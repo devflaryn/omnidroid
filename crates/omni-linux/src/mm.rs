@@ -592,6 +592,7 @@ fn report_boot_image(p: &Process, file: &crate::fd::OpenFile, guest: &[u8], view
 }
 
 /// `OMNI_PROP_FULL_COPY=1`: a mapped prop area is written whole, zero tail and all (the old way) --
+/// and every process keeps its `/dev/__properties__` areas whole (`crate::props::PropBlob`) --
 /// here and in the property service's writes of a change (`crate::props`).
 pub(crate) fn full_prop_copy() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

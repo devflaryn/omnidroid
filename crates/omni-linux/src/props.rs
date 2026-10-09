@@ -234,6 +234,62 @@ pub fn serial_area_bytes() -> Vec<u8> {
     Area::new().finish()
 }
 
+/// [`serial_area_bytes`] as a [`PropBlob`]: its 128-byte header, and its length.
+#[must_use]
+pub fn serial_area_blob() -> PropBlob {
+    let area = Area::new();
+    PropBlob { head: area.head(0), len: area.mapped_len(0) }
+}
+
+/// **A prop area file's bytes, kept without its zero tail.** A prop area is mostly room to grow:
+/// the live one ~61 KiB of header and properties in 1.125 MiB (1 MiB of room, whole 128 KiB
+/// units), `properties_serial` a 128-byte header in 128 KiB. Every guest process kept both whole
+/// for its `/dev/__properties__` files (`crate::procfs::PropFiles`), written zeros and all
+/// (`Vec::resize`): ~1.25 MiB of resident memory a process, ~1.2 MiB of it zeros -- the system's
+/// host process's 65 processes ~81 MiB, its 1.25 MiB allocations (census, 2026-10-09). The bytes
+/// are the same: [`head`](Self::head) and zeros up to [`len`](Self::len).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PropBlob {
+    head: Vec<u8>,
+    len: usize,
+}
+
+impl PropBlob {
+    /// A blob of exactly `bytes` (kept whole: the `OMNI_PROP_FULL_COPY=1` arm, and small files).
+    #[must_use]
+    pub fn whole(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        Self { head: bytes, len }
+    }
+
+    /// The bytes up to where only zeros follow (they may end in zeros themselves).
+    #[must_use]
+    pub fn head(&self) -> &[u8] {
+        &self.head
+    }
+
+    /// The file's length.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the file is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The file's bytes: the head, then zeros.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.len);
+        out.extend_from_slice(&self.head);
+        out.resize(self.len, 0);
+        out
+    }
+}
+
 /// The serialized `property_info`: one context, one type, a root node that maps every name to
 /// context 0.
 #[must_use]
@@ -369,15 +425,26 @@ impl Area {
     /// The area as mapped: the header (`bytes_used`, `serial`, magic, version), the data, and
     /// zeros up to `capacity` (at least a whole number of 128 KiB).
     fn bytes(&self, serial: u32, capacity: usize) -> Vec<u8> {
-        let mut out = vec![0u8; HEADER];
+        let mut out = self.head(serial);
+        out.resize(self.mapped_len(capacity), 0);
+        out
+    }
+
+    /// [`bytes`](Self::bytes) without the zeros after the data.
+    fn head(&self, serial: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER + self.data.len());
+        out.resize(HEADER, 0);
         out[0..4].copy_from_slice(&(self.data.len() as u32).to_le_bytes()); // bytes_used
         out[4..8].copy_from_slice(&serial.to_le_bytes());
         out[8..12].copy_from_slice(&PROP_AREA_MAGIC.to_le_bytes());
         out[12..16].copy_from_slice(&PROP_AREA_VERSION.to_le_bytes());
         out.extend_from_slice(&self.data);
-        let size = out.len().div_ceil(AREA_UNIT).max(1) * AREA_UNIT;
-        out.resize(size.max(capacity), 0);
         out
+    }
+
+    /// The length [`bytes`](Self::bytes) has at `capacity`.
+    fn mapped_len(&self, capacity: usize) -> usize {
+        ((HEADER + self.data.len()).div_ceil(AREA_UNIT).max(1) * AREA_UNIT).max(capacity)
     }
 }
 
@@ -479,6 +546,13 @@ impl PropertyService {
     pub fn area_bytes(&self) -> Vec<u8> {
         let live = self.live.lock();
         live.area.bytes(live.serial, live.capacity)
+    }
+
+    /// [`area_bytes`](Self::area_bytes) as a [`PropBlob`], never built with its zero tail.
+    #[must_use]
+    pub fn area_blob(&self) -> PropBlob {
+        let live = self.live.lock();
+        PropBlob { head: live.area.head(live.serial), len: live.area.mapped_len(live.capacity) }
     }
 
     /// A process mapped the prop area (`serial` false) or `properties_serial` (`serial` true)
@@ -785,6 +859,26 @@ mod tests {
         assert_eq!(svc.get(name1).as_deref(), Some(long_value.as_str()));
         // Verify name2 is still intact (not corrupted by the long value write).
         assert_eq!(svc.get(name2).as_deref(), Some("short2"));
+    }
+
+    #[test]
+    fn a_kept_prop_area_is_the_same_bytes_without_its_zero_tail() {
+        let root = crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), test_manifest());
+        let svc = PropertyService::for_test(&root);
+        assert_eq!(svc.set("ro.test.kept", "v"), PROP_SUCCESS);
+        assert_eq!(svc.set("sys.test.kept", "w"), PROP_SUCCESS); // a serial past 0
+        let blob = svc.area_blob();
+        let whole = svc.area_bytes();
+        assert_eq!(blob.len(), whole.len());
+        assert_eq!(blob.to_bytes(), whole, "the same bytes");
+        assert!(whole.len() >= 1 << 20, "the room to grow is there: {}", whole.len());
+        assert!(blob.head().len() < whole.len() / 4, "kept without the room: {} of {}", blob.head().len(), whole.len());
+        assert!(whole[blob.head().len()..].iter().all(|&b| b == 0), "only zeros dropped");
+
+        let serial = serial_area_blob();
+        assert_eq!(serial.to_bytes(), serial_area_bytes());
+        assert_eq!(serial.head().len(), HEADER);
+        assert_eq!(PropBlob::whole(vec![1, 0, 0]).to_bytes(), vec![1, 0, 0]);
     }
 
     #[test]

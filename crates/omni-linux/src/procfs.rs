@@ -20,11 +20,12 @@ pub trait ProcFs: Send + Sync {
     fn read(&self, path: &[u8]) -> Option<Vec<u8>>;
 }
 
-/// `/dev/__properties__`'s three files, built once when the process is.
+/// `/dev/__properties__`'s three files, built once when the process is. The two areas are kept
+/// without their zero tails (`crate::props::PropBlob`); a read or an open makes the whole bytes.
 pub struct PropFiles {
     pub info: Vec<u8>,
-    pub serial: Vec<u8>,
-    pub area: Vec<u8>,
+    pub serial: crate::props::PropBlob,
+    pub area: crate::props::PropBlob,
     /// `/apex/apex-info-list.xml`, as apexd writes it (sub-project B).
     pub apex_info: Vec<u8>,
 }
@@ -578,16 +579,22 @@ fn cpu_range(_p: &Process) -> Vec<u8> {
 }
 
 impl Process {
-    /// A `/dev/__properties__` file.
-    fn blob(&self, path: &[u8]) -> Option<&[u8]> {
+    /// A `/dev/__properties__` file: its bytes up to where only zeros follow, and its length.
+    fn blob(&self, path: &[u8]) -> Option<(&[u8], usize)> {
+        fn whole(b: &[u8]) -> (&[u8], usize) {
+            (b, b.len())
+        }
+        fn kept(b: &crate::props::PropBlob) -> (&[u8], usize) {
+            (b.head(), b.len())
+        }
         if path == b"/apex/apex-info-list.xml" {
-            return Some(&self.props.apex_info);
+            return Some(whole(&self.props.apex_info));
         }
         let name = path.strip_prefix(b"/dev/__properties__/")?;
         match name {
-            b"property_info" => Some(&self.props.info),
-            b"properties_serial" => Some(&self.props.serial),
-            _ if name == crate::props::CONTEXT.as_bytes() => Some(&self.props.area),
+            b"property_info" => Some(whole(&self.props.info)),
+            b"properties_serial" => Some(kept(&self.props.serial)),
+            _ if name == crate::props::CONTEXT.as_bytes() => Some(kept(&self.props.area)),
             _ => None,
         }
     }
@@ -846,8 +853,8 @@ impl ProcFs for Process {
         if let Some(q) = self.another(path) {
             return q.node(path);
         }
-        if let Some(blob) = self.blob(path) {
-            return Some(Node::Blob { size: blob.len() as u64 });
+        if let Some((_, len)) = self.blob(path) {
+            return Some(Node::Blob { size: len as u64 });
         }
         Some(match self.entry(path)? {
             Entry::Dir(_) | Entry::DynDir(_) => Node::Dir,
@@ -877,8 +884,11 @@ impl ProcFs for Process {
         if let Some(q) = self.another(path) {
             return q.read(path);
         }
-        if let Some(blob) = self.blob(path) {
-            return Some(blob.to_vec());
+        if let Some((head, len)) = self.blob(path) {
+            let mut bytes = Vec::with_capacity(len);
+            bytes.extend_from_slice(head);
+            bytes.resize(len, 0);
+            return Some(bytes);
         }
         match self.entry(path)? {
             Entry::File(generate) => Some(generate(self)),

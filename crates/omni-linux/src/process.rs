@@ -711,9 +711,15 @@ impl Process {
         let (_, dropped) = crate::props::Properties::from_sysroot(vfs.sysroot());
         let props = crate::procfs::PropFiles {
             info: crate::props::property_info_bytes(),
-            serial: crate::props::serial_area_bytes(),
+            // Kept without their zero tails (`PropBlob`: ~1.2 MiB a process less); whole with
+            // `OMNI_PROP_FULL_COPY=1`, as before -- the A/B's other arm.
+            serial: if crate::mm::full_prop_copy() { crate::props::PropBlob::whole(crate::props::serial_area_bytes()) } else { crate::props::serial_area_blob() },
             // The live area of the instance's property service: what every process reads.
-            area: crate::props::PropertyService::global(vfs.sysroot()).area_bytes(),
+            area: if crate::mm::full_prop_copy() {
+                crate::props::PropBlob::whole(crate::props::PropertyService::global(vfs.sysroot()).area_bytes())
+            } else {
+                crate::props::PropertyService::global(vfs.sysroot()).area_blob()
+            },
             apex_info: crate::apex::apex_info_list(vfs.sysroot()),
         };
         let comm = argv.first().map_or_else(Vec::new, |a| {
