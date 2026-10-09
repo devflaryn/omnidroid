@@ -105,7 +105,12 @@ pub fn key(exe: &[u8], argv: &[Vec<u8>]) -> String {
     k.push_str(&String::from_utf8_lossy(exe));
     for a in argv {
         k.push_str("\narg=");
-        k.push_str(&String::from_utf8_lossy(a));
+        // An app's host process runs `... android.app.ActivityThread seq=<n>`, `n` the zygote's
+        // launch count -- how many launches after boot the app started, not what it runs.
+        match a.strip_prefix(b"seq=") {
+            Some(n) if !n.is_empty() && n.iter().all(u8::is_ascii_digit) => k.push_str("seq=*"),
+            _ => k.push_str(&String::from_utf8_lossy(a)),
+        }
     }
     k.push_str(&format!("\nhle={}", omni_cpu::dynarmic::hle_enabled()));
     k.push_str(&format!("\nhost={}", host_build()));
@@ -245,5 +250,14 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(file_for(std::path::Path::new("d"), &a), file_for(std::path::Path::new("d"), &b));
         assert!(a.contains("exe=/system/bin/app_process64") && a.contains("arg=com.roblox.client"), "{a}");
+    }
+
+    #[test]
+    fn an_app_s_launch_count_is_not_part_of_its_key() {
+        let exe = b"/system/bin/app_process64";
+        let argv = |last: &str| [b"--nice-name=com.roblox.client".to_vec(), last.as_bytes().to_vec()];
+        assert_eq!(key(exe, &argv("seq=17")), key(exe, &argv("seq=4")));
+        assert_ne!(key(exe, &argv("seq=17")), key(exe, &argv("seqx=17")));
+        assert_ne!(key(exe, &argv("seq=1a")), key(exe, &argv("seq=17")));
     }
 }
