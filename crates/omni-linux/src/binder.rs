@@ -139,12 +139,13 @@ thread_local! {
 }
 
 /// `binder_host_pool=1` (`crate::lever`) or `OMNI_BINDER_HOST_POOL=1`: a host service's call runs
-/// on a kept thread ([`host_pool_run`]) instead of a new one. Off by default (a behaviour change on
-/// every frame's path, for an in-session A/B first). MEASURED (Windows, i7-13700F E-cores,
+/// on a kept thread ([`host_pool_run`]) instead of a new one. **On by default** since the in-world
+/// A/B of 2026-10-09 (PS99, 6 pairs: fps +1.6 median, 5/6; all hosts -2..-9 ms/frame);
+/// `OMNI_BINDER_HOST_POOL=0` or the lever is the way back. MEASURED (Windows, i7-13700F E-cores,
 /// `host_pool_round_trip`, 2000 calls each): handing a call to its thread and hearing it ran took
 /// **104-111 us on a new thread, 13-16 us on a kept one** -- plus, off that path, the new thread's
 /// exit.
-pub static HOST_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static HOST_POOL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 fn host_pool_on() -> bool {
     static FROM_ENV: std::sync::Once = std::sync::Once::new();

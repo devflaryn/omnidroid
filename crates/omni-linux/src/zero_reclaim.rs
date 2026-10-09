@@ -14,7 +14,7 @@
 //! each resident page's first words (a page that is not zero says so at once) -- ~20-40 ms a sweep
 //! for ~1.6 GiB of guest memory, off every guest thread.
 //!
-//! **Off by default**: `OMNI_ZERO_RECLAIM=<seconds>` from the start, or the live lever
+//! **On by default (60 s)**: `OMNI_ZERO_RECLAIM=<seconds>` from the start (0: off), or the live lever
 //! `zero_reclaim=<seconds>` (`crate::lever`; 0 stops it). Each sweep that finds something says so:
 //! `[zero] pid <host pid>: <n> MiB of zero pages reset of <m> MiB resident guest memory (<k>
 //! processes, <t> ms)`.
@@ -23,6 +23,9 @@ use std::time::{Duration, Instant};
 
 /// Seconds between sweeps; 0: none.
 pub static PERIOD_S: AtomicU64 = AtomicU64::new(0);
+
+/// The period a host process sweeps with unless told otherwise.
+pub const DEFAULT_PERIOD_S: u64 = 60;
 /// Set by the lever: sweep at the next look rather than a whole period later.
 static KICK: AtomicBool = AtomicBool::new(false);
 
@@ -34,11 +37,13 @@ pub fn set_period(seconds: u64) {
 
 /// Start the sweeper for this host process (once). It idles while the period is 0.
 pub fn start() {
-    if let Some(s) = std::env::var("OMNI_ZERO_RECLAIM").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
-        set_period(s);
-        if s != 0 {
-            eprintln!("[lever] OMNI_ZERO_RECLAIM: zero_reclaim={s}");
-        }
+    // A sweep a minute by default since the in-world A/B of 2026-10-09 (PS99: the first sweep
+    // gave back ~126 MB of working set; a steady sweep costs ~0.1 s a minute in the game's host
+    // process); `OMNI_ZERO_RECLAIM=0` or the lever turns it off.
+    let s = std::env::var("OMNI_ZERO_RECLAIM").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(DEFAULT_PERIOD_S);
+    set_period(s);
+    if std::env::var_os("OMNI_ZERO_RECLAIM").is_some() {
+        eprintln!("[lever] OMNI_ZERO_RECLAIM: zero_reclaim={s}");
     }
     let _ = std::thread::Builder::new().name("omni-zero-reclaim".into()).spawn(|| {
         let mut last = Instant::now();
