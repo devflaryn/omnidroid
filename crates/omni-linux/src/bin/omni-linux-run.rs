@@ -20,7 +20,18 @@ static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static HEAP: omni_linux::alloc_trace::Tracing = omni_linux::alloc_trace::Tracing;
 
+/// When this host process started, for its `[boot-ms]` lines.
+static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// `[boot-ms] <ms since the host process started> <what>`: the boot's steps to the millisecond (the
+/// guest log's own `[t]` clock ticks once a second).
+fn boot_ms(what: &str) {
+    let ms = STARTED.get().map_or(0, |t| t.elapsed().as_millis());
+    eprintln!("[boot-ms] {ms} {what}");
+}
+
 fn main() -> ExitCode {
+    let _ = STARTED.set(std::time::Instant::now());
     // The host's descriptor limit, as high as it allows: the system's host process holds every
     // guest process's files and sockets, and Linux's default soft limit (1024) ran out on a boot
     // pinned to 2 CPUs -- init's services then failed to start ("Too many open files", system_suspend
@@ -31,6 +42,7 @@ fn main() -> ExitCode {
     omni_linux::lever::start();
     omni_linux::proccpu::start();
     omni_linux::jit_time::start();
+    omni_linux::ws_trim::start();
     omni_linux::zero_reclaim::start();
     omni_linux::alloc_trace::start();
     let mut args = std::env::args().skip(1);
@@ -207,6 +219,7 @@ fn main() -> ExitCode {
                 let classes: Vec<&str> = init_classes.iter().map(String::as_str).collect();
                 let started = init.boot(&classes);
                 eprintln!("[init] started {} services: {}", started.len(), started.join(" "));
+                boot_ms("init's boot commands done, its classes started");
             }
             Err(e) => eprintln!("[init] {e}"),
         }
@@ -222,6 +235,7 @@ fn main() -> ExitCode {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         eprintln!("[init] servicemanager ready after {} ms", t.elapsed().as_millis());
+        boot_ms("servicemanager ready");
     } else if !daemons.is_empty() || !init_classes.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
@@ -234,7 +248,10 @@ fn main() -> ExitCode {
             "gralloc" => {
                 let allocator = omni_linux::hal::gralloc::Allocator::new();
                 match allocator.register(&broker) {
-                    Ok(()) => eprintln!("[hal] gralloc: {}", omni_linux::hal::gralloc::INSTANCE),
+                    Ok(()) => {
+                        eprintln!("[hal] gralloc: {}", omni_linux::hal::gralloc::INSTANCE);
+                        boot_ms("gralloc registered");
+                    }
                     Err(e) => eprintln!("[hal] gralloc: {e}"),
                 }
                 _served.push(allocator);
@@ -250,7 +267,10 @@ fn main() -> ExitCode {
                 let fb = std::sync::Arc::new(omni_linux::hal::framebuffer::Framebuffer::new(w, h));
                 let composer = omni_linux::hal::composer::Composer::new(std::sync::Arc::clone(&broker), std::sync::Arc::clone(&fb));
                 match composer.register() {
-                    Ok(()) => eprintln!("[hal] composer: {}", omni_linux::hal::composer::INSTANCE),
+                    Ok(()) => {
+                        eprintln!("[hal] composer: {}", omni_linux::hal::composer::INSTANCE);
+                        boot_ms("composer registered");
+                    }
                     Err(e) => eprintln!("[hal] composer: {e}"),
                 }
                 // OMNI_WINDOW=1: the display in a live host window whose size is the display's
@@ -508,6 +528,7 @@ fn main() -> ExitCode {
             Process::spawn_as(config, uid).map_err(|e| e.to_string())
         });
     }
+    boot_ms("the program starts");
     let status = p.run();
     // OMNI_VERIFY_MAPS=1 -- every read-only file mapping still holds the file's bytes.
     if std::env::var("OMNI_VERIFY_MAPS").as_deref() == Ok("1") {

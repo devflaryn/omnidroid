@@ -62,6 +62,8 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 6 | code aging's floor 8 -> 6 MiB (`code_trim::MIN_BYTES`) | s5 `s5-snap.csv`, `new` vs `new8` (`OMNI_CODE_TRIM_MIN_MB=8`), 2 pairs | **private WS 3.079/3.102 -> 2.991/2.993 GB (-88/-109 MB)**; **system host 0.911/0.908 -> 0.822/0.824 GB**; all ms/frame 42.8/41.2 -> 38.6/41.2; fps, join, world the same. Cause of #5's +17 MB: a cache's commit counts its prelude, ~1 MiB smaller with 0078, so small quiet services (ueventd, gatekeeperd, HALs) fell under the 8 MiB floor and kept their translations; at 6 they are trimmed again, and more with them | **yes** |
 | 7 | dynarmic **0079**: Xbyak's label manager without heap nodes (tsl robin map/set, flat waiting list) | `the_speed_of_emission`, byte-identical | emit **15.7 -> 13.1 us/block (-16.5%)**, i5-4460 | yes (device check s5) |
 | 8 | dynarmic **0080**: a value's host location from a checked hint, not a search | same | emit **13.1 -> 11.9 us/block (-9%)** | yes (device check s5) |
+| 9 | system_server and the HALs after servicemanager is ready, not a fixed 1.5 s sleep (`OMNI_INIT_FIXED_WAIT=1` = old) | s6 `s6-boot.csv`, ABCCBA, 2 pairs; `[t]` milestones | servicemanager was ready "after 0 ms": **system_server 12.5/12.1 -> 10.4/10.4 s, boot_completed 30.8/30.8 -> 29.5/29.5, DID_LOG_IN 59.2/61.0 -> 58.6/58.6, onGameLoaded 87.3/88.0 -> 84.7/85.7** | **yes** |
+| 10 | the place's link at once after sign-in (`OMNI_R_LINK_DELAY=0`, default 3) | s6, 2 runs | Joining 71.8/63.6 vs 70.6/67.7: the sign-in-to-Joining gap swings 5-14 s run to run (matchmaking, network) | no (inconclusive; default unchanged) |
 
 **Why the in-world worker got cheaper with faster translation:** the game keeps translating in the
 measured window -- after its code-aging pass (3 min) it translates the hot code again in bursts of
@@ -95,3 +97,23 @@ private WS against `new`. Where they work and where not (`[jit-snapshot]` lines)
   1.7M blocks as without a snapshot. Its host's commit was +84 MiB (2,641 vs 2,557) with the same
   guest memory and JIT counters: the snapshot machinery's own memory for a game it does not help.
   Next: what invalidates the game's restored blocks (`[jit-time]` now counts invalidations).
+
+## Session s6 (01:23-02:04): the boot's waits (`s6-boot.csv`)
+
+| arm | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|
+| fixed (`OMNI_INIT_FIXED_WAIT=1`) | 12.5 / 12.1 | 30.8 / 30.8 | 59.2 / 61.0 | 73.3 / 75.4 | 87.3 / 88.0 |
+| smwait (default now) | 10.4 / 10.4 | 29.5 / 29.5 | 58.6 / 58.6 | 70.6 / 67.7 | 84.7 / 85.7 |
+| nolink (+ `OMNI_R_LINK_DELAY=0`) | 10.5 / 10.4 | 29.6 / 29.2 | 58.8 / 58.5 | 71.8 / 63.6 | 85.9 / 82.6 |
+
+The early boot, from one run's log: apexd done 4.2 s; init's `exec_start` chain (derive_sdk,
+vold_prepare_subdirs, the BPF loader, ...) until 9.4 s, one fresh guest process at a time; gralloc
+registered 9.4, composer 10.4 (`[t]` ticks are 1 s apart: the next build prints `[boot-ms]`);
+system_server's runtime 10.4.
+
+**Why the game's snapshot does not help (diag run):** the game's code cache keeps 256 MiB of live
+code; its start translates ~1.4M blocks and retires regions all through it (18 regions, ~288 MiB,
+between 54 and 88 s) -- with or without a snapshot. A restored snapshot (274 MiB) sits in the oldest
+regions, so it is the first evicted, before most of it is entered. Invalidations are not the cause
+(174k requests in the first 5 s dropped 41 blocks). Measured next (s7): a 512 MiB live budget.
+Also: every rebuild of the host binary refuses every snapshot (host addresses are part of it).

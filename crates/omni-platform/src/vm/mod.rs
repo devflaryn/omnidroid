@@ -1284,6 +1284,26 @@ pub fn process_working_set() -> VmResult<u64> {
     backend::process_working_set()
 }
 
+/// Take every page out of this process's working set (Windows `EmptyWorkingSet`): the private
+/// ones go to the modified list, where the system compresses them or writes them out, and come
+/// back on their next touch as soft faults. Nothing is decommitted -- commit charge is unchanged
+/// (measured, see the crate docs) -- only the RAM the pages held while nothing touched them.
+/// `false` where there is no such thing (elsewhere) or the call failed.
+#[must_use]
+pub fn trim_working_set() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        // SAFETY: the pseudo-handle of this process; the call only changes its working set.
+        unsafe { K32EmptyWorkingSet(GetCurrentProcess()) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// One snapshot of this process's memory, as the operating system accounts for it.
 ///
 /// **Every field is a number the OS was asked for, and each is named for what it measures**

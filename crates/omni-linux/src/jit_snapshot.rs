@@ -69,6 +69,9 @@ pub struct Target {
     linker_file: Arc<parking_lot::Mutex<Option<(i32, Vec<u8>, u64)>>>,
     zone_placed: Arc<std::sync::atomic::AtomicU64>,
     zone_at_home: Arc<std::sync::atomic::AtomicU64>,
+    /// Saved just before code aging dropped its translations ([`save_before_trim`]): that save is
+    /// its snapshot, and later ones -- of what it translated since, a fraction -- are not made.
+    final_saved: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// `OMNI_JIT_SNAPSHOT_LIB_ZONE=1` (default off): the dynamic linker's library reservations placed
@@ -375,14 +378,31 @@ pub(crate) fn attach(p: &Arc<Process>, exe: &[u8], argv: &[Vec<u8>]) {
         linker_file: Arc::default(),
         zone_placed: Arc::default(),
         zone_at_home: Arc::default(),
+        final_saved: Arc::default(),
     });
     start_quiet_saver();
 }
 
 /// Save `p`'s snapshot, if it has a target and has translated anything since it was last saved
 /// or loaded. Its guest threads wait on the code cache's lock meanwhile.
+/// Save the process's snapshot now, before code aging drops its translations
+/// (`crate::code_trim`), and make it the last: system_server's first trim comes ~60 s into a boot,
+/// and a snapshot saved after it held only what it translated since (72-78k blocks of ~550k,
+/// 2026-10-10 s5), so the next boot translated its start again.
+pub(crate) fn save_before_trim(p: &Process) {
+    let Some(target) = p.jit_snapshot.get() else { return };
+    if target.final_saved.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    save(p, "before its translations are dropped");
+    target.final_saved.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn save(p: &Process, why: &str) {
     let (Some(target), Some(backend)) = (p.jit_snapshot.get(), p.backend()) else { return };
+    if target.final_saved.load(std::sync::atomic::Ordering::Relaxed) {
+        return;  // saved before a trim: that is its snapshot
+    }
     let Some(stats) = backend.code_cache_stats() else { return };
     {
         let last = target.saved_emitted.lock();

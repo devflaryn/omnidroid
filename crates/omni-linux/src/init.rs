@@ -477,10 +477,13 @@ impl Init {
                     }
                 }
                 Command::ExecStart(n) => {
+                    let t = std::time::Instant::now();
                     if let Some(status) = self.exec_service(n) {
                         started.push(n.clone());
-                        if std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
-                            eprintln!("[init] exec_start {n}: {status:?}");
+                        // Each is a step of the boot's critical path: said when it took a while.
+                        let ms = t.elapsed().as_millis();
+                        if ms >= 50 || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                            eprintln!("[init] exec_start {n}: {status:?} in {ms} ms");
                         }
                     }
                 }

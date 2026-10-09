@@ -18,6 +18,7 @@ pub mod guestprof;
 pub mod hle;
 pub mod jit_snapshot;
 pub mod jit_time;
+pub mod ws_trim;
 pub mod threadsys;
 pub mod proccpu;
 pub mod bpf;

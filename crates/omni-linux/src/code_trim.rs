@@ -99,6 +99,7 @@ fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, busy: bool, all_quiet: 
         if busy || !quiet || !due || committed < min_bytes || name == "surfaceflinger" {
             continue;
         }
+        crate::jit_snapshot::save_before_trim(p);
         p.trim_code();
         seen.insert(pid, (emitted, Some(Instant::now())));
         eprintln!("[code] {name} (pid {pid}) quiet{}: {} MiB of translations dropped", if all_quiet { " (settled after its start)" } else { "" }, committed >> 20);
