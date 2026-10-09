@@ -336,16 +336,47 @@ pub fn ensure_region(shm: &Shm, stride_bytes: u64) -> bool {
     }
 }
 
-/// A name for the next share image of this process.
+/// A name for the next share image of this process: its pid, a number this process drew when it
+/// started, and a count. The pid alone named a dead process's images again in a new process that
+/// Windows gave the same pid -- while the system host still held the old ones open by those names
+/// (it keeps an image it is not drawing for `KEEP_IMPORTED` composed frames, and composes none
+/// while no app draws), and it looks an image up by name: the new app's frames would have been
+/// shown from the old app's memory, or the new export refused.
 #[must_use]
 pub fn next_name() -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    format!("Local\\omni-share-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed))
+    format!("Local\\omni-share-{}-{:08x}-{}", std::process::id(), process_nonce(), N.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A number drawn once per process (the clock's nanoseconds, mixed with a stack address).
+fn process_nonce() -> u32 {
+    static NONCE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *NONCE.get_or_init(|| {
+        let local = 0u8;
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+        let mixed = (nanos ^ (std::ptr::addr_of!(local) as u64).rotate_left(29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (mixed >> 32) as u32
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A share image's name says which process *instance* made it, not only its pid (which Windows
+    /// gives again to a later process), and fits a description's 63 units at the longest.
+    #[test]
+    fn a_name_carries_the_process_s_own_number() {
+        let (a, b) = (next_name(), next_name());
+        assert_ne!(a, b);
+        let parts = |n: &str| n.rsplitn(3, '-').map(str::to_string).collect::<Vec<_>>();
+        let (pa, pb) = (parts(&a), parts(&b));
+        assert_eq!(pa[1], pb[1], "one number per process");
+        assert_eq!(pa[1].len(), 8, "{a}");
+        assert!(a.starts_with(&format!("Local\\omni-share-{}-", std::process::id())), "{a}");
+        let longest = format!("Local\\omni-share-{}-{:08x}-{}", u32::MAX, u32::MAX, u64::MAX);
+        assert!(longest.encode_utf16().count() <= NAME_UNITS, "{longest}");
+    }
 
     #[test]
     fn a_description_survives_the_metadata_page() {
