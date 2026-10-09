@@ -44,6 +44,7 @@ pub mod loopns;
 pub mod netlink;
 pub mod owners;
 pub mod mm;
+pub mod mmap_log;
 pub mod pipe;
 pub mod poll;
 pub mod process;

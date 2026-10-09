@@ -645,6 +645,7 @@ fn sys_prctl(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             if a[1] == 0 && a[4] != 0 && a[3] != 0 {
                 let name = p.mem.read_cstr(a[4], 80)?;
                 let (start, len) = (crate::guest::untag(a[2]), a[3]);
+                crate::mmap_log::named(p, t, start, len, &name);
                 if p.mm.name_at(start).is_none() {
                     let mut label = b"[anon:".to_vec();
                     label.extend_from_slice(&name);
