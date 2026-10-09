@@ -191,10 +191,12 @@ pub fn set_inline(on: bool) {
     INLINE.store(on, Ordering::Relaxed);
 }
 
-/// **Batching** (`vk_batch=0|1`, `OMNI_VK_BATCH=1`; off by default): what the guest's driver is told
+/// **Batching** (`vk_batch=0|1`, `OMNI_VK_BATCH=0|1`; **on by default** since the in-world A/B of
+/// 2026-10-09, PS99 session s4: the game's host process -0.5..-2.3 ms of CPU a frame in 5/5 pairs at
+/// the same ~57.5 fps): what the guest's driver is told
 /// at each `vkBeginCommandBuffer` (`OMNI_VK_ID_CONFIG`). On, the commands that only record into a
 /// command buffer reach the host in batches ([`BATCH_COMMAND`]) instead of one system call each.
-pub static BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static BATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Switch [`FAST`].
 pub fn set_fast(on: bool) {
@@ -214,8 +216,8 @@ fn read_switches() {
         if on("OMNI_VK_FAST") {
             set_fast(true);
         }
-        if on("OMNI_VK_BATCH") {
-            set_batch(true);
+        if let Ok(v) = std::env::var("OMNI_VK_BATCH") {
+            set_batch(v.trim() != "0");
         }
         if on("OMNI_VK_HANDLES") {
             set_handle_cache(true);
