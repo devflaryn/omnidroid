@@ -126,12 +126,20 @@ const IDLE_APPS: &[&str] = &[
 /// The script that disables `IDLE_APPS` once the device is up (`OMNI_R_LEAN=0`: none) -- in the
 /// background with `OMNI_R_FAST_SETUP=1`, joined after the install (`common::r_scripts`).
 fn lean_script() -> String {
-    // `OMNI_DEVICE_IDLE_APPS=out`: they are not in the image (`omni_linux::device::IDLE_APPS_LEFT_OUT`),
-    // so there is nothing to disable.
-    if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") || omni_linux::device::idle_apps_out() {
+    if std::env::var("OMNI_R_LEAN").as_deref() == Ok("0") {
         return String::new();
     }
-    common::r_scripts::lean(IDLE_APPS, common::r_scripts::fast_setup())
+    // `OMNI_DEVICE_IDLE_APPS=out`: those not in the image (`omni_linux::device::
+    // IDLE_APP_PACKAGES_LEFT_OUT`) are not disabled; the ones a system service needs stay and are.
+    // (`com.android.cellbroadcastreceiver` and `com.android.ext.adservices.api` are on no lean
+    // device either way.)
+    let apps: Vec<&str> = if omni_linux::device::idle_apps_out() {
+        let gone = ["com.android.cellbroadcastreceiver", "com.android.ext.adservices.api"];
+        IDLE_APPS.iter().copied().filter(|a| !omni_linux::device::IDLE_APP_PACKAGES_LEFT_OUT.contains(a) && !gone.contains(a)).collect()
+    } else {
+        IDLE_APPS.to_vec()
+    };
+    common::r_scripts::lean(&apps, common::r_scripts::fast_setup())
 }
 
 /// The device is set up as a freely resizable one is: Developer options' "Force activities to be
