@@ -6,22 +6,29 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <condition_variable>
 #include <deque>
+#include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include <boost/icl/interval_set.hpp>
 #include <mcl/assert.hpp>
 #include <mcl/bit_cast.hpp>
 #include <mcl/scope_exit.hpp>
+#include <tsl/robin_map.h>
 #include <tsl/robin_set.h>
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
@@ -326,6 +333,30 @@ struct SharedCodeCache::Impl final {
     /// Omnidroid patch 0050: retire the oldest full regions until at most `keep_bytes` of regions
     /// are live (the one being filled counts). How many were retired.
     size_t EvictTo(size_t keep_bytes);
+
+    // Omnidroid patch 0070: translation snapshots (see SharedCodeCache::SaveSnapshot).
+    void EnableSnapshots();
+    s64 SaveSnapshot(const char* path, const char* key, u64 max_bytes, bool include_unverified);
+    s64 LoadSnapshot(const char* path, const char* key);
+    /// A restored block at `location`, unverified: its guest code read through `translator_conf`'s
+    /// callbacks and compared. Its entry point if it is the same (and now entered), nothing if
+    /// there is none or it was dropped.
+    std::optional<CodePtr> VerifyRestored(IR::LocationDescriptor location, const UserConfig& translator_conf);
+    /// What shapes emitted code besides the guest's: one hash.
+    u64 CodeShape() const;
+    /// Remember emitted blocks' guest-code hashes (under `lock`).
+    bool snapshot_hashing = false;
+    tsl::robin_map<u64, u64> block_hashes;  // location -> hash of the guest code emitted from
+    struct Unverified {
+        u64 first;
+        u32 span;
+        u64 hash;
+    };
+    tsl::robin_map<u64, Unverified> unverified;  // location -> what verifying needs (under `lock`)
+    std::atomic<u64> unverified_count{0};        // non-zero while any may remain: Emit checks
+    u64 snapshot_restored = 0;
+    u64 snapshot_verified = 0;
+    u64 snapshot_rejected = 0;
 
 private:
     void EnsureRoom(SharedThreadState& thread, std::unique_lock<SharedCodeLock>& held);
@@ -832,6 +863,604 @@ std::optional<CodePtr> SharedCodeCache::Impl::Lookup(IR::LocationDescriptor loca
     return std::nullopt;
 }
 
+// ------------------------------------------------------------------------------------------------
+// Omnidroid patch 0070: translation snapshots.
+//
+// A shared cache's emitted code does not depend on where the cache is: a block reaches the prelude,
+// the constant pool and its own link slots `rip`-relatively, and everything per-thread or
+// per-process through JitState (patch 0022). MEASURED (`tests/code_size.rs`, OMNI_EMIT_DUMP2):
+// 11,005 blocks emitted into two caches at different addresses, with different monitors, have the
+// same bytes up to their link slots. What it does depend on is the prelude (whose thunks it calls
+// by offset, and which holds the host's function addresses) and everything that shapes code --
+// both hashed into the snapshot and compared before anything is installed. A block is restored at
+// the same offset in the same region, its slots rewritten for the new buffer and unlinked, and
+// entered only once its guest code reads back the same.
+// ------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr u64 SNAPSHOT_MAGIC = 0x3150414E534A444FULL;  // "ODJSNAP1"
+constexpr u32 SNAPSHOT_VERSION = 1;
+
+struct Fnv {
+    u64 h = 0xCBF29CE484222325ULL;
+    void Byte(u8 b) {
+        h ^= b;
+        h *= 0x100000001B3ULL;
+    }
+    void Bytes(const void* p, size_t n) {
+        const u8* b = static_cast<const u8*>(p);
+        for (size_t i = 0; i < n; i++) {
+            Byte(b[i]);
+        }
+    }
+    template<typename T>
+    void Value(const T& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        Bytes(&v, sizeof(v));
+    }
+};
+
+/// The words of guest code `[first, end)` read through `conf`'s callbacks, hashed; nothing if one
+/// cannot be read.
+std::optional<u64> GuestCodeHash(const UserConfig& conf, u64 first, u64 end) {
+    if (end < first || end - first > (1u << 24)) {
+        return std::nullopt;
+    }
+    Fnv f;
+    f.Value(first);
+    f.Value(end - first);
+    for (u64 at = first; at < end; at += 4) {
+        const auto word = conf.callbacks->MemoryReadCode(at);
+        if (!word) {
+            return std::nullopt;
+        }
+        f.Value(*word);
+    }
+    return f.h;
+}
+
+class Writer {
+public:
+    explicit Writer(std::FILE* f)
+            : f(f) {}
+    template<typename T>
+    void Value(const T& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        Bytes(&v, sizeof(v));
+    }
+    void Bytes(const void* p, size_t n) {
+        if (ok && n != 0 && std::fwrite(p, 1, n, f) != n) {
+            ok = false;
+        }
+        written += n;
+    }
+    bool ok = true;
+    u64 written = 0;
+
+private:
+    std::FILE* f;
+};
+
+class Reader {
+public:
+    explicit Reader(std::vector<u8> data)
+            : data(std::move(data)) {}
+    template<typename T>
+    bool Value(T& v) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        if (data.size() - at < sizeof(T)) {
+            return false;
+        }
+        std::memcpy(&v, data.data() + at, sizeof(T));
+        at += sizeof(T);
+        return true;
+    }
+    const u8* Take(size_t n) {
+        if (data.size() - at < n) {
+            return nullptr;
+        }
+        const u8* p = data.data() + at;
+        at += n;
+        return p;
+    }
+    bool AtEnd() const { return at == data.size(); }
+
+private:
+    std::vector<u8> data;
+    size_t at = 0;
+};
+
+std::FILE* OpenFile(const char* path, bool write) {
+    const std::filesystem::path p{std::u8string{reinterpret_cast<const char8_t*>(path)}};
+#ifdef _WIN32
+    return _wfopen(p.c_str(), write ? L"wb" : L"rb");
+#else
+    return std::fopen(p.c_str(), write ? "wb" : "rb");
+#endif
+}
+
+struct SavedBlock {
+    u64 location;
+    u32 entry;
+    u32 size;
+    u64 first;
+    u32 span;
+    u64 hash;
+    std::vector<EmitX64::SnapshotSlot> slots;
+    std::vector<EmitX64::SnapshotSite> sites;
+};
+
+struct SavedRegion {
+    u32 index;
+    u64 used;
+    const u8* bytes;  // into the reader's data
+    std::vector<SavedBlock> blocks;
+};
+
+}  // namespace
+
+u64 SharedCodeCache::Impl::CodeShape() const {
+    Fnv f;
+    f.Value(SNAPSHOT_VERSION);
+    // The prelude's code (after the constant pool), which every block calls into by offset and
+    // which holds the host's addresses: the same build, configuration and host, at the same
+    // module addresses, generate the same bytes.
+    const ConstantPool& pool = block_of_code.GetConstantPool();
+    const u8* const buffer = block_of_code.getCode();
+    const u8* const pool_end = static_cast<const u8*>(pool.Begin()) + pool.CapacityBytes();
+    const u8* const prelude_end = static_cast<const u8*>(block_of_code.GetCodeBegin());
+    f.Value(static_cast<u64>(static_cast<const u8*>(pool.Begin()) - buffer));
+    f.Value(static_cast<u64>(pool_end - buffer));
+    f.Value(static_cast<u64>(prelude_end - buffer));
+    // The prelude's bytes, with every 64-bit immediate (`mov r64, imm64`) and every word that is
+    // an address inside the buffer left out: those are its own addresses, its exception handler's
+    // object and the host's function addresses, which differ from cache to cache and which no block
+    // reads. What is hashed is its code -- every thunk at the same offset, doing the same thing.
+    {
+        const u64 lo = reinterpret_cast<u64>(buffer);
+        const u64 hi = lo + block_of_code.GetTotalCodeSize();
+        const size_t n = static_cast<size_t>(prelude_end - pool_end);
+        size_t i = 0;
+        while (i < n) {
+            const u8 b = pool_end[i];
+            if (i + 10 <= n && (b == 0x48 || b == 0x49) && pool_end[i + 1] >= 0xB8 && pool_end[i + 1] <= 0xBF) {
+                f.Byte(b);
+                f.Byte(pool_end[i + 1]);
+                f.Byte(0x5A);
+                i += 10;
+                continue;
+            }
+            if (i + 8 <= n) {
+                u64 word = 0;
+                std::memcpy(&word, pool_end + i, 8);
+                if ((word >= lo && word < hi) || (u64{0} - word >= lo && u64{0} - word < hi)) {
+                    f.Byte(0xA5);
+                    i += 8;
+                    continue;
+                }
+            }
+            f.Byte(b);
+            i++;
+        }
+    }
+    // What a block's own absolute addresses are: the host functions it calls (an `mov rax, imm64;
+    // call rax` each), in this executable and the C runtime -- the same addresses only where these
+    // are -- and only while the buffer is out of `call rel32` reach of them, or the instruction
+    // chosen, and its bytes, would depend on where the buffer is.
+    {
+        const u64 functions[] = {
+            reinterpret_cast<u64>(&GuestCodeHash),
+            reinterpret_cast<u64>(&Backend::X64::NoteTbiTaggedSite),
+            reinterpret_cast<u64>(static_cast<void* (*)(void*, const void*, size_t)>(&std::memcpy)),
+            reinterpret_cast<u64>(static_cast<void* (*)(void*, const void*, size_t)>(&std::memmove)),
+            reinterpret_cast<u64>(static_cast<double (*)(double, double, double)>(&std::fma)),
+            reinterpret_cast<u64>(static_cast<double (*)(double)>(&std::sqrt)),
+        };
+        const u64 lo = reinterpret_cast<u64>(buffer);
+        const u64 hi = lo + block_of_code.GetTotalCodeSize();
+        bool close_by = false;
+        for (const u64 fn : functions) {
+            f.Value(fn);
+            const u64 distance = fn < lo ? hi - fn : fn - lo;
+            close_by |= distance < (u64{1} << 32);
+        }
+        if (close_by) {
+            f.Value(lo);  // then only a cache at this very address has this shape
+        }
+    }
+    f.Value(static_cast<u64>(block_of_code.HostFeatureBits()));
+    f.Value(block_of_code.GetTotalCodeSize());
+    f.Value(static_cast<u64>(regions.size()));
+    f.Value(static_cast<u64>(regions.front().begin - buffer));
+    f.Value(static_cast<u64>(regions.front().end - regions.front().begin));
+    f.Value(static_cast<u64>(live_limit));
+    // Everything a block's code depends on besides the guest's: the configuration that shapes code
+    // (as EmitsTheSameCode compares it) and the switches read at emit time.
+    f.Value(static_cast<u32>(conf.optimizations));
+    f.Value(conf.unsafe_optimizations);
+    f.Value(conf.hook_data_cache_operations);
+    f.Value(conf.hook_isb);
+    f.Value(conf.hook_hint_instructions);
+    f.Value(conf.cntfrq_el0);
+    f.Value(conf.ctr_el0);
+    f.Value(conf.dczid_el0);
+    f.Value(conf.tpidrro_el0 == nullptr);
+    f.Value(conf.tpidr_el0 == nullptr);
+    f.Value(conf.fastmem_pointer.has_value());
+    f.Value(static_cast<u64>(conf.fastmem_pointer.value_or(0)));
+    f.Value(conf.fastmem_address_space_bits);
+    f.Value(conf.silently_mirror_fastmem);
+    f.Value(conf.fastmem_exclusive_access);
+    f.Value(conf.define_unpredictable_behaviour);
+    f.Value(conf.wall_clock_cntpct);
+    f.Value(conf.check_halt_on_memory_access);
+    f.Value(conf.enable_cycle_counting);
+    f.Value(conf.global_monitor == nullptr);
+    f.Value(live_fp_optimizations.load(std::memory_order_relaxed));
+    f.Value(live_precise_get_set.load(std::memory_order_relaxed));
+    f.Value(live_fast_dispatch_inline.load(std::memory_order_relaxed));
+    f.Value(live_scalar_fp_in_xmm.load(std::memory_order_relaxed));
+    f.Value(live_fastmem_mask_by_and.load(std::memory_order_relaxed));
+    f.Value(live_fastmem_tbi_unmasked.load(std::memory_order_relaxed));
+    f.Value(live_compact_code.load(std::memory_order_relaxed));
+    return f.h;
+}
+
+void SharedCodeCache::Impl::EnableSnapshots() {
+    std::unique_lock held{lock};
+    snapshot_hashing = true;
+}
+
+s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 max_bytes, bool include_unverified) {
+    std::unique_lock held{lock};
+    if (!snapshot_hashing) {
+        return -2;
+    }
+    u8* const buffer = const_cast<u8*>(block_of_code.getCode());
+
+    // Every live block, in emission order: the newest range of each location names it.
+    std::vector<std::tuple<u64, u64, u32>> ranges;
+    emitter.SnapshotRanges(ranges);
+    tsl::robin_map<u64, size_t> newest;
+    for (size_t i = 0; i < ranges.size(); i++) {
+        newest[std::get<0>(ranges[i])] = i;
+    }
+    std::vector<size_t> live;
+    for (size_t i = 0; i < regions.size(); i++) {
+        if (regions[i].state == Region::State::Current || regions[i].state == Region::State::Full) {
+            live.push_back(i);
+        }
+    }
+    std::sort(live.begin(), live.end(), [this](size_t a, size_t b) { return regions[a].sequence < regions[b].sequence; });
+    std::vector<std::vector<SavedBlock>> per_region(regions.size());
+    std::vector<u64> used(regions.size(), 0);
+    for (size_t i = 0; i < ranges.size(); i++) {
+        const auto [location, first, span] = ranges[i];
+        if (newest[location] != i) {
+            continue;
+        }
+        const auto any = emitter.GetAnyBlock(IR::LocationDescriptor{location});
+        if (!any) {
+            continue;
+        }
+        const auto& [block, verified] = *any;
+        u64 hash = 0;
+        if (verified) {
+            const auto h = block_hashes.find(location);
+            if (h == block_hashes.end()) {
+                continue;  // emitted before hashing was on, or its code could not be read back
+            }
+            hash = h->second;
+        } else {
+            const auto u = unverified.find(location);
+            if (!include_unverified || u == unverified.end()) {
+                continue;
+            }
+            hash = u->second.hash;
+        }
+        const u8* const entry = static_cast<const u8*>(block.entrypoint);
+        size_t region = regions.size();
+        for (size_t r : live) {
+            if (entry >= regions[r].begin && entry + block.size <= regions[r].end) {
+                region = r;
+            }
+        }
+        if (region == regions.size()) {
+            continue;
+        }
+        SavedBlock saved{location, static_cast<u32>(entry - buffer), block.size, first, span, hash, {}, {}};
+        emitter.SnapshotSlotsOf(block.first_link, saved.slots);
+        emitter.SnapshotSitesIn(entry, entry + block.size, saved.sites);
+        used[region] = std::max<u64>(used[region], static_cast<u64>(entry + block.size - regions[region].begin));
+        per_region[region].push_back(std::move(saved));
+    }
+
+    u64 total = 0;
+    for (size_t r : live) {
+        total += used[r];
+    }
+    if (total > max_bytes) {
+        return -3;
+    }
+
+    const std::string temporary = std::string{path} + ".partial";
+    std::FILE* const file = OpenFile(temporary.c_str(), true);
+    if (file == nullptr) {
+        return -4;
+    }
+    Writer w{file};
+    const size_t key_len = std::strlen(key);
+    w.Value(SNAPSHOT_MAGIC);
+    w.Value(SNAPSHOT_VERSION);
+    w.Value(static_cast<u32>(key_len));
+    w.Bytes(key, key_len);
+    w.Value(CodeShape());
+    const auto placed = block_of_code.GetConstantPool().Placed();
+    w.Value(static_cast<u64>(placed.size()));
+    w.Bytes(placed.data(), placed.size_bytes());
+    u64 blocks = 0;
+    u32 region_count = 0;
+    for (size_t r : live) {
+        region_count += per_region[r].empty() ? 0 : 1;
+    }
+    w.Value(region_count);
+    for (size_t r : live) {
+        if (per_region[r].empty()) {
+            continue;
+        }
+        w.Value(static_cast<u32>(r));
+        w.Value(used[r]);
+        w.Bytes(regions[r].begin, used[r]);
+        w.Value(static_cast<u64>(per_region[r].size()));
+        for (const SavedBlock& b : per_region[r]) {
+            w.Value(b.location);
+            w.Value(b.entry);
+            w.Value(b.size);
+            w.Value(b.first);
+            w.Value(b.span);
+            w.Value(b.hash);
+            w.Value(static_cast<u32>(b.slots.size()));
+            w.Bytes(b.slots.data(), b.slots.size() * sizeof(EmitX64::SnapshotSlot));
+            w.Value(static_cast<u32>(b.sites.size()));
+            w.Bytes(b.sites.data(), b.sites.size() * sizeof(EmitX64::SnapshotSite));
+            blocks++;
+        }
+    }
+    w.Value(SNAPSHOT_MAGIC);
+    const bool closed = std::fclose(file) == 0;
+    if (!w.ok || !closed) {
+        std::filesystem::remove(std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(temporary.c_str())}});
+        return -5;
+    }
+    std::error_code error;
+    std::filesystem::rename(std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(temporary.c_str())}},
+                            std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(path)}}, error);
+    if (error) {
+        return -6;
+    }
+    return static_cast<s64>(blocks);
+}
+
+s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
+    // Read the whole file first, outside the lock.
+    std::vector<u8> data;
+    {
+        std::FILE* const file = OpenFile(path, false);
+        if (file == nullptr) {
+            return -1;
+        }
+        u8 chunk[1 << 16];
+        for (;;) {
+            const size_t n = std::fread(chunk, 1, sizeof(chunk), file);
+            data.insert(data.end(), chunk, chunk + n);
+            if (n < sizeof(chunk)) {
+                break;
+            }
+        }
+        std::fclose(file);
+    }
+    Reader in{std::move(data)};
+
+    std::unique_lock held{lock};
+    // Only into a cache that has emitted nothing: the restored blocks' records and ranges are made
+    // in emission order, region by region, as their emission made them.
+    if (blocks_emitted != 0 || snapshot_restored != 0 || current != 0 || block_of_code.getCurr<u8*>() != regions[0].begin) {
+        return -7;
+    }
+
+    // Parse and check everything before changing anything.
+    u64 magic = 0;
+    u32 version = 0, key_len = 0;
+    if (!in.Value(magic) || magic != SNAPSHOT_MAGIC || !in.Value(version) || version != SNAPSHOT_VERSION || !in.Value(key_len)) {
+        return -8;
+    }
+    const u8* const saved_key = in.Take(key_len);
+    if (saved_key == nullptr || key_len != std::strlen(key) || std::memcmp(saved_key, key, key_len) != 0) {
+        return -9;
+    }
+    u64 shape = 0;
+    if (!in.Value(shape) || shape != CodeShape()) {
+        return -10;
+    }
+    u64 constant_count = 0;
+    if (!in.Value(constant_count)) {
+        return -8;
+    }
+    const ConstantPool& pool = block_of_code.GetConstantPool();
+    if (constant_count > pool.CapacityBytes() / 16) {
+        return -8;
+    }
+    const u8* const constants = in.Take(constant_count * 16);
+    if (constants == nullptr) {
+        return -8;
+    }
+    const auto placed = pool.Placed();
+    if (placed.size() > constant_count || std::memcmp(placed.data(), constants, placed.size_bytes()) != 0) {
+        return -11;  // the prelude placed other constants
+    }
+    u32 region_count = 0;
+    if (!in.Value(region_count) || region_count > live_limit) {
+        return -8;
+    }
+    u8* const buffer = const_cast<u8*>(block_of_code.getCode());
+    std::vector<SavedRegion> saved_regions(region_count);
+    std::vector<bool> seen(regions.size(), false);
+    u64 block_total = 0;
+    for (SavedRegion& r : saved_regions) {
+        if (!in.Value(r.index) || r.index >= regions.size() || seen[r.index] || !in.Value(r.used)) {
+            return -8;
+        }
+        seen[r.index] = true;
+        const Region& region = regions[r.index];
+        if (r.used > static_cast<u64>(region.end - region.begin)) {
+            return -8;
+        }
+        r.bytes = in.Take(r.used);
+        u64 count = 0;
+        if (r.bytes == nullptr || !in.Value(count)) {
+            return -8;
+        }
+        const u64 lo = static_cast<u64>(region.begin - buffer);
+        const u64 hi = lo + r.used;
+        r.blocks.resize(count);
+        for (SavedBlock& b : r.blocks) {
+            u32 slots = 0, sites = 0;
+            if (!in.Value(b.location) || !in.Value(b.entry) || !in.Value(b.size) || !in.Value(b.first) || !in.Value(b.span) || !in.Value(b.hash)) {
+                return -8;
+            }
+            if (b.entry < lo || static_cast<u64>(b.entry) + b.size > hi || (b.size & EmitX64::UNVERIFIED_BLOCK) != 0) {
+                return -8;
+            }
+            if (!in.Value(slots) || slots > b.size / 8) {
+                return -8;
+            }
+            b.slots.resize(slots);
+            const u8* p = in.Take(slots * sizeof(EmitX64::SnapshotSlot));
+            if (p == nullptr) {
+                return -8;
+            }
+            std::memcpy(b.slots.data(), p, slots * sizeof(EmitX64::SnapshotSlot));
+            for (const auto& s : b.slots) {
+                if (s.slot < b.entry || static_cast<u64>(s.slot) + 8 > static_cast<u64>(b.entry) + b.size || s.slot % 8 != 0 || s.unlinked >= hi) {
+                    return -8;
+                }
+            }
+            if (!in.Value(sites) || sites > b.size) {
+                return -8;
+            }
+            b.sites.resize(sites);
+            p = in.Take(sites * sizeof(EmitX64::SnapshotSite));
+            if (p == nullptr) {
+                return -8;
+            }
+            std::memcpy(b.sites.data(), p, sites * sizeof(EmitX64::SnapshotSite));
+            const u64 prelude_end = static_cast<u64>(static_cast<const u8*>(block_of_code.GetCodeBegin()) - buffer);
+            for (const auto& s : b.sites) {
+                if (s.site < b.entry || s.site >= b.entry + b.size || s.resume < lo || s.resume >= hi || s.callback >= prelude_end) {
+                    return -8;
+                }
+            }
+        }
+        block_total += count;
+    }
+    u64 trailer = 0;
+    if (!in.Value(trailer) || trailer != SNAPSHOT_MAGIC || !in.AtEnd()) {
+        return -8;
+    }
+
+    // Install. The constant pool first: the blocks read their constants at fixed offsets.
+    block_of_code.EnableWriting();
+    SCOPE_EXIT {
+        block_of_code.DisableWriting();
+    };
+    ConstantPool& writable_pool = block_of_code.GetConstantPool();
+    for (u64 i = placed.size(); i < constant_count; i++) {
+        u64 pair[2];
+        std::memcpy(pair, constants + i * 16, 16);
+        const void* const at = writable_pool.Place(pair[0], pair[1]);
+        // A constant appears once in a pool; a snapshot whose pool repeats one is not ours.
+        ASSERT(at == static_cast<const u8*>(writable_pool.Begin()) + i * 16);
+    }
+    // The constructor started region 0; the snapshot's regions are started in its order instead.
+    regions[0].state = Region::State::Free;
+    current = NO_REGION;
+    for (SavedRegion& r : saved_regions) {
+        if (current != NO_REGION) {
+            regions[current].state = Region::State::Full;
+            current = NO_REGION;
+        }
+        StartRegion(r.index);
+        Region& region = regions[r.index];
+        u8* const committed = std::min(AlignUp(region.begin + r.used, SHARED_GRANULE), region.end);
+        if (committed > region.begin) {
+            block_of_code.CommitRange(region.begin, static_cast<size_t>(committed - region.begin));
+            region.code_committed_end = committed;
+        }
+        std::memcpy(region.begin, r.bytes, r.used);
+        for (const SavedBlock& b : r.blocks) {
+            const IR::LocationDescriptor location{b.location};
+            emitter.RestoreBlock(location, b.entry, b.size, b.slots.data(), b.slots.size(), b.sites.data(), b.sites.size());
+            emitter.RestoreGuestRange(location, b.first, b.span);
+            unverified[b.location] = Unverified{b.first, b.span, b.hash};
+        }
+        block_of_code.SetCodePtr(region.begin + r.used);
+    }
+    if (current == NO_REGION) {
+        StartRegion(0);
+    }
+    snapshot_hashing = true;
+    snapshot_restored += block_total;
+    unverified_count.store(unverified.size(), std::memory_order_relaxed);
+    return static_cast<s64>(block_total);
+}
+
+std::optional<CodePtr> SharedCodeCache::Impl::VerifyRestored(IR::LocationDescriptor location, const UserConfig& translator_conf) {
+    Unverified pending;
+    {
+        std::shared_lock guard{lock};
+        const auto it = unverified.find(location.Value());
+        if (it == unverified.end()) {
+            return std::nullopt;
+        }
+        pending = it->second;
+    }
+    // Read back outside the lock, as the frontend reads.
+    const auto hash = GuestCodeHash(translator_conf, pending.first, pending.first + pending.span);
+
+    std::unique_lock held{lock};
+    const auto it = unverified.find(location.Value());
+    if (it == unverified.end()) {
+        // Another thread verified (or dropped) it meanwhile.
+        if (const auto block = emitter.GetBasicBlock(location)) {
+            return block->entrypoint;
+        }
+        return std::nullopt;
+    }
+    unverified.erase(it);
+    unverified_count.store(unverified.size(), std::memory_order_relaxed);
+    const auto any = emitter.GetAnyBlock(location);
+    if (!any) {
+        return std::nullopt;  // invalidated or evicted before it was ever entered
+    }
+    if (any->second) {
+        return any->first.entrypoint;  // a newer translation
+    }
+    block_of_code.EnableWriting();
+    SCOPE_EXIT {
+        block_of_code.DisableWriting();
+    };
+    if (hash && *hash == pending.hash) {
+        emitter.MarkVerified(location);
+        block_hashes[location.Value()] = pending.hash;
+        snapshot_verified++;
+        return any->first.entrypoint;
+    }
+    emitter.InvalidateBasicBlocks({location});
+    snapshot_rejected++;
+    return std::nullopt;
+}
+
 CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserConfig& translator_conf, SharedThreadState& thread) {
     // Translate -- the frontend and the IR passes, most of the work, reading guest code through
     // this thread's callbacks -- without the cache's lock, so other threads' lookups are not held
@@ -841,6 +1470,12 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
     // lock of its own, not the cache's, so that waiting does not queue behind emission (MEASURED on
     // the 4-core Linux host: waiters retaking the cache's writer-preferring lock doubled the cold
     // pass of eight threads).
+    // Patch 0070: a block restored from a snapshot is entered once its guest code is found the same.
+    if (unverified_count.load(std::memory_order_relaxed) != 0) {
+        if (const auto restored = VerifyRestored(location, translator_conf)) {
+            return *restored;
+        }
+    }
     bool waited = false;
     for (;;) {
         if (waited) {
@@ -891,11 +1526,24 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
         translate_ns.fetch_add(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
     }
 
+    // Patch 0070: the guest code's hash, read back as the frontend read it, for a snapshot.
+    std::optional<u64> code_hash;
+    if (snapshot_hashing) {
+        code_hash = GuestCodeHash(translator_conf, A64::LocationDescriptor{ir_block->Location()}.PC(), A64::LocationDescriptor{ir_block->EndLocation()}.PC());
+    }
+
     std::unique_lock held{lock};
     for (;;) {
         if (const auto block = emitter.GetBasicBlock(location)) {
             translations_raced.fetch_add(1, std::memory_order_relaxed);
             return block->entrypoint;
+        }
+        // Patch 0070: a restored block still unverified here (its verification raced this
+        // translation) gives way to the new one.
+        if (const auto any = emitter.GetAnyBlock(location); any && !any->second) {
+            block_of_code.EnableWriting();
+            emitter.InvalidateBasicBlocks({location});
+            block_of_code.DisableWriting();
         }
         // Guest code the block was translated from may have changed since: an invalidation
         // applied meanwhile that touches its range means translating it again, now, under the
@@ -905,6 +1553,9 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
         if (InvalidatedSince(serial_before, begin.PC(), end.PC())) {
             translations_redone++;
             ir_block.emplace(TranslateBlock(location, translator_conf, polyfill_options));
+            if (snapshot_hashing) {
+                code_hash = GuestCodeHash(translator_conf, A64::LocationDescriptor{ir_block->Location()}.PC(), A64::LocationDescriptor{ir_block->EndLocation()}.PC());
+            }
         }
         const u64 before = epoch.load(std::memory_order_relaxed);
         EnsureRoom(thread, held);
@@ -922,6 +1573,13 @@ CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserC
     code_bytes_emitted += descriptor.size;
     if (!last_evicted.empty() && last_evicted.erase(location.Value()) != 0) {
         blocks_reemitted++;
+    }
+    if (snapshot_hashing) {  // patch 0070
+        if (code_hash) {
+            block_hashes[location.Value()] = *code_hash;
+        } else {
+            block_hashes.erase(location.Value());
+        }
     }
     return descriptor.entrypoint;
 }
@@ -971,6 +1629,9 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
 
 void SharedCodeCache::Impl::ForgetEverything(SharedThreadState* thread) {
     blocks_invalidated += emitter.ForgetAllBlocks();
+    block_hashes = {};  // patch 0070: every block is forgotten
+    unverified = {};
+    unverified_count.store(0, std::memory_order_relaxed);
     generation.fetch_add(1, std::memory_order_seq_cst);
     last_evicted = {};
     // Patch 0028: the emitter's serials start again from 0, and the full regions, whose blocks are
@@ -1287,6 +1948,9 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
         std::lock_guard attach_guard{attach_lock};
         s.attached = attached.size();
     }
+    s.snapshot_blocks_restored = snapshot_restored;  // patch 0070
+    s.snapshot_blocks_verified = snapshot_verified;
+    s.snapshot_blocks_rejected = snapshot_rejected;
     return s;
 }
 
@@ -1332,6 +1996,18 @@ void SharedCodeCache::ClearCache() {
 
 std::size_t SharedCodeCache::EvictTo(std::size_t keep_bytes) {
     return impl->EvictTo(keep_bytes);
+}
+
+void SharedCodeCache::EnableSnapshots() {
+    impl->EnableSnapshots();
+}
+
+std::int64_t SharedCodeCache::SaveSnapshot(const char* path, const char* key, std::uint64_t max_bytes, bool include_unverified) {
+    return impl->SaveSnapshot(path, key, max_bytes, include_unverified);
+}
+
+std::int64_t SharedCodeCache::LoadSnapshot(const char* path, const char* key) {
+    return impl->LoadSnapshot(path, key);
 }
 
 // ------------------------------------------------------------------------------------------------

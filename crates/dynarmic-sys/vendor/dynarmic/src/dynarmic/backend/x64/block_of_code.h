@@ -189,6 +189,11 @@ public:
 
     JitStateInfo GetJitStateInfo() const { return jsi; }
 
+    /// Omnidroid patch 0070: the constant pool and the host features, for a translation snapshot.
+    ConstantPool& GetConstantPool() { return constant_pool; }
+    const ConstantPool& GetConstantPool() const { return constant_pool; }
+    HostFeature HostFeatureBits() const { return host_features; }
+
     bool HasHostFeature(HostFeature feature) const {
         return (host_features & feature) == feature;
     }

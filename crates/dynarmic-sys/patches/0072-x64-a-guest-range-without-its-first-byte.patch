@@ -1,5 +1,5 @@
 diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
-index 2a5c907..3a72bc2 100644
+index 9c3b59a..247d3bf 100644
 --- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
 +++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
 @@ -330,7 +330,9 @@ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 l
@@ -14,10 +14,10 @@ index 2a5c907..3a72bc2 100644
          return;
      }
 diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
-index f654d03..4f92f75 100644
+index b48ce0e..9817928 100644
 --- a/src/dynarmic/backend/x64/a64_emit_x64.h
 +++ b/src/dynarmic/backend/x64/a64_emit_x64.h
-@@ -204,16 +204,17 @@ protected:
+@@ -211,16 +211,17 @@ protected:
      // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
      /// Patch 0052: 20 bytes at 4-byte alignment (24 before): the location as a `Key64`, the first
      /// byte in two halves, and the length (0: an empty range, `last < first` as registered).
@@ -39,7 +39,7 @@ index f654d03..4f92f75 100644
      static constexpr unsigned guest_page_bits = 12;
      /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
      /// invalidation, instead of in every page it covers.
-@@ -223,6 +224,7 @@ protected:
+@@ -230,6 +231,7 @@ protected:
      const GuestRange& RangeAt(u32 serial) const { return guest_ranges[serial - range_base]; }
      tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
      std::vector<u32> wide_guest_ranges;

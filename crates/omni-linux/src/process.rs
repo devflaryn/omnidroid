@@ -88,6 +88,9 @@ pub struct Process {
     pub(crate) traced: crate::ptrace::Traced,
     /// Shared with the vfork children running in this process's memory.
     backend: Option<Arc<DynarmicBackend>>,
+    /// Where its translation snapshot is read and written (`crate::jit_snapshot`), if snapshots
+    /// are on.
+    pub(crate) jit_snapshot: std::sync::OnceLock<crate::jit_snapshot::Target>,
     pub(crate) start: Mutex<Option<(u64, u64)>>, // (pc, sp) of the main task
     exit: Mutex<Option<ExitStatus>>,
     /// Signalled when `exit` is set.
@@ -725,6 +728,7 @@ impl Process {
             traced: crate::ptrace::Traced::default(),
             sigtramp: std::sync::atomic::AtomicU64::new(0),
             backend,
+            jit_snapshot: std::sync::OnceLock::new(),
             start: Mutex::new(None),
             exit: Mutex::new(None),
             exited: parking_lot::Condvar::new(),
@@ -783,6 +787,7 @@ impl Process {
         let space = Arc::new(reserve_space().map_err(|e| format!("reserve the guest address space: {e}"))?);
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid, view);
+        crate::jit_snapshot::attach(&p, &exe, &config.argv);
         p.load(&exe, &config.argv, &config.envp)?;
         Ok(p)
     }
@@ -848,6 +853,7 @@ impl Process {
         p.sys.inherit_ignored(&self.sys);
         p.sys.inherit_ids(&self.sys);
         p.family.inherit(&self.family);
+        crate::jit_snapshot::attach(&p, exe, argv);
         p.load(exe, argv, envp)?;
         Ok(p)
     }
@@ -981,6 +987,9 @@ impl Process {
             }
         }
         drop(tasks);
+        // Every thread stopped: its translations as they are now, for the next process of the
+        // same program (`OMNI_JIT_SNAPSHOT`).
+        crate::jit_snapshot::save(self, "exit");
         let status = self.group_exit.lock().clone().unwrap_or(status);
         // Exit closes every descriptor, whoever still holds the process (a parent that has not
         // waited for it): a pipe's reader sees end of file once its last writer has ended.

@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 6u
+#define OD_DYNARMIC_ABI_VERSION 7u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -419,6 +419,10 @@ typedef struct od_code_cache_stats {
     uint64_t evict_max_ns;        /* the longest single eviction */
     uint64_t regions_live;        /* regions whose blocks are live now */
     uint64_t regions_live_max;    /* how many may be */
+    /* Patch 0070 (ABI 7): translation snapshots. */
+    uint64_t snapshot_blocks_restored;  /* installed from a snapshot, unverified */
+    uint64_t snapshot_blocks_verified;  /* of those, found unchanged at their first lookup and entered */
+    uint64_t snapshot_blocks_rejected;  /* of those, whose guest code had changed: dropped */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
 
@@ -457,6 +461,21 @@ void od_code_cache_clear(void* cache);
 /* Patch 0050: retire the oldest full regions until at most `keep_bytes` of regions are live (at
  * least the one being filled stays); how many were retired. Same restriction as the clear. */
 uint64_t od_code_cache_evict_to(void* cache, uint64_t keep_bytes);
+/* Patch 0070: translation snapshots (x64; a no-op returning -1 elsewhere). `enable` makes the
+ * cache hash the guest code of every block it emits from then on. `save` writes every live block
+ * that has a hash to `path` (UTF-8; written beside and renamed), tagged with `key`; the blocks
+ * written, or negative: -2 not enabled, -3 more than `max_bytes` of code, -4..-6 the file. `load`,
+ * on a cache that has emitted nothing, installs a snapshot with the same key and code shape: each
+ * block entered only once a lookup reads its guest code back unchanged. The blocks installed, or
+ * negative (the cache unchanged): -1 no file, -7 not an empty cache, -8 malformed, -9 another key,
+ * -10 another code shape (build, configuration, switches, host), -11 another prelude pool. Same
+ * restriction as the clear. */
+void od_code_cache_enable_snapshots(void* cache);
+/* `flags`: OD_SNAPSHOT_ENTERED_ONLY leaves out the blocks restored from a snapshot and never entered
+ * since (written with their stored hashes otherwise). */
+#define OD_SNAPSHOT_ENTERED_ONLY 1u
+int64_t od_code_cache_save_snapshot(void* cache, const char* path, const char* key, uint64_t max_bytes, uint32_t flags);
+int64_t od_code_cache_load_snapshot(void* cache, const char* path, const char* key);
 
 /* Where a jit's JitState keeps its two exclusive-monitor slot pointers, which code in a shared
  * cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot addresses

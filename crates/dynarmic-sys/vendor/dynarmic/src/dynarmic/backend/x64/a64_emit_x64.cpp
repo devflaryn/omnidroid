@@ -354,6 +354,13 @@ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 l
     }
 }
 
+void A64EmitX64::SnapshotRanges(std::vector<std::tuple<u64, u64, u32>>& out) const {
+    out.reserve(out.size() + guest_ranges.size());
+    for (const GuestRange& r : guest_ranges) {
+        out.emplace_back(r.location.Value(), r.First(), r.span);
+    }
+}
+
 tsl::robin_set<IR::LocationDescriptor> A64EmitX64::GuestRangeLocations(const boost::icl::interval_set<u64>& ranges) const {
     tsl::robin_set<IR::LocationDescriptor> locations;
     for (const auto& interval : ranges) {

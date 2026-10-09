@@ -585,7 +585,69 @@ medians): the locked dispatcher lookup 115 -> 70 ns, threaded dispatch with Fast
 28.0 ns/op. Verified: the dynarmic-sys suite, `a64_exec`/`hostile`/`host_fault` under
 `OD_TEST_SHARED_CACHE=1`, omni-cpu's exclusive/tbi/faults/thunk/lifecycle/exclusive_store_fault.
 
-### 0065 — x64: a guest range without its first byte
+### 0070 — x64 shared cache: translation snapshots (off unless asked for)
+
+x64, shared caches. A cache's translations are written to a file and installed into a later
+cache, so a program does not translate again what it ran last time. Nothing changes unless a
+host calls these (omni-linux: `OMNI_JIT_SNAPSHOT=<dir>`).
+
+- **The API.** `SharedCodeCache::EnableSnapshots`, `SaveSnapshot(path, key, max_bytes,
+  include_unverified)` and `LoadSnapshot(path, key)`; in the shim, `od_code_cache_enable_snapshots`,
+  `od_code_cache_save_snapshot` and `od_code_cache_load_snapshot` (ABI 7). The stats count the
+  blocks restored, verified and rejected.
+- **What is saved.** With snapshots enabled, each block emitted keeps a hash of the guest code it
+  was translated from, read back through the translating thread's `MemoryReadCode`. A save writes
+  each live region's code bytes and, per block, its location, offset, guest range and hash, link
+  slots (`SnapshotSlotsOf`) and fastmem sites (`SnapshotSitesIn`). It also writes the constant
+  pool and the *code shape*: a hash of the prelude's code with its 64-bit immediates and its own
+  addresses left out, sample host function addresses (this executable, the C runtime), the
+  configuration that shapes code, the live switches (0034/0037/0039/0040/0041/0042/0061) and the
+  host's features.
+- **What a load does.** Only into a cache that has emitted nothing, and only with the same key
+  and code shape. It replays the constant pool, then restarts the snapshot's regions in their
+  order at the same indices. It copies their bytes, rewrites every slot unlinked and records the
+  slots, sites and guest ranges as emission did (`RestoreBlock`, `RestoreGuestRange`). Each block
+  is installed with `UNVERIFIED_BLOCK` set in its stored size. `GetBasicBlock` hides such a block,
+  and no slot is linked to it.
+- **Verification.** The first lookup of a restored block (`VerifyRestored`, at the top of
+  `Impl::Emit`) reads its guest code back outside the lock and compares the hash. If it matches,
+  the block is entered and linked both ways (`MarkVerified`). If not, it is dropped (and
+  translated as usual).
+
+**Why the code can be moved.** A shared cache's block reaches the prelude, the constant pool and
+its slots `rip`-relatively, and everything per-thread or per-process through JitState (0022).
+MEASURED with `tests/code_size.rs` (`OMNI_EMIT_DUMP2`): 11,005 blocks emitted into two caches at
+different addresses, with different monitors, have identical bytes up to their link slots. A
+block's absolute host addresses are the helper functions it calls, which the code shape checks.
+So is the buffer being out of `call rel32` reach of them; otherwise only a cache at the same
+address matches.
+
+Verified:
+
+- `tests/snapshot.rs`:
+  - A program restored into another cache, at another address with another monitor, gives the
+    same results with nothing translated.
+  - Changed guest code drops exactly the one block it touches.
+  - A host fault in a restored block is served through its restored fastmem site.
+  - Another key (-9), another code shape (compact code on: -10) and a cache that has emitted
+    (-7) are refused.
+  - A restored cache saved again keeps its unverified blocks, or with
+    `OD_SNAPSHOT_ENTERED_ONLY` none of them.
+- `tests/code_size.rs::a_snapshot_of_real_code_runs_it_the_same`: bionic `libc.so`'s 4,855
+  first blocks, saved and restored into a second cache. Every register file, PC and the data
+  arena are identical to the first pass's, nothing is translated, and every block is verified.
+- The dynarmic-sys suite, per-thread and shared.
+
+### 0071 — x64 shared cache: restored blocks keep 0064's link heads
+
+x64, shared caches. 0070 was written before 0064 and kept every restored link's head in
+`link_heads`. With 0064 a translated target's head lives beside its block: `RestoreBlock` now
+chains a link through `HeadOf` (the target's block when it was restored first), and a restored
+block takes over the head already waiting for it in `link_heads`, as `RegisterBlock` does.
+Without it, a restored target's later links would start a second list in `link_heads` that its
+`Patch`/`Unpatch` never walk.
+
+### 0072 — x64: a guest range without its first byte (written as 0065, renumbered after 0070/0071)
 
 x64. A block's `GuestRange` (patch 0026's per-block record, 20 bytes since 0052) kept its first
 guest byte, which is always its own location's PC: `Emit`, the only caller of `AddGuestRange`,
@@ -593,7 +655,7 @@ passes `descriptor.PC()` (now asserted). `GuestRange::First()` reads it back fro
 record is 12 bytes. In a world's game host (`OMNI_MEM_TRACE` 2026-10-09: 636,522 ranges) -4.9 MiB,
 in the system host (233k-380k ranges over 40 caches) -1.8 to -2.9 MiB. The same behaviour.
 
-### 0066 — x64 shared cache: the maps shrink after blocks are forgotten (a switch, off)
+### 0073 — x64 shared cache: the maps shrink after blocks are forgotten (a switch, off; written as 0066)
 
 x64, shared caches. A robin_map never gives its bucket array back, so a cache whose blocks an
 eviction (code aging, `EvictTo`; the live limit) or an invalidation forgot kept the block map, the
@@ -609,3 +671,6 @@ on through the rehashed maps, an invalidation after it too. What it is for:
 with `code_age_game` the game's 28 MiB block map (2^20 buckets, 636k blocks) stays at 2^20 after
 aging to ~260k blocks; with this, 2^19 (-14 MiB) or less.
 
+
+With 0070's snapshots: `RestoreGuestRange` passes the saved `First()`, the location's PC, so 0072's
+assert holds for restored blocks too.

@@ -1,6 +1,7 @@
 """Compare two emit dumps (`tests/code_size.rs::the_speed_of_emission`, OMNI_EMIT_DUMP).
 
-Each line is one block: guest PC, total size (with link slots), code bytes (hex, up to the slots).
+Each line is one block: guest PC, total size (with link slots), code bytes (hex, up to the slots),
+and (newer dumps) the block's host address.
 Two builds of the emitter are the same when every block has the same guest PC, the same total size,
 the same code length and the same bytes -- except inside the operand of a host *absolute address*,
 which differs between builds and between runs (Windows ASLR moves the executable):
@@ -19,7 +20,8 @@ def load(path):
     blocks = []
     with open(path, encoding="ascii") as f:
         for line in f:
-            pc, total, code = line.split()
+            fields = line.split()
+            pc, total, code = fields[:3]  # a fourth, the block's host address, when present
             blocks.append((int(pc, 16), int(total), bytes.fromhex(code)))
     return blocks
 
