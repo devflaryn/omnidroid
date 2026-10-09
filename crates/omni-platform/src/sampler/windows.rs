@@ -46,6 +46,9 @@ extern "system" {
     fn QueryThreadCycleTime(thread: HANDLE, cycles: *mut u64) -> i32;
 }
 
+mod whole;
+pub(super) use whole::{current_thread_id, open_thread, process_cpu_time, symbolize, threads};
+
 fn last_error(operation: &'static str, api: &'static str) -> SamplerError {
     // SAFETY: reads the calling thread's last-error value; no arguments.
     SamplerError::LastError { operation, api, code: unsafe { GetLastError() } }

@@ -15,6 +15,7 @@ pub mod boot;
 pub mod cpuprof;
 pub mod guestprof;
 pub mod threadsys;
+pub mod proccpu;
 pub mod bpf;
 pub mod device;
 pub mod display_window;

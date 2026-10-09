@@ -13,6 +13,10 @@
 //! `OMNI_GUEST_PROF=1` as well: each `jit` sample's host address is kept, and every report is
 //! followed by `[guestprof]` lines naming the guest functions those samples ran ([`crate::guestprof`]).
 //!
+//! `[thread-host]` lines name, for the same threads, the host functions their samples in an image
+//! (`dyn`, `kern`, a DLL) were in, from the PDB (`crate::proccpu::HostNames`; `OMNI_HOST_SYMBOLS=0`
+//! leaves them out).
+//!
 //! Each report is also followed by `[thread-sys]` lines: for the same threads, the wall and processor
 //! time inside each system call, and which guest code their futex waits came from
 //! ([`crate::threadsys`]).
@@ -45,6 +49,9 @@ struct Entry {
     kern: HashMap<String, u32>,
     /// `OMNI_GUEST_PROF`: the host address of each `jit` sample this period.
     jit: Vec<u64>,
+    /// The host address of each sample in an image (`dyn`, `kern`, a DLL), named by function at
+    /// the report (`[thread-host]`).
+    host_ips: Vec<usize>,
     /// The guest process the task belongs to, for its memory map.
     process: Option<Weak<crate::process::Process>>,
     /// The task's system-call counters (`[thread-sys]`), which its own thread writes.
@@ -57,6 +64,7 @@ static THREADS: Mutex<Option<HashMap<i32, Entry>>> = Mutex::new(None);
 
 /// The calling host thread runs task `tid` from now on (`Process::run_task`).
 pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Weak<crate::process::Process>>) {
+    crate::proccpu::task_started(tid, name);
     let Some(every) = period() else { return };
     static REPORTER: OnceLock<()> = OnceLock::new();
     REPORTER.get_or_init(|| {
@@ -79,6 +87,7 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Wea
             exe: HashMap::new(),
             kern: HashMap::new(),
             jit: Vec::new(),
+            host_ips: Vec::new(),
             process,
             sys,
             report_cycles,
@@ -88,6 +97,7 @@ pub fn started(tid: i32, name: &[u8], state: &Arc<AtomicU8>, process: Option<Wea
 
 /// Task `tid` is no longer run by its host thread.
 pub fn stopped(tid: i32) {
+    crate::proccpu::task_stopped();
     if period().is_some() {
         crate::threadsys::detach();
         if let Some(m) = THREADS.lock().as_mut() {
@@ -98,6 +108,7 @@ pub fn stopped(tid: i32) {
 
 /// Task `tid` renamed itself (`PR_SET_NAME`).
 pub fn renamed(tid: i32, name: &[u8]) {
+    crate::proccpu::task_renamed(tid, name);
     if period().is_some() {
         if let Some(e) = THREADS.lock().as_mut().and_then(|m| m.get_mut(&tid)) {
             e.name = name.to_vec();
@@ -115,6 +126,7 @@ fn sample_loop(every: u64) {
     let mut kinds: HashMap<usize, MemoryKind> = HashMap::new();
     let guest = crate::guestprof::enabled();
     let mut symbols = crate::guestprof::Symbolizer::default();
+    let mut host_names = crate::proccpu::HostNames::default();
     loop {
         std::thread::sleep(Duration::from_millis(10));
         ticks += 1;
@@ -132,6 +144,9 @@ fn sample_loop(every: u64) {
             let Ok(s) = e.host.sample(&mut code) else { continue };
             let page = s.ip & !0xfff;
             let kind = *kinds.entry(page).or_insert_with(|| sampler::memory_kind(s.ip).unwrap_or(MemoryKind::Other));
+            if matches!(kind, MemoryKind::Image { .. }) && e.host_ips.len() < 4096 {
+                e.host_ips.push(s.ip);
+            }
             if kernel {
                 let at = match kind {
                     MemoryKind::Image { base } if base == exe_base => format!("+{:#x}", (s.ip - exe_base) & !0xff),
@@ -166,7 +181,8 @@ fn sample_loop(every: u64) {
         // Every thread's system-call counters are taken (and so reset) each period; the hot ones
         // are reported.
         let mut sys: Vec<(i32, Arc<crate::threadsys::Counters>, f64)> = Vec::new();
-        let mut lines: Vec<(Duration, String, Option<crate::guestprof::HotThread>, i32)> = map
+        #[allow(clippy::type_complexity)]
+        let mut lines: Vec<(Duration, String, Option<crate::guestprof::HotThread>, i32, (Vec<usize>, u32))> = map
             .iter_mut()
             .filter_map(|(tid, e)| {
                 let now = e.host.cpu_time().ok()?;
@@ -180,6 +196,7 @@ fn sample_loop(every: u64) {
                 let exe = std::mem::take(&mut e.exe);
                 let kern = std::mem::take(&mut e.kern);
                 let jit = std::mem::take(&mut e.jit);
+                let host_ips = std::mem::take(&mut e.host_ips);
                 if used < Duration::from_millis(every * 50) {
                     return None; // under 5% of a core
                 }
@@ -212,6 +229,7 @@ fn sample_loop(every: u64) {
                     ),
                     guest_hot,
                     *tid,
+                    (host_ips, total),
                 ))
             })
             .collect();
@@ -222,11 +240,13 @@ fn sample_loop(every: u64) {
         let total: Duration = lines.iter().map(|l| l.0).sum();
         let mut hot = Vec::new();
         let hot_tids: Vec<i32> = lines.iter().take(12).map(|l| l.3).collect();
+        let mut host_samples = Vec::new();
         let body: Vec<String> = lines
             .into_iter()
             .take(12)
             .map(|l| {
                 hot.extend(l.2);
+                host_samples.push((l.3, l.4));
                 l.1
             })
             .collect();
@@ -238,6 +258,27 @@ fn sample_loop(every: u64) {
             body.join("\n[thread-cpu]   ")
         );
         // After the registry is let go: the lookups below take locks a guest thread may hold.
+        // `[thread-host]`: each hot thread's samples in host code, by function (the PDB's names).
+        if crate::proccpu::host_symbols() {
+            let caveat = host_names.caveat();
+            if !caveat.is_empty() && host_samples.iter().any(|(_, (ips, _))| !ips.is_empty()) {
+                eprintln!("[thread-host]{caveat}");
+            }
+            for (tid, (ips, total)) in host_samples {
+                if ips.is_empty() {
+                    continue;
+                }
+                let mut by: HashMap<String, u32> = HashMap::new();
+                for ip in ips {
+                    *by.entry(host_names.name(ip)).or_default() += 1;
+                }
+                let mut by: Vec<(String, u32)> = by.into_iter().collect();
+                by.sort_by(|a, b| b.1.cmp(&a.1));
+                let rows: Vec<String> = by.iter().take(8).map(|(n, k)| format!("{n} {}%", k * 100 / total.max(1))).collect();
+                let name = names.get(&tid).map(|n| String::from_utf8_lossy(&n.0).into_owned()).unwrap_or_default();
+                eprintln!("[thread-host] {tid} {name:?}: {}", rows.join(", "));
+            }
+        }
         if guest {
             let report = crate::guestprof::report(&hot, &mut symbols);
             if !report.is_empty() {
