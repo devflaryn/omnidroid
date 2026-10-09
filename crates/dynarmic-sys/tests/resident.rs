@@ -143,3 +143,60 @@ fn a_code_cache_s_constant_pool_is_committed_but_not_resident() {
     eprintln!("after a run: {:.2} MiB resident", mib(resident_after_run));
     assert!(mib(resident_after_run) < 2.0, "{:.2} MiB", mib(resident_after_run));
 }
+
+/// Every private allocation's committed bytes and ranges, by base (exec or not).
+fn all_allocations() -> BTreeMap<usize, (usize, Vec<(usize, usize)>)> {
+    let mut by_base: BTreeMap<usize, (usize, Vec<(usize, usize)>)> = BTreeMap::new();
+    let mut at = 0usize;
+    loop {
+        let mut info = MemoryBasicInformation::default();
+        // SAFETY: as in `executable_allocations`.
+        let got = unsafe { VirtualQuery(at as *const c_void, &mut info, std::mem::size_of::<MemoryBasicInformation>()) };
+        if got == 0 {
+            break;
+        }
+        if info.state == MEM_COMMIT && info.kind == MEM_PRIVATE && info.protect & 0x100 == 0 && info.protect != 1 {
+            let e = by_base.entry(info.allocation_base).or_default();
+            e.0 += info.region_size;
+            e.1.push((info.base_address, info.region_size));
+        }
+        let next = info.base_address + info.region_size;
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    by_base
+}
+
+/// **Measurement**: the private allocations of 256 KiB or more a code cache and its monitor add
+/// when made -- what each guest process of the system's host costs before it translates anything.
+#[test]
+#[ignore = "measurement, not a test"]
+fn what_a_new_code_cache_allocates() {
+    let before = all_allocations();
+    let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
+    let arena = arena.as_mut_ptr();
+    // SAFETY: freed below.
+    let monitor = unsafe { od_monitor_new(4096) };
+    let opts = VmOptions { shared_arena: arena as usize, shared_monitor: monitor as usize, ..VmOptions::default() };
+    let cache = Vm::new_code_cache(&opts, monitor, arena, 1 << 30, 16 << 20, 256 << 20);
+    let after = all_allocations();
+    for (base, (committed, ranges)) in &after {
+        let old = before.get(base).map_or(0, |b| b.0);
+        if committed.saturating_sub(old) >= 256 << 10 {
+            let (resident, _) = resident_pages(ranges);
+            eprintln!(
+                "  {base:#x}: {:.2} MiB committed (+{:.2}), {:.2} MiB resident",
+                *committed as f64 / 1048576.0,
+                (committed - old) as f64 / 1048576.0,
+                (resident * PAGE) as f64 / 1048576.0
+            );
+        }
+    }
+    // SAFETY: no jit uses either.
+    unsafe {
+        od_code_cache_free(cache);
+        od_monitor_free(monitor);
+    }
+}

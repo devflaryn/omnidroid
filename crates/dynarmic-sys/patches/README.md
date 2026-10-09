@@ -519,3 +519,14 @@ suite with `OD_TEST_COMPACT` on, per-thread and shared. With the switch defaulte
 `a1_toybox`, `a4_threads`, `a5_signals`, `b_hello_dex` (ART; with `OMNI_BOOT_IMAGE_UNCOMPRESSED=0`,
 since that test's mapping-name check fails at HEAD either way) and `tbi_off`.
 
+### 0053 — x64: the fastmem fallbacks in flat tables
+
+x64. `A64EmitX64`'s `read_fallbacks`, `write_fallbacks` and `exclusive_write_fallbacks` were
+`std::map`s of ~2,000 entries each, filled by the prelude: ~6,000 tree nodes, ~0.6 MiB of heap per
+code cache (`tests/resident.rs::what_a_new_code_cache_allocates`: +0.65 MiB before, nothing over
+256 KiB after) -- in the system's host process one cache per guest process (40 caches in a
+world, ~25 MiB). Now three arrays indexed by (ordered, bit size, address register, value register),
+20 KiB each, read through the same `operator[]` (a missing entry reads null, as the map's did).
+Verified: the dynarmic-sys suite, omni-cpu's exclusive/tbi/faults/thunk/lifecycle tests under
+`OD_TEST_SHARED_CACHE=1`.
+

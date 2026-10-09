@@ -248,9 +248,27 @@ protected:
     void (*memory_exclusive_write_128)();
     void GenMemory128Accessors();
 
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;
-    std::map<std::tuple<bool, size_t, int, int>, void (*)()> exclusive_write_fallbacks;
+    /// Omnidroid patch 0053: the fastmem fallbacks by (ordered, bit size, address register, value
+    /// register), a flat array instead of a `std::map`. The prelude makes ~2,000 of each kind; as
+    /// map nodes (~80 bytes each with the heap's header) the three held ~0.5 MiB per code cache --
+    /// in the system's host process, one cache per guest process (~40). Here 2 x 5 x 16 x 16
+    /// pointers, 20 KiB each. Read only through `operator[]`, as the maps were (a missing entry
+    /// reads null, as a map's `operator[]` made it).
+    struct FallbackTable {
+        using Fn = void (*)();
+        std::array<Fn, 2 * 5 * 16 * 16> fns{};
+        static size_t Index(const std::tuple<bool, size_t, int, int>& k) {
+            const auto [ordered, bitsize, vaddr, value] = k;
+            const size_t size = bitsize == 8 ? 0 : bitsize == 16 ? 1 : bitsize == 32 ? 2 : bitsize == 64 ? 3 : 4;
+            ASSERT(bitsize == 8 || bitsize == 16 || bitsize == 32 || bitsize == 64 || bitsize == 128);
+            ASSERT(vaddr >= 0 && vaddr < 16 && value >= 0 && value < 16);
+            return ((static_cast<size_t>(ordered) * 5 + size) * 16 + static_cast<size_t>(vaddr)) * 16 + static_cast<size_t>(value);
+        }
+        Fn& operator[](const std::tuple<bool, size_t, int, int>& k) { return fns[Index(k)]; }
+    };
+    FallbackTable read_fallbacks;
+    FallbackTable write_fallbacks;
+    FallbackTable exclusive_write_fallbacks;
     void GenFastmemFallbacks();
 
     const void* terminal_handler_pop_rsb_hint;
