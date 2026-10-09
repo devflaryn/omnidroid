@@ -59,7 +59,7 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 3 | dynarmic **0077**: IR accessors inline, `VerificationPass` only with `OMNI_JIT_VERIFY=1` | `the_speed_of_emission` (deterministic, byte-identical code) | frontend **7.60 -> 4.85 us/block** (i5-4460), 4.34 -> 3.16 (i7, verify on/off) | yes |
 | 4 | dynarmic **0078**: small fastmem fallbacks (`OMNI_JIT_SMALL_FALLBACKS`) | `tests/resident.rs`, fallback bytes | a fresh cache's resident **0.88 -> 0.13 MiB** (Windows); fallbacks 1.89 MB -> 115 KB per cache (Linux) | yes |
 | 5 | 0077 + 0078 on a device: `old` = `OMNI_JIT_SMALL_FALLBACKS=0 OMNI_JIT_VERIFY=1` | s3 `s3-jit.csv`, 3 pairs ABBA-BA | **fps 57.81/58.05/58.69 -> 58.70/59.14/59.33 (3/3)**; **engine worker 13.81/14.00/12.88 -> 11.85/10.64/12.33 ms/frame (3/3)**; game JIT per boot translate 11.0 -> 8.8-9.2 s, emit ~22 s both; join/world within noise; **system host WS +15-20 MB (3/3)** -- see below | yes, with #6 |
-| 6 | code aging's floor 8 -> 6 MiB (`code_trim::MIN_BYTES`) | to measure (s5) | the +17 MB of #5: a cache's commit counts its prelude, ~1 MiB smaller with 0078, so ~6 small quiet services (ueventd, gatekeeperd, HALs) fell under the 8 MiB floor and kept ~110k blocks (block map 542k -> 652k entries, JIT tables 78 -> 95 MiB) | pending |
+| 6 | code aging's floor 8 -> 6 MiB (`code_trim::MIN_BYTES`) | s5 `s5-snap.csv`, `new` vs `new8` (`OMNI_CODE_TRIM_MIN_MB=8`), 2 pairs | **private WS 3.079/3.102 -> 2.991/2.993 GB (-88/-109 MB)**; **system host 0.911/0.908 -> 0.822/0.824 GB**; all ms/frame 42.8/41.2 -> 38.6/41.2; fps, join, world the same. Cause of #5's +17 MB: a cache's commit counts its prelude, ~1 MiB smaller with 0078, so small quiet services (ueventd, gatekeeperd, HALs) fell under the 8 MiB floor and kept their translations; at 6 they are trimmed again, and more with them | **yes** |
 | 7 | dynarmic **0079**: Xbyak's label manager without heap nodes (tsl robin map/set, flat waiting list) | `the_speed_of_emission`, byte-identical | emit **15.7 -> 13.1 us/block (-16.5%)**, i5-4460 | yes (device check s5) |
 | 8 | dynarmic **0080**: a value's host location from a checked hint, not a search | same | emit **13.1 -> 11.9 us/block (-9%)** | yes (device check s5) |
 
@@ -72,3 +72,26 @@ much of that itself, on its own frame time.
 memory 210 MiB, translated code 326-338 MiB committed, the JIT's tables on the heap 78-95 MiB (block
 map, links, fastmem sites, guest ranges: ~155 bytes per live block, beside ~380 bytes of code). The
 JIT is about half of that host's working set.
+
+## Session s5 (00:32-01:22): translation snapshots, and code aging's floor (`s5-snap.csv`)
+
+Build fd73108 (0076-0080, floor 6 MiB). `snap` = `OMNI_JIT_SNAPSHOT` + `_LAZY=1` + `_LIB_ZONE=1` +
+`_FORGET=1` (one fill run first). Milestones from the log's `[t]` clock (seconds from start):
+
+| arm | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded | private WS | system host |
+|---|---|---|---|---|---|---|---|
+| new | 11.5 / 11.4 | 30.6 / 30.4 | 58.9 / 58.4 | 72.0 / 71.4 | 86.0 / 85.5 | 2.991 / 2.993 | 0.822 / 0.824 |
+| new8 | 11.4 / 11.5 | 30.5 / 30.7 | 58.6 / 59.0 | 71.2 / 73.0 | 85.6 / 86.0 | 3.079 / 3.102 | 0.911 / 0.908 |
+| snap | 11.2 / 11.3 | **28.4 / 27.7** | **54.4 / 53.3** | **68.4 / 63.5** | **82.4 / 79.5** | 3.137 / 3.108 | 0.872 / 0.851 |
+
+Snapshots: -2..-3 s to boot_completed, -4..-5 s to sign-in, -3..-6 s to the world; +115..+145 MB
+private WS against `new`. Where they work and where not (`[jit-snapshot]` lines):
+- native daemons, SurfaceFlinger, the small app hosts: **~98-100% of restored blocks verified** --
+  the library zone puts every library at its home (SurfaceFlinger 141,931 of 143,869).
+- system_server: 98% of 78,488 verified, but its snapshot is small: it was saved after code aging had
+  dropped most of its translations (549k blocks translated anyway).
+- **the game: 682,955 restored, 16,628 verified (2.4%)**, and the settle-time forget dropped 0 in 12
+  ms -- the restored blocks were already gone from the cache (invalidated), so the game translated its
+  1.7M blocks as without a snapshot. Its host's commit was +84 MiB (2,641 vs 2,557) with the same
+  guest memory and JIT counters: the snapshot machinery's own memory for a game it does not help.
+  Next: what invalidates the game's restored blocks (`[jit-time]` now counts invalidations).

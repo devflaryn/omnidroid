@@ -300,7 +300,7 @@ fn the_apk_is_installed_started_and_draws() {
     // `OMNI_R_PLACE=<id>`: once signed in, the place's deep link, as a link opened on a device.
     let join = place.as_deref().map_or_else(String::new, |id| {
         format!(
-            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 900 ]; do sleep 1; i=$((i+1)); done; sleep {}; {}",
+            "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 4500 ]; do sleep 0.2; i=$((i+1)); done; sleep {}; {}",
             common::r_scripts::link_delay(),
             join_script(id, 90)
         )
@@ -389,9 +389,9 @@ fn the_apk_is_installed_started_and_draws() {
         let start = "am start -W -n \"$act\"; echo \"[r] am start: $?\"; ";
         let open = place.as_deref().map_or_else(String::new, |id| {
             format!(
-                "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 300 ]; do \
+                "i=0; until [ -e /data/local/tmp/signed-in ] || [ $i -ge 1500 ]; do \
                  if [ -e /data/local/tmp/app-died ]; then rm -f /data/local/tmp/app-died; am start -n \"$act\"; echo \"[r] the app died: started again\"; fi; \
-                 sleep 1; i=$((i+1)); done; {}",
+                 sleep 0.2; i=$((i+1)); done; {}",
                 join_script(id, 120)
             )
         });

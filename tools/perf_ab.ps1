@@ -112,7 +112,7 @@ function Result($status, $extra) {
   $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o); warp = $warp }
   if ($extra) { foreach ($k in $extra.Keys) { $row[$k] = $extra[$k] } }
   $obj = [pscustomobject]$row
-  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads,loaded_s,cores,affinity,warp"
+  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads,loaded_s,cores,affinity,warp,t_ss,t_boot,t_login,t_join,t_loaded,log"
   if (-not (Test-Path $Csv)) { Set-Content -Path $Csv -Value $cols -Encoding utf8 }
   $line = ($cols.Split(",") | ForEach-Object { $v = $obj.$_; if ($null -eq $v) { "" } else { [string]$v } }) -join ","
   Add-Content -Path $Csv -Value $line -Encoding utf8
@@ -165,6 +165,25 @@ while ((Get-Date) -lt $wEnd) {
   [void]$threadsAll.Add((($g | ForEach-Object { $_.Threads.Count }) | Measure-Object -Sum).Sum)
 }
 $s1 = Snap
+# Milestones, from the log's own clock (`[t] +N.Ns` ticks, about one a second): when system_server's
+# runtime started, Android booted, the account signed in, the place was being joined, the world was
+# loaded -- finer than the join poll above (5 s).
+function Milestones {
+  $m = [ordered]@{ t_ss = ""; t_boot = ""; t_login = ""; t_join = ""; t_loaded = "" }
+  $pat = [ordered]@{ t_ss = "START com.android.internal.os.RuntimeInit uid 1000"; t_boot = "[r] boot_completed=1"; t_login = "DID_LOG_IN"; t_join = "Joining game"; t_loaded = "onGameLoaded()" }
+  $t = ""
+  # The log is still being written: open it sharing reads and writes, as Get-Content does.
+  $fs = [System.IO.FileStream]::new($log, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+  $rd = [System.IO.StreamReader]::new($fs)
+  while ($null -ne ($line = $rd.ReadLine())) {
+    if ($line.StartsWith("[t] +")) { $t = $line.Substring(5).Split("s")[0]; continue }
+    foreach ($k in $pat.Keys) { if ($m[$k] -eq "" -and $line.Contains($pat[$k])) { $m[$k] = $t } }
+    if ($m.t_loaded -ne "") { break }
+  }
+  $rd.Dispose(); $fs.Dispose()
+  $m
+}
+$ms = Milestones
 $new = @(Get-Content $log | Select-Object -Skip $lines0)
 $kicked = $new | Select-String -Pattern "Client has been disconnected" -Quiet
 
@@ -202,4 +221,10 @@ Result ($(if ($kicked) { "kicked" } else { "ok" })) ([ordered]@{
   loaded_s = $loaded_s
   cores = "{0:N2}" -f (($s1.all - $s0.all) / 1000 / $wall)
   affinity = $Affinity
+  t_ss = $ms.t_ss
+  t_boot = $ms.t_boot
+  t_login = $ms.t_login
+  t_join = $ms.t_join
+  t_loaded = $ms.t_loaded
+  log = Split-Path -Leaf $log
 })

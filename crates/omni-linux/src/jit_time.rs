@@ -35,13 +35,16 @@ pub fn start() {
                     .map(|p| String::from_utf8_lossy(&p.comm.lock()).into_owned())
                     .unwrap_or_default();
                 eprintln!(
-                    "[jit-time] host process {} ({name}) {every}s: +{blocks} blocks, translate {} ms, emit {} ms; total {} blocks, {:.1} s + {:.1} s",
+                    "[jit-time] host process {} ({name}) {every}s: +{blocks} blocks, translate {} ms, emit {} ms; total {} blocks, {:.1} s + {:.1} s; invalidations +{} (+{} blocks), regions retired +{}",
                     std::process::id(),
                     now.translate_ns.saturating_sub(last.translate_ns) / 1_000_000,
                     now.emit_ns.saturating_sub(last.emit_ns) / 1_000_000,
                     now.blocks_emitted,
                     now.translate_ns as f64 / 1e9,
                     now.emit_ns as f64 / 1e9,
+                    now.invalidations.saturating_sub(last.invalidations),
+                    now.blocks_invalidated.saturating_sub(last.blocks_invalidated),
+                    now.regions_retired.saturating_sub(last.regions_retired),
                 );
             }
             last = now;

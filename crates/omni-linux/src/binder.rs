@@ -724,6 +724,14 @@ fn rewrite_ref(data: &mut [u8], off: usize, (kind, value, cookie): (u32, u64, u6
 }
 
 impl Broker {
+    /// Whether a live process is this context's manager (servicemanager has called
+    /// `BINDER_SET_CONTEXT_MGR`): a service can be added from then on.
+    #[must_use]
+    pub fn has_context_manager(&self) -> bool {
+        let st = self.state.lock();
+        st.context_mgr.is_some_and(|n| st.nodes.get(&n).is_some_and(|n| !n.dead))
+    }
+
     /// A binder service served by the host: a node owned by [`HOST`] whose transactions `handler`
     /// answers. Its `ptr` (the node's binder in a parcel) is returned; the service lives as long as
     /// the broker.

@@ -211,7 +211,18 @@ fn main() -> ExitCode {
             Err(e) => eprintln!("[init] {e}"),
         }
     }
-    if !daemons.is_empty() || !init_classes.is_empty() {
+    // The HALs below add themselves to servicemanager, and the program uses it: wait for it to be
+    // the binder context manager. With init's classes it was started at `on init`, seconds ago, and
+    // the fixed 1.5 s this used to sleep was spent on the boot's critical path (system_server starts
+    // after it). At most 1.5 s, as before; `OMNI_INIT_FIXED_WAIT=1` sleeps the fixed 1.5 s.
+    if !init_classes.is_empty() && std::env::var("OMNI_INIT_FIXED_WAIT").as_deref() != Ok("1") {
+        let t = std::time::Instant::now();
+        let broker = omni_linux::binder::broker(omni_linux::binder::Context::Binder);
+        while !broker.has_context_manager() && t.elapsed() < std::time::Duration::from_millis(1500) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        eprintln!("[init] servicemanager ready after {} ms", t.elapsed().as_millis());
+    } else if !daemons.is_empty() || !init_classes.is_empty() {
         std::thread::sleep(std::time::Duration::from_millis(1500));
     }
     let mut _served = Vec::new();
