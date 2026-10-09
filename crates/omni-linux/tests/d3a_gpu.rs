@@ -126,9 +126,60 @@ fn batched_vulkan_records_in_order_and_costs_less() {
         costs.push(ns);
     }
     omni_linux::gpu::set_fast(false);
-    omni_linux::gpu::set_batch(false);
+    omni_linux::gpu::set_batch(true);
     // Batched is far cheaper than one system call a command, whatever the host's load.
     assert!(costs[2] * 2.0 < costs[0] && costs[5] * 2.0 < costs[3], "{costs:?}");
+}
+
+/// Batching's edge cases (`vkbatchx`): a pool reset, command buffers freed and a pool destroyed
+/// with commands unsent, a secondary command buffer executed between a primary's batched commands,
+/// four threads recording at once past a batch's size, and an update too big for a batch -- what
+/// the GPU wrote is checked, with batching on (now the default) and off.
+#[test]
+fn batching_keeps_pools_secondaries_and_threads_right() {
+    let (sysroot, instance) = prepare("vkbatchx", "vkbatchx");
+    for (batch, inline) in [(true, false), (false, false), (true, true)] {
+        omni_linux::gpu::set_batch(batch);
+        omni_linux::gpu::set_inline(inline);
+        let (status, out, err) = run_fixture(&sysroot, &instance, "vkbatchx");
+        assert_eq!(status, ExitStatus::Exited(0), "vkbatchx batch={batch} inline={inline}\nstdout: {out}\nstderr: {err}");
+        assert!(out.contains("vkbatchx ok"), "batch={batch} inline={inline}\nstdout: {out}\nstderr: {err}");
+        // A freed/destroyed recording's commands ran: allowed only without batching (the driver's).
+        assert!(!batch || !out.contains("note:"), "batch={batch} inline={inline}\nstdout: {out}");
+        if let Some(note) = out.lines().find(|l| l.starts_with("note:")) {
+            eprintln!("[vkbatchx] batch={batch}: {note}");
+        }
+    }
+    omni_linux::gpu::set_batch(true);
+    omni_linux::gpu::set_inline(false);
+}
+
+/// `vk_inline` alone, A/B'd closely: `vkbatch`'s cost per cheap unbatched command (batching off)
+/// with `vk_fast` on, inline off and on, ABBA (`--ignored`; `OMNI_INLINE_AB_ROUNDS`, default 6).
+#[test]
+#[ignore]
+fn inline_arguments_ab() {
+    let (sysroot, instance) = prepare("vkinline", "vkbatch");
+    let rounds = std::env::var("OMNI_INLINE_AB_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(6usize);
+    let mut sums = [0.0f64; 2];
+    for round in 0..rounds {
+        let order = if round % 2 == 0 { [false, true] } else { [true, false] };
+        for inline in order {
+            omni_linux::gpu::set_fast(true);
+            omni_linux::gpu::set_inline(inline);
+            omni_linux::gpu::set_batch(false);
+            let (status, out, err) = run_fixture(&sysroot, &instance, "vkbatch");
+            assert_eq!(status, ExitStatus::Exited(0), "vkbatch inline={inline}\nstdout: {out}\nstderr: {err}");
+            let line = out.lines().find(|l| l.starts_with("vkbatch ok ")).unwrap_or_else(|| panic!("stdout: {out}\nstderr: {err}"));
+            let ns: f64 = line.split_whitespace().nth(2).and_then(|v| v.parse().ok()).expect("ns");
+            eprintln!("[inline-ab] round {round} vk_inline={}: {ns:.1} ns per command", u8::from(inline));
+            sums[usize::from(inline)] += ns;
+        }
+    }
+    omni_linux::gpu::set_fast(false);
+    omni_linux::gpu::set_inline(false);
+    omni_linux::gpu::set_batch(true);
+    eprintln!("[inline-ab] mean: off {:.1}, on {:.1} ns per command", sums[0] / rounds as f64, sums[1] / rounds as f64);
 }
 
 /// The forwarding's levers on a game-like frame loop (`vkframe`: three threads, each frame

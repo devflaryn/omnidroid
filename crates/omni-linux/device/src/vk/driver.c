@@ -39,31 +39,51 @@ static void open_device(void) {
     __atomic_store_n(&g_inline, (int)((host_config() >> 1) & 1u), __ATOMIC_RELAXED);
 }
 
-uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc) {
+/* The request in the 32 bytes right before `args` (OMNI_VK_FRAME's room), so the inline form
+ * needs no copy of the arguments: one request serves both forms. */
+uint64_t omni_vk_call_framed(uint32_t id, uint64_t* args, uint32_t argc) {
     pthread_once(&g_open_once, open_device);
     t_failed = 0;
-    if (argc <= 32u && g_fd >= 0 && __atomic_load_n(&g_inline, __ATOMIC_RELAXED)) {
-        struct {
-            struct omni_gpu_call c;
-            uint64_t a[32];
-        } r;
-        r.c = (struct omni_gpu_call){.command = id, .argc = argc, .args = OMNI_U64(r.a), .result = 0, .reserved = 0};
-        memcpy(r.a, args, (size_t)argc * 8u);
-        if (ioctl(g_fd, (int)OMNI_GPU_CALL_INLINE(argc), &r) == 0) return r.c.result;
+    struct omni_gpu_call* c = (struct omni_gpu_call*)(void*)((char*)args - sizeof(struct omni_gpu_call));
+    *c = (struct omni_gpu_call){.command = id, .argc = argc, .args = OMNI_U64(args), .result = 0, .reserved = 0};
+    if (g_fd >= 0 && argc <= 32u && __atomic_load_n(&g_inline, __ATOMIC_RELAXED)) {
+        if (ioctl(g_fd, (int)OMNI_GPU_CALL_INLINE(argc), c) == 0) return c->result;
         if (errno != ENOTTY) {
             t_failed = 1;
             LOGE("command %u: %s", id, strerror(errno));
             return (uint64_t)(uint32_t)VK_ERROR_DEVICE_LOST;
         }
         __atomic_store_n(&g_inline, 0, __ATOMIC_RELAXED);
+        c->result = 0;
     }
-    struct omni_gpu_call c = {.command = id, .argc = argc, .args = OMNI_U64(args), .result = 0, .reserved = 0};
-    if (g_fd < 0 || ioctl(g_fd, OMNI_GPU_CALL, &c) != 0) {
+    if (g_fd < 0 || ioctl(g_fd, OMNI_GPU_CALL, c) != 0) {
         t_failed = 1;
         LOGE("command %u: %s", id, g_fd < 0 ? "no /dev/omni-gpu" : strerror(errno));
         return (uint64_t)(uint32_t)VK_ERROR_DEVICE_LOST;
     }
-    return c.result;
+    return c->result;
+}
+
+/* For callers whose arguments have no room before them (special.c, the batches): copied into a
+ * frame here -- by a loop the compiler may not turn into a call to memcpy (a libc call from here
+ * is the game's libc, whatever it hooks). */
+__attribute__((no_builtin("memcpy"))) uint64_t omni_vk_call(uint32_t id, const uint64_t* args, uint32_t argc) {
+    if (argc > 32u) {
+        pthread_once(&g_open_once, open_device);
+        t_failed = 0;
+        struct omni_gpu_call c = {.command = id, .argc = argc, .args = OMNI_U64(args), .result = 0, .reserved = 0};
+        if (g_fd < 0 || ioctl(g_fd, OMNI_GPU_CALL, &c) != 0) {
+            t_failed = 1;
+            return (uint64_t)(uint32_t)VK_ERROR_DEVICE_LOST;
+        }
+        return c.result;
+    }
+    struct {
+        struct omni_gpu_call c;
+        uint64_t a[32];
+    } f;
+    for (uint32_t i = 0; i < argc; i++) f.a[i] = args[i];
+    return omni_vk_call_framed(id, f.a, argc);
 }
 
 VkResult omni_vk_result(uint64_t r) { return (VkResult)(int32_t)(uint32_t)r; }
@@ -83,6 +103,11 @@ int omni_vk_failed(void) { return t_failed; }
  * caller may reuse its memory once the command has returned.
  *
  * A record: u32 id, u32 argc, u32 size (all of it, 8-aligned), u32 0, u64 args[argc], the copies. */
+
+/* Every live command buffer wrapper (its definition, below, with the wrappers). */
+static pthread_mutex_t g_cmdbufs_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct omni_vk_cmdbuf* g_cmdbufs;
+static void unlink_locked(struct omni_vk_cmdbuf* cb);
 
 #define BATCH_BYTES (64u * 1024u)
 /* A command bigger than this (vkCmdUpdateBuffer's data, up to 64 KiB) is sent as it is. */
@@ -184,10 +209,32 @@ void omni_vk_sync(VkCommandBuffer commandBuffer, int how) {
     if (how == OMNI_VK_SYNC_BEGIN) cb->batching = host_batches();
 }
 
+void omni_vk_pool_sync(uint64_t commandPool, int how) {
+    if (commandPool == 0) return;
+    pthread_mutex_lock(&g_cmdbufs_lock);
+    for (struct omni_vk_cmdbuf *cb = g_cmdbufs, *next; cb != NULL; cb = next) {
+        next = cb->next;
+        if (cb->pool != commandPool) continue;
+        /* Reset: back to the initial state, so what was recorded and not sent is gone (a
+         * vkBeginCommandBuffer would discard it too, but nothing need follow). Destroyed: the
+         * command buffer with it -- its wrapper is freed here, as the pool frees the host's. */
+        if (cb->batch != NULL) {
+            give_batch(cb->batch);
+            cb->batch = NULL;
+        }
+        if (how == OMNI_VK_POOL_DESTROY) {
+            unlink_locked(cb);
+            free(cb);
+        }
+    }
+    pthread_mutex_unlock(&g_cmdbufs_lock);
+}
+
+/* `args` is a generated command's OMNI_VK_FRAME (the only callers): sent as it is when not batched. */
 void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const struct omni_vk_copy* copies, uint32_t ncopies) {
     struct omni_vk_cmdbuf* cb = (struct omni_vk_cmdbuf*)(uintptr_t)args[0];
     if (cb == NULL || !cb->batching) {
-        (void)omni_vk_call(id, args, argc);
+        (void)omni_vk_call_framed(id, (uint64_t*)(uintptr_t)args, argc);
         return;
     }
     size_t need = 16u + (size_t)argc * 8u;
@@ -196,11 +243,11 @@ void omni_vk_record(uint32_t id, const uint64_t* args, uint32_t argc, const stru
     }
     if (need > RECORD_MAX || argc > 32u) {
         send_batch(cb);
-        (void)omni_vk_call(id, args, argc);
+        (void)omni_vk_call_framed(id, (uint64_t*)(uintptr_t)args, argc);
         return;
     }
     if (cb->batch == NULL && (cb->batch = take_batch()) == NULL) {
-        (void)omni_vk_call(id, args, argc);
+        (void)omni_vk_call_framed(id, (uint64_t*)(uintptr_t)args, argc);
         return;
     }
     struct omni_vk_batch* b = cb->batch;
@@ -237,6 +284,32 @@ struct omni_vk_cmdbuf* omni_vk_wrap_cmdbuf(void) {
     if (cb == NULL) return NULL;
     cb->obj.dispatch.magic = HWVULKAN_DISPATCH_MAGIC;
     return cb;
+}
+
+/* Every live command buffer wrapper, so a pool reset or destroyed can find its own (Vulkan has the
+ * application synchronize a pool with all its command buffers, so the batches themselves need no
+ * lock; the list is shared by every pool). */
+void omni_vk_cmdbuf_live(struct omni_vk_cmdbuf* cb, uint64_t pool) {
+    cb->pool = pool;
+    pthread_mutex_lock(&g_cmdbufs_lock);
+    cb->prev = NULL;
+    cb->next = g_cmdbufs;
+    if (g_cmdbufs != NULL) g_cmdbufs->prev = cb;
+    g_cmdbufs = cb;
+    pthread_mutex_unlock(&g_cmdbufs_lock);
+}
+
+static void unlink_locked(struct omni_vk_cmdbuf* cb) {
+    if (cb->prev != NULL) cb->prev->next = cb->next;
+    else if (g_cmdbufs == cb) g_cmdbufs = cb->next;
+    if (cb->next != NULL) cb->next->prev = cb->prev;
+    cb->prev = cb->next = NULL;
+}
+
+void omni_vk_cmdbuf_gone(struct omni_vk_cmdbuf* cb) {
+    pthread_mutex_lock(&g_cmdbufs_lock);
+    unlink_locked(cb);
+    pthread_mutex_unlock(&g_cmdbufs_lock);
 }
 
 struct omni_vk_object* omni_vk_child(struct omni_vk_parent* parent, uint64_t host) {
