@@ -1,0 +1,283 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp b/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+index 7677a2e..62246cc 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64_memory.cpp
+@@ -5,8 +5,12 @@
+ 
+ #include <array>
+ #include <initializer_list>
++#include <mutex>
+ #include <tuple>
+ #include <utility>
++#include <vector>
++
++#include <tsl/robin_set.h>
+ 
+ #include <fmt/format.h>
+ #include <fmt/ostream.h>
+@@ -30,6 +34,38 @@ using namespace Xbyak::util;
+ std::atomic<std::uint32_t> live_fastmem_mask_by_and{0};
+ std::atomic<std::uint32_t> live_fastmem_tbi_unmasked{0};
+ 
++// Omnidroid patch 0041.
++std::atomic<std::uint64_t> tbi_sites_noted{0};
++namespace {
++std::mutex tbi_sites_mutex;
++tsl::robin_set<u64> tbi_masked_sites;
++std::vector<u64> tbi_sites_in_order;
++}  // namespace
++
++void NoteTbiTaggedSite(std::uint64_t location) {
++    std::lock_guard lock{tbi_sites_mutex};
++    if (tbi_masked_sites.insert(location).second) {
++        tbi_sites_in_order.push_back(A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC());
++        tbi_sites_noted.store(tbi_sites_in_order.size(), std::memory_order_release);
++    }
++}
++
++bool IsTbiMaskedSite(std::uint64_t location) {
++    if (tbi_sites_noted.load(std::memory_order_acquire) == 0) {
++        return false;
++    }
++    std::lock_guard lock{tbi_sites_mutex};
++    return tbi_masked_sites.count(location) != 0;
++}
++
++std::vector<std::uint64_t> TbiSitesFrom(std::size_t first) {
++    std::lock_guard lock{tbi_sites_mutex};
++    if (first >= tbi_sites_in_order.size()) {
++        return {};
++    }
++    return {tbi_sites_in_order.begin() + static_cast<std::ptrdiff_t>(first), tbi_sites_in_order.end()};
++}
++
+ void A64EmitX64::GenMemory128Accessors() {
+     code.align();
+     memory_read_128 = code.getCurr<void (*)()>();
+@@ -114,6 +150,21 @@ void A64EmitX64::GenMemory128Accessors() {
+ }
+ 
+ void A64EmitX64::GenFastmemFallbacks() {
++    // Omnidroid patch 0041: `rax` = a guest location (descriptor) to note; everything caller-saved kept.
++    code.align();
++    tbi_note_thunk = code.getCurr<const void*>();
++    ABI_PushCallerSaveRegistersAndAdjustStack(code);
++    code.mov(code.ABI_PARAM1, code.rax);
++    code.CallFunction(&NoteTbiTaggedSite);
++    // Leave `Run` at the next halt check (a return, an indirect branch, a checked terminal), where
++    // the host drops the noted sites' translations: blocks already translated unmasked would
++    // otherwise keep faulting until the run slice ends.
++    code.lock();
++    code.or_(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::CacheInvalidation));
++    ABI_PopCallerSaveRegistersAndAdjustStack(code);
++    code.ret();
++    PerfMapRegister(tbi_note_thunk, code.getCurr(), "a64_tbi_note");
++
+     const std::initializer_list<int> idxes{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+     const std::array<std::pair<size_t, ArgCallback>, 4> read_callbacks{{
+         {8, UserCallback<&A64::UserCallbacks::MemoryRead8>()},
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index 2fcdd60..a1856f4 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -60,6 +60,17 @@ extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
+ /// read when a block is emitted.
+ extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
+ 
++/// Omnidroid patch 0041: guest instructions (by A64 location descriptor, process-wide) that
++/// accessed memory through a tagged address while the mask was off (`live_fastmem_tbi_unmasked`).
++/// Such a site is emitted masked from then on; the rest stay unmasked. `NoteTbiTaggedSite` is
++/// called from generated code (through `EmitX64::tbi_note_thunk`); `TbiSitesFrom(n)` returns the
++/// guest PCs of the sites noted after the first `n`, for the host to invalidate their
++/// translations; `tbi_sites_noted` counts them.
++void NoteTbiTaggedSite(std::uint64_t location);
++bool IsTbiMaskedSite(std::uint64_t location);
++std::vector<std::uint64_t> TbiSitesFrom(std::size_t first);
++extern std::atomic<std::uint64_t> tbi_sites_noted;
++
+ using A64FullVectorWidth = std::integral_constant<size_t, 128>;
+ 
+ // Array alias that always sizes itself according to the given type T
+@@ -118,6 +129,10 @@ public:
+     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations);
+ 
+ protected:
++    /// Omnidroid patch 0041: notes `rax` (a guest location) with `NoteTbiTaggedSite`, every caller-saved
++    /// register kept. Emitted with the fastmem fallbacks (A64 only); null elsewhere.
++    const void* tbi_note_thunk = nullptr;
++
+     // Microinstruction emitters
+ #define OPCODE(name, type, ...) void Emit##name(EmitContext& ctx, IR::Inst* inst);
+ #define A32OPC(...)
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+index 0e5f98b..4d9937d 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
++++ b/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc
+@@ -126,15 +126,21 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
+     if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling;
+-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        bool tbi_unmasked = false;
++        const u64 site = inst->GetArg(0).GetU64();
++        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
+ 
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
+             code.call(wrapped_fn);
++            const auto resume = code.getCurr();
++            if (tbi_unmasked) {
++                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
++            }
+ 
+-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
++            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
+                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+             EmitCheckMemoryAbort(ctx, inst, end.get());
+@@ -207,15 +213,21 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
+     if (fastmem_marker) {
+         // Use fastmem
+         bool require_abort_handling;
+-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        bool tbi_unmasked = false;
++        const u64 site = inst->GetArg(0).GetU64();
++        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
+ 
+         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
+ 
+         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+             code.L(*abort);
+             code.call(wrapped_fn);
++            const auto resume = code.getCurr();
++            if (tbi_unmasked) {
++                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
++            }
+ 
+-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
++            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
+                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
+ 
+             EmitCheckMemoryAbort(ctx, inst, end.get());
+@@ -384,13 +396,28 @@ void AxxEmitX64::EmitExclusiveReadMemoryInline(AxxEmitContext& ctx, IR::Inst* in
+     if (fastmem_marker) {
+         SharedLabel abort = GenSharedLabel(), end = GenSharedLabel();
+         bool require_abort_handling = false;
++        bool tbi_unmasked = false;
++        const u64 site = inst->GetArg(0).GetU64();
+ 
+-        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling);
++        const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
+ 
+         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
+ 
+-        RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
+-                          mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
++        if (tbi_unmasked) {
++            // Omnidroid patch 0041: the fallback returns to a stub that notes a tagged access, then
++            // to the instruction after the load (which is inline here, with no slow path of its own).
++            const auto marker = *fastmem_marker;
++            ctx.deferred_emits.emplace_back([=, this] {
++                const auto stub = code.getCurr();
++                EmitTbiNote(code, tbi_note_thunk, vaddr, site);
++                code.jmp(*end, code.T_NEAR);
++                RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(stub),
++                                  mcl::bit_cast<u64>(wrapped_fn), marker, conf.recompile_on_exclusive_fastmem_failure);
++            });
++        } else {
++            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
++                              mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
++        }
+ 
+         code.L(*end);
+ 
+@@ -485,7 +512,9 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+         SharedLabel abort = GenSharedLabel();
+         bool require_abort_handling = false;
+ 
+-        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp);
++        bool tbi_unmasked = false;
++        const u64 site = inst->GetArg(0).GetU64();
++        const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, tmp, site, &tbi_unmasked);
+ 
+         const auto location = code.getCurr();
+ 
+@@ -520,8 +549,12 @@ void AxxEmitX64::EmitExclusiveWriteMemoryInline(AxxEmitContext& ctx, IR::Inst* i
+         ctx.deferred_emits.emplace_back([=, this] {
+             code.L(*abort);
+             code.call(wrapped_fn);
++            const auto resume = code.getCurr();
++            if (tbi_unmasked) {
++                EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
++            }
+ 
+-            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(code.getCurr()),
++            RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
+                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_exclusive_fastmem_failure);
+ 
+             code.cmp(al, 0);
+diff --git a/src/dynarmic/backend/x64/emit_x64_memory.h b/src/dynarmic/backend/x64/emit_x64_memory.h
+index 40b5125..847dedc 100644
+--- a/src/dynarmic/backend/x64/emit_x64_memory.h
++++ b/src/dynarmic/backend/x64/emit_x64_memory.h
+@@ -152,24 +152,30 @@ template<>
+ }
+ 
+ template<typename EmitContext>
+-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt);
++Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 location = 0, bool* tbi_unmasked = nullptr);
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64, bool*) {
+     return r13 + vaddr;
+ }
+ 
+ template<>
+-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
++[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 location, bool* tbi_unmasked) {
+     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
+ 
+     if (unused_top_bits == 0) {
+         return r13 + vaddr;
+-    } else if (unused_top_bits == 8 && ctx.conf.silently_mirror_fastmem && live_fastmem_tbi_unmasked.load(std::memory_order_relaxed) != 0) {
++    } else if (unused_top_bits == 8 && ctx.conf.silently_mirror_fastmem && live_fastmem_tbi_unmasked.load(std::memory_order_relaxed) != 0
++               && !(location != 0 && IsTbiMaskedSite(location))) {
+         // Omnidroid patch 0040: Top Byte Ignore's mask (56 bits, mirrored) left off, switched at run
+         // time: the address as it is, as with 64 bits. A tagged one is non-canonical on x86-64, so
+         // it takes a general-protection fault, which the fastmem handler (keyed on the faulting
+         // instruction, not the address) sends to the callback -- where the host clears the tag.
++        // Patch 0041: the caller then plants `EmitTbiNote` on its slow path, so a site that ever
++        // sees a tag is noted and, translated again, masked (the branch below).
++        if (tbi_unmasked) {
++            *tbi_unmasked = true;
++        }
+         return r13 + vaddr;
+     } else if (ctx.conf.silently_mirror_fastmem) {
+         if (!tmp) {
+@@ -211,6 +217,23 @@ template<>
+     }
+ }
+ 
++/// Omnidroid patch 0041: on a fastmem site's slow path (after the fallback has served the access),
++/// note the site's guest location when the address carried a tag, for `IsTbiMaskedSite`. `rax` and the
++/// flags only; the stack stays 16-byte aligned (two pushes). `thunk` is `EmitX64::tbi_note_thunk`.
++inline void EmitTbiNote(BlockOfCode& code, const void* thunk, Xbyak::Reg64 vaddr, u64 location) {
++    Xbyak::Label skip;
++    code.push(code.rax);
++    code.push(code.rax);
++    code.mov(code.rax, vaddr);
++    code.shr(code.rax, 56);
++    code.jz(skip);
++    code.mov(code.rax, location);
++    code.call(thunk);
++    code.L(skip);
++    code.pop(code.rax);
++    code.pop(code.rax);
++}
++
+ template<std::size_t bitsize>
+ const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+     // Omnidroid patch 0029: an ordered load of 64 bits or fewer is a plain `mov`. x86 loads already

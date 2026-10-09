@@ -559,6 +559,10 @@ uint32_t od_set_fastmem_mask_by_and(uint32_t on);
  * Returns the value in force; a no-op returning 0 on arm64. */
 uint32_t od_set_tbi_unmasked(uint32_t on);
 
+/* Patch 0041 (x64 only): guest instructions that met a tagged address while the mask was off,
+ * and are emitted masked since, in this process. 0 on arm64. */
+uint64_t od_tbi_sites_noted(void);
+
 void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);

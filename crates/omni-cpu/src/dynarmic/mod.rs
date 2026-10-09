@@ -299,19 +299,17 @@ pub struct DynarmicOptions {
     /// With [`top_byte_ignore`](Self::top_byte_ignore): whether the **direct** path masks the tag
     /// (56 bits, mirrored: `mov`/`shl`/`shr` before every guest access). **Default `true`**.
     ///
-    /// `false` (x64 hosts only, `OMNI_JIT_TBI=0` in `omni-linux`) keeps D4's 64-bit identity on the
-    /// direct path -- measured 15-25% faster on load/store loops (`tests/bench.rs::
-    /// the_cost_of_top_byte_ignore`) -- and leaves a tagged address to the host: on x86-64 any
-    /// non-zero top byte makes it non-canonical, the access takes a general-protection fault
-    /// (Windows: an access violation at "address" `u64::MAX`; Linux: `SIGSEGV` at 0), which the
-    /// demand pager declines and dynarmic's handler turns, by the faulting instruction's address,
-    /// into the callback path -- where the tag is cleared and the access served, every time (the
-    /// site is not recompiled). Correct, and **~2.4 us each** (MEASURED, `bench.rs`: 1,600x a
-    /// masked access), so it only pays where tagged pointers are rare -- and on Android 15 they
-    /// are not: scudo tags heap pointers with `0x02` whatever `PR_SET_TAGGED_ADDR_CTRL` answers
-    /// (MEASURED, `omni-linux/tests/tbi_off.rs`: 820 tagged accesses in `toybox echo`, ~19,000 in
-    /// `ls -lR /system/etc` and `sha256sum`, every sampled one tagged `0x02`). So this stays `true`
-    /// unless the heap stops tagging. Each such access is counted ([`tagged_accesses`]) and exempt
+    /// `false` (x64 hosts only) is the configuration's form of what [`set_tbi_unmasked`] does at run
+    /// time, **without** patch 0041's learning: D4's 64-bit identity on the direct path -- measured
+    /// 15-25% faster on load/store loops (`tests/bench.rs::the_cost_of_top_byte_ignore`) -- and a
+    /// tagged address left to the host: on x86-64 any non-zero top byte makes it non-canonical, the
+    /// access takes a general-protection fault (Windows: an access violation at "address"
+    /// `u64::MAX`; Linux: `SIGSEGV` at 0), which the demand pager declines and dynarmic's handler
+    /// turns, by the faulting instruction's address, into the callback path -- where the tag is
+    /// cleared and the access served, every time. Correct, and **~2.4 us each** (MEASURED,
+    /// `bench.rs`), and Android 15's scudo reaches every chunk header through a `0x02`-tagged
+    /// pointer (`omni-linux/tests/tbi_off.rs`), so `omni-linux` uses the live switch instead, whose
+    /// sites learn the mask after their first tagged access. Each such access is counted ([`tagged_accesses`]) and exempt
     /// from the per-slice degraded-memory invariant. Ignored (treated as `true`) on other hosts: an
     /// arm64 host would apply its own TBI to a tagged address, which in a low window (D41) is the
     /// wrong memory.
@@ -415,11 +413,25 @@ pub fn set_fastmem_mask_by_and(on: bool) -> bool {
 /// live form of [`DynarmicOptions::tbi_direct_mask`] `false`, for blocks emitted from now on (clear
 /// the cache to have every block again): a context configured with the mask emits its accesses
 /// unmasked, and a tagged one faults to the slow path, which clears the tag and counts it
-/// ([`tagged_accesses`]). Returns what is in force (`false` on arm64). Off by default;
-/// `omni-linux`'s `jit_tbi=0` lever turns it on (`jit_tbi=1` back).
+/// ([`tagged_accesses`]). **Patch 0041**: that instruction is then noted (by guest location,
+/// process-wide; [`tbi_sites_noted`]), the run leaves at its next halt check, its translations
+/// are dropped, and it is emitted masked from then on -- so a process pays one fault per
+/// instruction that ever meets a tag (MEASURED: 279 per `toybox` process, the same for a 7x
+/// larger listing), not one per access, and every other access runs at D4's identity. Returns
+/// what is in force (`false` on arm64). Off by default; `omni-linux`'s `jit_tbi=0` lever (or
+/// `OMNI_JIT_TBI=0` from the start) turns it on (`jit_tbi=1` back).
 pub fn set_tbi_unmasked(on: bool) -> bool {
     // SAFETY: stores one process-wide atomic; no pointer crosses.
     unsafe { dynarmic_sys::od_set_tbi_unmasked(u32::from(on)) != 0 }
+}
+
+/// **Guest instructions that learned Top Byte Ignore's mask** (patch 0041): with the mask off
+/// ([`set_tbi_unmasked`]), each instruction that meets a tagged address once is noted and from
+/// then on emitted masked; this counts them, process-wide (0 on arm64).
+#[must_use]
+pub fn tbi_sites_noted() -> u64 {
+    // SAFETY: loads one process-wide atomic.
+    unsafe { dynarmic_sys::od_tbi_sites_noted() }
 }
 
 /// **Data accesses through a tagged address** (bits 56-63 non-zero) that the slow path served, by

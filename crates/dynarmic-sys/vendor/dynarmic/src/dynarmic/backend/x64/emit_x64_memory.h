@@ -152,24 +152,30 @@ template<>
 }
 
 template<typename EmitContext>
-Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt);
+Xbyak::RegExp EmitFastmemVAddr(BlockOfCode& code, EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp = std::nullopt, u64 location = 0, bool* tbi_unmasked = nullptr);
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>) {
+[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A32EmitContext>(BlockOfCode&, A32EmitContext&, Xbyak::Label&, Xbyak::Reg64 vaddr, bool&, std::optional<Xbyak::Reg64>, u64, bool*) {
     return r13 + vaddr;
 }
 
 template<>
-[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp) {
+[[maybe_unused]] Xbyak::RegExp EmitFastmemVAddr<A64EmitContext>(BlockOfCode& code, A64EmitContext& ctx, Xbyak::Label& abort, Xbyak::Reg64 vaddr, bool& require_abort_handling, std::optional<Xbyak::Reg64> tmp, u64 location, bool* tbi_unmasked) {
     const size_t unused_top_bits = 64 - ctx.conf.fastmem_address_space_bits;
 
     if (unused_top_bits == 0) {
         return r13 + vaddr;
-    } else if (unused_top_bits == 8 && ctx.conf.silently_mirror_fastmem && live_fastmem_tbi_unmasked.load(std::memory_order_relaxed) != 0) {
+    } else if (unused_top_bits == 8 && ctx.conf.silently_mirror_fastmem && live_fastmem_tbi_unmasked.load(std::memory_order_relaxed) != 0
+               && !(location != 0 && IsTbiMaskedSite(location))) {
         // Omnidroid patch 0040: Top Byte Ignore's mask (56 bits, mirrored) left off, switched at run
         // time: the address as it is, as with 64 bits. A tagged one is non-canonical on x86-64, so
         // it takes a general-protection fault, which the fastmem handler (keyed on the faulting
         // instruction, not the address) sends to the callback -- where the host clears the tag.
+        // Patch 0041: the caller then plants `EmitTbiNote` on its slow path, so a site that ever
+        // sees a tag is noted and, translated again, masked (the branch below).
+        if (tbi_unmasked) {
+            *tbi_unmasked = true;
+        }
         return r13 + vaddr;
     } else if (ctx.conf.silently_mirror_fastmem) {
         if (!tmp) {
@@ -209,6 +215,23 @@ template<>
         }
         return r13 + vaddr;
     }
+}
+
+/// Omnidroid patch 0041: on a fastmem site's slow path (after the fallback has served the access),
+/// note the site's guest location when the address carried a tag, for `IsTbiMaskedSite`. `rax` and the
+/// flags only; the stack stays 16-byte aligned (two pushes). `thunk` is `EmitX64::tbi_note_thunk`.
+inline void EmitTbiNote(BlockOfCode& code, const void* thunk, Xbyak::Reg64 vaddr, u64 location) {
+    Xbyak::Label skip;
+    code.push(code.rax);
+    code.push(code.rax);
+    code.mov(code.rax, vaddr);
+    code.shr(code.rax, 56);
+    code.jz(skip);
+    code.mov(code.rax, location);
+    code.call(thunk);
+    code.L(skip);
+    code.pop(code.rax);
+    code.pop(code.rax);
 }
 
 template<std::size_t bitsize>

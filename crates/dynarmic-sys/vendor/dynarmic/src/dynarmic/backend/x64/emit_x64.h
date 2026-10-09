@@ -60,6 +60,17 @@ extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
 /// read when a block is emitted.
 extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
 
+/// Omnidroid patch 0041: guest instructions (by A64 location descriptor, process-wide) that
+/// accessed memory through a tagged address while the mask was off (`live_fastmem_tbi_unmasked`).
+/// Such a site is emitted masked from then on; the rest stay unmasked. `NoteTbiTaggedSite` is
+/// called from generated code (through `EmitX64::tbi_note_thunk`); `TbiSitesFrom(n)` returns the
+/// guest PCs of the sites noted after the first `n`, for the host to invalidate their
+/// translations; `tbi_sites_noted` counts them.
+void NoteTbiTaggedSite(std::uint64_t location);
+bool IsTbiMaskedSite(std::uint64_t location);
+std::vector<std::uint64_t> TbiSitesFrom(std::size_t first);
+extern std::atomic<std::uint64_t> tbi_sites_noted;
+
 using A64FullVectorWidth = std::integral_constant<size_t, 128>;
 
 // Array alias that always sizes itself according to the given type T
@@ -118,6 +129,10 @@ public:
     void InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescriptor>& locations);
 
 protected:
+    /// Omnidroid patch 0041: notes `rax` (a guest location) with `NoteTbiTaggedSite`, every caller-saved
+    /// register kept. Emitted with the fastmem fallbacks (A64 only); null elsewhere.
+    const void* tbi_note_thunk = nullptr;
+
     // Microinstruction emitters
 #define OPCODE(name, type, ...) void Emit##name(EmitContext& ctx, IR::Inst* inst);
 #define A32OPC(...)

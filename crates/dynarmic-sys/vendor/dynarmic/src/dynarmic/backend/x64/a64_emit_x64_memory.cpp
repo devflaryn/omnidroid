@@ -5,8 +5,12 @@
 
 #include <array>
 #include <initializer_list>
+#include <mutex>
 #include <tuple>
 #include <utility>
+#include <vector>
+
+#include <tsl/robin_set.h>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -29,6 +33,38 @@ using namespace Xbyak::util;
 
 std::atomic<std::uint32_t> live_fastmem_mask_by_and{0};
 std::atomic<std::uint32_t> live_fastmem_tbi_unmasked{0};
+
+// Omnidroid patch 0041.
+std::atomic<std::uint64_t> tbi_sites_noted{0};
+namespace {
+std::mutex tbi_sites_mutex;
+tsl::robin_set<u64> tbi_masked_sites;
+std::vector<u64> tbi_sites_in_order;
+}  // namespace
+
+void NoteTbiTaggedSite(std::uint64_t location) {
+    std::lock_guard lock{tbi_sites_mutex};
+    if (tbi_masked_sites.insert(location).second) {
+        tbi_sites_in_order.push_back(A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC());
+        tbi_sites_noted.store(tbi_sites_in_order.size(), std::memory_order_release);
+    }
+}
+
+bool IsTbiMaskedSite(std::uint64_t location) {
+    if (tbi_sites_noted.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    std::lock_guard lock{tbi_sites_mutex};
+    return tbi_masked_sites.count(location) != 0;
+}
+
+std::vector<std::uint64_t> TbiSitesFrom(std::size_t first) {
+    std::lock_guard lock{tbi_sites_mutex};
+    if (first >= tbi_sites_in_order.size()) {
+        return {};
+    }
+    return {tbi_sites_in_order.begin() + static_cast<std::ptrdiff_t>(first), tbi_sites_in_order.end()};
+}
 
 void A64EmitX64::GenMemory128Accessors() {
     code.align();
@@ -114,6 +150,21 @@ void A64EmitX64::GenMemory128Accessors() {
 }
 
 void A64EmitX64::GenFastmemFallbacks() {
+    // Omnidroid patch 0041: `rax` = a guest location (descriptor) to note; everything caller-saved kept.
+    code.align();
+    tbi_note_thunk = code.getCurr<const void*>();
+    ABI_PushCallerSaveRegistersAndAdjustStack(code);
+    code.mov(code.ABI_PARAM1, code.rax);
+    code.CallFunction(&NoteTbiTaggedSite);
+    // Leave `Run` at the next halt check (a return, an indirect branch, a checked terminal), where
+    // the host drops the noted sites' translations: blocks already translated unmasked would
+    // otherwise keep faulting until the run slice ends.
+    code.lock();
+    code.or_(code.dword[code.r15 + offsetof(A64JitState, halt_reason)], static_cast<u32>(HaltReason::CacheInvalidation));
+    ABI_PopCallerSaveRegistersAndAdjustStack(code);
+    code.ret();
+    PerfMapRegister(tbi_note_thunk, code.getCurr(), "a64_tbi_note");
+
     const std::initializer_list<int> idxes{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     const std::array<std::pair<size_t, ArgCallback>, 4> read_callbacks{{
         {8, UserCallback<&A64::UserCallbacks::MemoryRead8>()},

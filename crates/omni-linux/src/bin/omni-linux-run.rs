@@ -362,7 +362,12 @@ fn main() -> ExitCode {
                 std::thread::sleep(std::time::Duration::from_secs(30));
                 let now = omni_cpu::dynarmic::tagged_accesses();
                 if now != seen {
-                    eprintln!("[tbi] {name} host process {}: {now} tagged accesses served by the slow path (+{} in 30 s)", std::process::id(), now - seen);
+                    eprintln!(
+                        "[tbi] {name} host process {}: {now} tagged accesses served by the slow path (+{} in 30 s); {} guest instructions learned the mask",
+                        std::process::id(),
+                        now - seen,
+                        omni_cpu::dynarmic::tbi_sites_noted()
+                    );
                     seen = now;
                 }
             }
@@ -424,7 +429,7 @@ fn main() -> ExitCode {
             let census = omni_cpu::stats::code_caches_with_tables();
             let tables: Vec<String> = census.tables.iter().filter(|t| t.bytes > 0).map(|t| format!("{} {} entries {} KiB", t.name, t.entries, t.bytes >> 10)).collect();
             let heap: u64 = census.tables.iter().map(|t| t.bytes).sum();
-            eprintln!("[mem] {name} host process {}: {} code caches' tables on the heap {} MiB: {}", std::process::id(), census.caches, heap >> 20, tables.join(", "));
+            eprintln!("[mem] {name} host process {}: {} code caches' tables on the heap {} MiB: {}; dispatcher misses {}", std::process::id(), census.caches, heap >> 20, tables.join(", "), census.locked_lookups);
         });
     }
     // An app's host process: the system's properties, as they are now.
