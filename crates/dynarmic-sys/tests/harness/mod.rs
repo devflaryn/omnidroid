@@ -99,8 +99,13 @@ pub struct Ctx {
     /// guest carries on); 0 leaves `SVC #1` like any other. Forces host context switches in the
     /// middle of guest execution.
     pub sleep_on_svc1_us: u64,
-    /// How many `SVC #1`s return at once before the sleeping ones start.
+    /// How many `SVC #1`s return at once before the sleeping (or parking) ones start.
     pub sleep_on_svc1_skip: usize,
+    /// Test hook: an [`SvcPark`] (as `usize`, 0 = off). `SVC #1` (past `sleep_on_svc1_skip`)
+    /// counts itself parked and waits on the host thread until the test releases it, then
+    /// returns without halting -- a callback that blocks for as long as the test needs, however
+    /// slow the host, rather than for a fixed time.
+    pub park_on_svc1: usize,
     /// Test hook: `SVC #2` writes the byte already at this host address back to it, from inside
     /// the callback -- i.e. on the guest's thread, in the middle of guest execution. 0 = off.
     pub rewrite_byte_on_svc2: u64,
@@ -130,6 +135,27 @@ pub struct Ctx {
     /// then waits there until released -- so a test can change the code while a translation made
     /// from the old word is in progress.
     pub pause_fetch: usize,
+}
+
+/// See [`Ctx::park_on_svc1`].
+#[derive(Default)]
+pub struct SvcPark {
+    /// How many `SVC #1`s are waiting (or have waited) in the callback.
+    pub parked: std::sync::atomic::AtomicUsize,
+    /// Set by the test to let them return.
+    pub release: std::sync::atomic::AtomicBool,
+}
+
+impl SvcPark {
+    /// Wait until `n` callbacks have parked. Panics after `limit`: a thread that never gets there
+    /// is a failure, not a slow host.
+    pub fn wait_parked(&self, n: usize, limit: std::time::Duration) {
+        let started = std::time::Instant::now();
+        while self.parked.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(started.elapsed() < limit, "{n} parked callbacks not reached in {limit:?}");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 }
 
 /// See [`Ctx::pause_fetch`].
@@ -456,6 +482,18 @@ unsafe extern "C" fn cb_call_svc(ctx: *mut c_void, swi: u32) {
                 core::ptr::write_volatile(p, core::ptr::read_volatile(p));
                 return;
             }
+            if swi == 1 && c.park_on_svc1 != 0 {
+                if c.svc.iter().filter(|&&s| s == 1).count() > c.sleep_on_svc1_skip {
+                    // SAFETY: a live `SvcPark` the test owns for the `Vm`'s life.
+                    let park = &*(c.park_on_svc1 as *const SvcPark);
+                    use std::sync::atomic::Ordering::SeqCst;
+                    park.parked.fetch_add(1, SeqCst);
+                    while !park.release.load(SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                return;
+            }
             if swi == 1 && c.sleep_on_svc1_us != 0 {
                 // The first `sleep_on_svc1_skip` of them return at once.
                 if c.svc.iter().filter(|&&s| s == 1).count() > c.sleep_on_svc1_skip {
@@ -730,6 +768,7 @@ impl Vm {
             halt_on_svc: true,
             sleep_on_svc1_us: 0,
             sleep_on_svc1_skip: 0,
+            park_on_svc1: 0,
             rewrite_byte_on_svc2: 0,
             host_thread_pointers_in_svc: (0, 0),
             poke_on_svc3: None,

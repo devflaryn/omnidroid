@@ -19,7 +19,7 @@ mod harness;
 
 use dynarmic_sys::*;
 use harness::a64;
-use harness::{config_for, Vm, VmOptions, CODE_BASE, HALT_DONE, MEM_GUARD, MEM_SIZE};
+use harness::{config_for, SvcPark, Vm, VmOptions, CODE_BASE, HALT_DONE, MEM_GUARD, MEM_SIZE};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -340,14 +340,16 @@ fn threads_stay_right_while_another_rewrites_and_invalidates_their_code() {
     const A: u16 = 0x1111;
     const B: u16 = 0x2222;
     const C: u16 = 0x3333;
-    // 0: MOVZ X1, #300 ; 1: MOVZ X0, #A (rewritten) ; 2: SUBS X1, X1, #1 ; 3: B.NE 1 ; 4: SVC #0
-    let program = vec![
-        a64::movz(1, 300, 0),
-        a64::movz(0, A, 0),
-        a64::subs_imm(1, 1, 1),
-        a64::b_cond(a64::cond::NE, -2),
-        a64::svc(0),
-    ];
+    // 0: MOVZ X1, #300 ; 1: MOVZ X0, #A (rewritten) ; then PAD x ADD X2..X9, #1 ; SUBS X1, X1, #1 ;
+    // B.NE 1 ; SVC #0. The padding makes each translation of the rewritten block a few KiB, so the
+    // translations fill a region in a few thousand invalidations rather than ~55,000 -- which a
+    // loaded host did not get through in a minute (2026-10-09: 18,235 translations of 148 bytes).
+    const PAD: usize = 192;
+    let mut program = vec![a64::movz(1, 300, 0), a64::movz(0, A, 0)];
+    program.extend((0..PAD as u32).map(|i| a64::add_imm(2 + i % 8, 2 + i % 8, 1)));
+    program.push(a64::subs_imm(1, 1, 1));
+    program.push(a64::b_cond(a64::cond::NE, -(PAD as i32 + 2)));
+    program.push(a64::svc(0));
     // Small regions, so that the rewriting also fills and retires them under the runners.
     let space = Space::new(VmOptions { cycle_counting: true, ..VmOptions::default() }, 8, 40 << 20, 8 << 20, &program);
     let stop = Arc::new(AtomicBool::new(false));
@@ -385,17 +387,30 @@ fn threads_stay_right_while_another_rewrites_and_invalidates_their_code() {
         })
         .collect();
 
-    // At least three seconds, and on until a region has been retired under the runners (a slow
-    // host emits less per second), for at most sixty.
+    // At least three seconds, and on until a region has been retired under the runners. A slow
+    // host emits less per second, so the bound is progress, not time: give up only when no code
+    // was emitted for thirty seconds (the runners or the writer are stuck), or after ten minutes.
     let started = Instant::now();
     let mut flips = 0u64;
-    while started.elapsed() < Duration::from_secs(3)
-        || (space.stats().regions_retired == 0 && started.elapsed() < Duration::from_secs(60))
-    {
-        space.rewrite(1, a64::movz(0, if flips % 2 == 0 { B } else { A }, 0));
-        space.invalidate(1);
-        flips += 1;
-        std::thread::yield_now();
+    let mut progress = (Instant::now(), 0u64);
+    loop {
+        let stats = space.stats();
+        if started.elapsed() >= Duration::from_secs(3) && stats.regions_retired > 0 {
+            break;
+        }
+        if stats.code_bytes_emitted != progress.1 {
+            progress = (Instant::now(), stats.code_bytes_emitted);
+        }
+        assert!(
+            progress.0.elapsed() < Duration::from_secs(30) && started.elapsed() < Duration::from_secs(600),
+            "no region retired, and translation stalled or too slow: {flips} flips, {stats:?}"
+        );
+        for _ in 0..16 {
+            space.rewrite(1, a64::movz(0, if flips % 2 == 0 { B } else { A }, 0));
+            space.invalidate(1);
+            flips += 1;
+            std::thread::yield_now();
+        }
     }
     stop.store(true, Ordering::Relaxed);
     finished.wait();
@@ -479,22 +494,23 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
     assert_eq!(program.len(), P_WORDS);
     program.extend(chain(BLOCKS));
     let space = Space::new(VmOptions { cycle_counting: true, ..VmOptions::default() }, 2, 40 << 20, 8 << 20, &program);
-    let parked = Arc::new(AtomicBool::new(false));
+    // P parks in the callback until released -- after Q's passes, however long a loaded host
+    // takes over them -- rather than sleeping a fixed time Q had to finish within.
+    let park = Arc::new(SvcPark::default());
 
     let p = {
         let space = Arc::clone(&space);
-        let parked = Arc::clone(&parked);
+        let park = Arc::clone(&park);
         std::thread::spawn(move || {
             let vm = space.vm(0, true);
             vm.with_ctx(|c| {
-                c.sleep_on_svc1_us = 4_000_000;
+                c.park_on_svc1 = Arc::as_ptr(&park) as usize;
                 c.sleep_on_svc1_skip = 1;
                 c.halt_on_svc = true;
             });
             vm.start(u64::MAX >> 2);
-            parked.store(true, Ordering::SeqCst);
-            // `SVC #1` sleeps and returns without halting; `SVC #0` halts. The run that parks must
-            // come back -- after the sleep -- through the halt the retirements raised, straight
+            // `SVC #1` parks and returns without halting; `SVC #0` halts. The run that parks must
+            // come back -- once released -- through the halt the retirements raised, straight
             // after the `SVC` (the loop's `ADD` not yet run), and not carry on into the retired
             // region's code.
             let first = vm.run();
@@ -503,13 +519,11 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
             unsafe { od_jit_clear_halt(vm.raw(), OD_HALT_CACHE_INVALIDATION) };
             let hr = vm.run_to_completion(64);
             assert_eq!(hr & HALT_DONE, HALT_DONE);
+            // (`park`, captured, outlives `vm`: the callback reads it until the jit is gone.)
             (vm.reg(0), vm.with_ctx(|c| c.svc.clone()), woke)
         })
     };
-    while !parked.load(Ordering::SeqCst) {
-        std::thread::yield_now();
-    }
-    std::thread::sleep(Duration::from_millis(300));
+    park.wait_parked(1, Duration::from_secs(120));
 
     let vm = space.vm(1, true);
     let mut pinned_while_parked = Vec::new();
@@ -525,6 +539,8 @@ fn a_thread_parked_in_a_callback_does_not_hold_a_retired_region() {
     }
     let during = space.stats();
     assert!(!p.is_finished(), "P was still parked through all of Q's passes");
+    assert_eq!(park.parked.load(Ordering::SeqCst), 1, "P parked once");
+    park.release.store(true, Ordering::SeqCst);
     let (x0, svc, (woke_halt, woke_pc, woke_x0)) = p.join().expect("P");
     assert_ne!(
         woke_halt & OD_HALT_CACHE_INVALIDATION,
@@ -585,17 +601,20 @@ fn threads_parked_all_over_a_region_do_not_fragment_it() {
         assert_eq!(q.run_to_completion(64) & HALT_DONE, HALT_DONE);
     };
 
+    // The threads park in the callback until released, after the checks below -- however long a
+    // loaded host takes -- rather than sleeping a fixed time the rest had to fit in.
+    let park = Arc::new(SvcPark::default());
     let mut parked = Vec::new();
     for (k, &segment) in segment_at.iter().enumerate() {
         run_q(segment);
         // P_k translates its stub now -- right after segment k's code -- and parks in it.
-        let before = space.stats().blocks_emitted;
         let space_k = Arc::clone(&space);
+        let park_k = Arc::clone(&park);
         let stub = stub_at[k];
         parked.push(std::thread::spawn(move || {
             let vm = space_k.vm(k as u32, true);
             vm.with_ctx(|c| {
-                c.sleep_on_svc1_us = 8_000_000;
+                c.park_on_svc1 = Arc::as_ptr(&park_k) as usize;
                 c.halt_on_svc = true;
             });
             vm.start(u64::MAX >> 2);
@@ -603,10 +622,8 @@ fn threads_parked_all_over_a_region_do_not_fragment_it() {
             assert_eq!(vm.run_to_completion(64) & HALT_DONE, HALT_DONE);
             (vm.reg(0), vm.with_ctx(|c| c.svc.clone()))
         }));
-        while space.stats().blocks_emitted == before {
-            std::thread::yield_now();
-        }
-        std::thread::sleep(Duration::from_millis(20));
+        // Parked in the callback: its stub translated, its return address in this region.
+        park.wait_parked(k + 1, Duration::from_secs(120));
     }
     // A second fill, so the region the later threads parked in is retired too.
     // SAFETY: the cache is live; this thread is not executing a jit on it.
@@ -623,6 +640,8 @@ fn threads_parked_all_over_a_region_do_not_fragment_it() {
     );
     assert!(during.parked_redirected >= PARKED as u64 / 2, "{during:?}");
     assert!(parked.iter().all(|p| !p.is_finished()), "the threads were still parked throughout");
+    assert_eq!(park.parked.load(Ordering::SeqCst), PARKED, "each parked once");
+    park.release.store(true, Ordering::SeqCst);
 
     for (i, p) in parked.into_iter().enumerate() {
         let (x0, svc) = p.join().expect("a parked thread");
