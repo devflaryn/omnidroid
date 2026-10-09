@@ -1066,15 +1066,18 @@ mod tests {
         use std::sync::atomic::Ordering::SeqCst;
         let Some(page) = own_gate() else { return };
         page.word(1).fetch_add(1, SeqCst);
-        let shut = std::thread::spawn(|| {
-            let t = std::time::Instant::now();
-            gate(true);
-            t.elapsed()
-        });
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shut = {
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                gate(true);
+                released.load(SeqCst)
+            })
+        };
         std::thread::sleep(std::time::Duration::from_millis(50));
+        released.store(true, SeqCst);
         page.word(1).fetch_sub(1, SeqCst);
-        let waited = shut.join().unwrap();
-        assert!(waited >= std::time::Duration::from_millis(40), "shut after the lease ended ({waited:?})");
+        assert!(shut.join().unwrap(), "shut only after the lease ended");
         assert!(page.word(0).load(SeqCst) >= 1, "shut");
         gate(false);
     }

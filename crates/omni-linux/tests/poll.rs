@@ -134,3 +134,120 @@ fn ppoll_reports_revents() {
     assert_eq!(p.syscall(&mut t, nr::PPOLL, [s, 1, 0, 0, 8, 0]), 1);
     assert_eq!(i16::from_le_bytes(p.mem.read(s + 6, 2).unwrap().try_into().unwrap()) & 1, 1);
 }
+
+const EPOLLET: u32 = 1 << 31;
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLL_CTL_MOD: u64 = 3;
+
+/// One `epoll_pwait` of up to `ms` (0: a look): how many events, and the first one's bits.
+fn wait_once(p: &Process, t: &mut omni_linux::Task, s: u64, ep: u64, ms: u64) -> (u64, u32) {
+    let n = p.syscall(t, nr::EPOLL_PWAIT, [ep, s + 1024, 8, ms, 0, 8]);
+    let bits = if n > 0 { u32::from_le_bytes(p.mem.read(s + 1024, 4).unwrap().try_into().unwrap()) } else { 0 };
+    (n, bits)
+}
+
+/// **`EPOLLET` is edge-triggered**: an eventfd written once and never read -- mio's waker, which
+/// tokio's driver waits on -- is reported once, not on every wait. Treated as level-triggered it
+/// answered every `epoll_pwait(0)` at once, and DnsResolver's `doh-handler` (tokio) spun at 99%
+/// of a core (system host, 2026-10-09). Each later write is a new edge, though the descriptor
+/// never stopped being readable.
+#[test]
+fn an_edge_triggered_eventfd_is_reported_once_per_write() {
+    let (p, mut t, s) = process();
+    let ep = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    let efd = p.syscall(&mut t, nr::EVENTFD2, [0, EFD_NONBLOCK, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, ep, efd, EPOLLIN | EPOLLET, 1);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0, "nothing written yet");
+    assert_eq!(write_u64(&p, &mut t, s + 64, efd, 1), 8);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0), (1, EPOLLIN));
+    for i in 0..1000 {
+        assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0, "look {i}: still readable, but no new edge");
+    }
+    assert_eq!(write_u64(&p, &mut t, s + 64, efd, 1), 8);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0), (1, EPOLLIN), "a second write while readable");
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0);
+    // A wait sleeps until the next write from another thread, then reports it once.
+    let writer = {
+        let p = Arc::clone(&p);
+        let mut t2 = p.test_task();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            p.mem.write_u64(s + 2048, 1).unwrap();
+            p.syscall(&mut t2, nr::WRITE, [efd, s + 2048, 8, 0, 0, 0])
+        })
+    };
+    let started = Instant::now();
+    assert_eq!(wait_once(&p, &mut t, s, ep, 5000).0, 1);
+    assert!(started.elapsed() >= Duration::from_millis(30), "it slept until the write");
+    assert_eq!(writer.join().unwrap(), 8);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0);
+    // Level-triggered, the same eventfd is reported for as long as it is readable.
+    let lt = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, lt, efd, EPOLLIN, 2);
+    assert_eq!(wait_once(&p, &mut t, s, lt, 0).0, 1);
+    assert_eq!(wait_once(&p, &mut t, s, lt, 0).0, 1);
+}
+
+/// A descriptor that is always writable (a UDP socket is; a socket pair's end with room is) and
+/// registered `EPOLLIN | EPOLLOUT | EPOLLET`, as mio registers every socket: writable is reported
+/// once; data arriving is a new edge, reported with what is ready then.
+#[test]
+fn an_always_writable_socket_is_reported_once_per_change_when_edge_triggered() {
+    let (p, mut t, s) = process();
+    // AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK
+    assert_eq!(p.syscall(&mut t, nr::SOCKETPAIR, [1, 2 | 0o4000, 0, s + 3000, 0, 0]), 0);
+    let pair = p.mem.read(s + 3000, 8).unwrap();
+    let a = u64::from(u32::from_le_bytes(pair[0..4].try_into().unwrap()));
+    let b = u64::from(u32::from_le_bytes(pair[4..8].try_into().unwrap()));
+    let ep = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, ep, a, EPOLLIN | EPOLLOUT | EPOLLET, 1);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0), (1, EPOLLOUT), "writable, once");
+    for _ in 0..100 {
+        assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0, "no change, no event");
+    }
+    p.mem.write(s + 4000, b"datagram").unwrap();
+    assert_eq!(p.syscall(&mut t, nr::WRITE, [b, s + 4000, 8, 0, 0, 0]), 8);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0), (1, EPOLLIN | EPOLLOUT), "a datagram arrived");
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0, "unread, but no new edge");
+}
+
+/// An edge-triggered timerfd is reported at each expiry, its count read in between -- the edge
+/// of the next expiry is not lost to the read.
+#[test]
+fn an_edge_triggered_timerfd_is_reported_at_each_expiry() {
+    let (p, mut t, s) = process();
+    let fd = p.syscall(&mut t, nr::TIMERFD_CREATE, [CLOCK_MONOTONIC, EFD_NONBLOCK, 0, 0, 0, 0]);
+    // itimerspec { interval 20 ms, value 20 ms }
+    for (i, v) in [0u64, 20_000_000, 0, 20_000_000].iter().enumerate() {
+        p.mem.write_u64(s + i as u64 * 8, *v).unwrap();
+    }
+    assert_eq!(p.syscall(&mut t, nr::TIMERFD_SETTIME, [fd, 0, s, 0, 0, 0]), 0);
+    let ep = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, ep, fd, EPOLLIN | EPOLLET, 1);
+    for round in 0..3 {
+        assert_eq!(wait_once(&p, &mut t, s, ep, 2000).0, 1, "expiry {round}");
+        assert_eq!(read_u64(&p, &mut t, s + 64, fd).0, 8);
+    }
+    // Expired but not read: reported once, then not again (no read, no new edge).
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 1);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0);
+}
+
+/// `EPOLLONESHOT`: reported once, then nothing until `EPOLL_CTL_MOD` re-arms it.
+#[test]
+fn a_oneshot_entry_waits_for_its_rearm() {
+    let (p, mut t, s) = process();
+    let ep = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    let efd = p.syscall(&mut t, nr::EVENTFD2, [1, EFD_NONBLOCK, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, ep, efd, EPOLLIN | EPOLLONESHOT, 1);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 1);
+    assert_eq!(write_u64(&p, &mut t, s + 64, efd, 1), 8);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0, "disarmed");
+    let mut ev = (EPOLLIN | EPOLLONESHOT).to_le_bytes().to_vec();
+    ev.extend_from_slice(&[0; 4]);
+    ev.extend_from_slice(&1u64.to_le_bytes());
+    p.mem.write(s + 512, &ev).unwrap();
+    assert_eq!(p.syscall(&mut t, nr::EPOLL_CTL, [ep, EPOLL_CTL_MOD, efd, s + 512, 0, 0]), 0);
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 1, "re-armed");
+}
