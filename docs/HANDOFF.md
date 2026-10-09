@@ -1,12 +1,38 @@
 # Handoff
 
-## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09 night, Windows; branch `perf/ps99-60fps`, not merged)
+## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09, ~20 h, Windows; branch `perf/ps99-60fps` @ the docs commit after 212550c, not merged, not pushed)
 
 Goal (owner): PS99 fully loaded toward 60 fps, CPU and RAM well below, no feature removed. Morning
-report `docs/MORNING-2026-10-09-ps99-60fps.md`; every A/B (winners and losers) in
-`docs/NIGHT-2026-10-09-ps99-60fps.md`. Same harness, `main` 6b1ab88 vs the branch, fresh boots:
-**fps 35 -> 58-60, CPU a frame 169 -> 45-50 ms, private working set 3.86 -> 3.40 GB, threads -34%;
-in the game 110-115 s after start (was ~185 s on a new device).**
+report `docs/MORNING-2026-10-09-ps99-60fps.md` (with the two checkpoints); every A/B (winners and
+losers, sessions s1-s23) in `docs/NIGHT-2026-10-09-ps99-60fps.md`. Same harness, `main` 6b1ab88 vs
+the branch, fresh boots: **fps 35.0 -> 59.8 (+24.8), CPU a frame 169 -> ~42 ms (-127 ms, -75%;
+5.9 -> ~2.5 cores), private working set 3.865 -> ~3.35 GB (-515 MB) before the day's last defaults
+and ~3.12 GB with them (s23, one clean pair: -296 MB more), threads ~1,220 -> ~800; "Joining game"
+~183 -> 85-100 s on a new device.**
+
+**State at the end (2026-10-09 ~17:30):**
+- New defaults of the day, each with its way back: the game's code aging (`OMNI_CODE_AGE_GAME`, 3 min,
+  one pass, later only past keep + 48 MiB, 1 s between regions; `=0` off), the JIT tables shrinking
+  after evictions (dynarmic 0073, `OMNI_JIT_TABLE_SHRINK=0` off), property areas kept without their
+  zero tails (~-77 MB in the system host; `OMNI_PROP_FULL_COPY=1` the old copy), SurfaceFlinger's code
+  aging, a saved device reading its launcher (`OMNI_R_LAUNCHER_SAVED=0` off), a degraded memory path
+  in a slice that only ran out of budget logged once and run on instead of killing the process.
+- **Translation snapshots** (`OMNI_JIT_SNAPSHOT=<dir>`, dynarmic 0070/0071/0074/0075; opt-in): -10..-11 s
+  to the world (onGameLoaded ~100 -> ~89 s, boot_completed -4 s, the game launched -11 s), fps the same,
+  but +80..+250 MB: the game and system_server verify only 2-11% of what they restore (their
+  libraries land elsewhere each boot; the perf harness also reinstalls the APK into a new random
+  path every boot -- a saved device would not). `OMNI_JIT_SNAPSHOT_LAZY=1` reads restored code in as
+  entered (works: the game read ~3-4k pages). **Next:** branch `perf/jit-snapshot-fixes` @f5003bf has
+  the unbuilt WIP for per-library placement (`OMNI_JIT_SNAPSHOT_LIB_ZONE=1`), forgetting unentered
+  restored blocks (0076, `OMNI_JIT_SNAPSHOT_FORGET=1`) and `OMNI_JIT_SNAPSHOT_WHY=1` (which says where
+  never-entered blocks went) -- build, test, A/B on a saved device (`OMNI_R_GOLDEN`).
+- **Fixed today, worth knowing:** region files `omni-shm-<pid>-<n>` of killed runs under a reused
+  host pid made gralloc refuse SurfaceFlinger's first buffer and the boot loop (20,372 stale files, 7
+  GB, in %TEMP%); `perf_ab.ps1` no longer waits out a failed launch and then kills later runs' guests.
+- **Open:** the s23 defaults A/B was noisy (one boot lost to the degraded-path abort, now non-fatal;
+  the later pair in a slow world) -- rerun it with more pairs; the game's one aging pass costs ~15 s at
+  47-57 fps once a session; ~55 MiB of unattributed resident zero pages in the system host's heap
+  (`OMNI_ALLOC_TRACE_KB=256` + `tools/zeroscan.ps1`); the Mac arm64 build unverified.
 
 - **Measure first, with the tools made for it:** `tools/perf_live.ps1` (levers A/B'd live in one
   session via `OMNI_LEVER_FILE`; every lever is in `crates/omni-linux/src/lever.rs`),
