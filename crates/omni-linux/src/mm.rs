@@ -652,6 +652,7 @@ fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
     let r = p.mm.map(p, t, MapRequest { addr: a[0], len: a[1], prot: a[2] as u32, flags: a[3] as u32, fd: a[4] as i64 as i32, offset: a[5] });
     mmap_watch(p, t, a, &r);
+    crate::mmap_log::mmap(p, t, a, &r);
     r
 }
 
@@ -671,7 +672,8 @@ fn mmap_watch(p: &Process, t: &Task, a: [u64; 6], r: &Result<u64, Errno>) {
     );
 }
 
-fn sys_munmap(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_munmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    crate::mmap_log::munmap(p, t, a);
     let probed = smc_probe(p, a[0], a[1], None);
     p.mm.unmap(a[0], a[1])?;
     if probed {
@@ -823,6 +825,12 @@ fn prot_bits(p: Protection) -> u32 {
 /// address, keeping contents and protection. bionic's CFI shadow uses the `FIXED` form to replace
 /// a range atomically; scudo's secondary grows with `MAYMOVE`.
 fn sys_mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
+    let r = mremap(p, t, a);
+    crate::mmap_log::mremap(p, t, a, &r);
+    r
+}
+
+fn mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let page = p.mm.page;
     let (old, flags, target) = (crate::guest::untag(a[0]), a[3], crate::guest::untag(a[4]));
     let old_len = p.mm.span(old, a[1]).ok_or(EINVAL)?;
