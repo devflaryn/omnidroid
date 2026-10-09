@@ -1300,6 +1300,8 @@ impl DynarmicBackend {
                     caches: 1,
                     blocks_emitted: s.blocks_emitted,
                     code_bytes_emitted: s.code_bytes_emitted,
+                    translate_ns: s.translate_ns,
+                    emit_ns: s.emit_ns,
                     invalidations: s.invalidations,
                     blocks_invalidated: s.blocks_invalidated,
                     regions_retired: s.regions_retired,

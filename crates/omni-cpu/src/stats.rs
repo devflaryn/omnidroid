@@ -113,6 +113,12 @@ pub struct CodeCacheCounters {
     pub blocks_emitted: u64,
     /// Host code bytes those blocks took.
     pub code_bytes_emitted: u64,
+    /// Nanoseconds threads spent in dynarmic's frontend for them (decoding to IR and its passes),
+    /// summed over threads; outside the cache's lock.
+    pub translate_ns: u64,
+    /// Nanoseconds spent emitting x64 for them, under the cache's lock (so at most one thread's
+    /// worth of wall time).
+    pub emit_ns: u64,
     /// Invalidation requests applied.
     pub invalidations: u64,
     /// Blocks those requests dropped.
@@ -205,6 +211,8 @@ fn sum_code_caches(tables: bool) -> CodeCacheCounters {
             sum.caches += 1;
             sum.blocks_emitted += c.blocks_emitted;
             sum.code_bytes_emitted += c.code_bytes_emitted;
+            sum.translate_ns += c.translate_ns;
+            sum.emit_ns += c.emit_ns;
             sum.invalidations += c.invalidations;
             sum.blocks_invalidated += c.blocks_invalidated;
             sum.regions_retired += c.regions_retired;

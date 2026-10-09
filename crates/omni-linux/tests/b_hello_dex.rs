@@ -42,19 +42,36 @@ fn spawn_watching(sysroot: &Path, instance: &Path, argv: &[&str], env: &[String]
         let (p, done) = (Arc::clone(&p), Arc::clone(&done));
         std::thread::spawn(move || {
             let mut seen = std::collections::BTreeSet::new();
+            let mut jit = omni_cpu::stats::CodeCacheCounters::default();
             while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                // The process's shared code cache, last seen alive: how much of the run was translating.
+                let now = omni_cpu::stats::code_caches();
+                if now.caches > 0 {
+                    jit = now;
+                }
                 for (start, len, name, _) in p.mm.file_mappings() {
                     let identity = p.mem.space().host_addr(start as usize) == start as usize;
                     seen.insert((start, start + len, String::from_utf8_lossy(&name).into_owned(), identity));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
-            seen.into_iter().collect::<Vec<Seen>>()
+            (seen.into_iter().collect::<Vec<Seen>>(), jit)
         })
     };
+    let started = std::time::Instant::now();
     let status = p.run();
+    let wall = started.elapsed();
     done.store(true, std::sync::atomic::Ordering::Relaxed);
-    let seen = watcher.join().expect("the watcher");
+    let (seen, jit) = watcher.join().expect("the watcher");
+    eprintln!(
+        "{}: {:.2} s, {} blocks translated ({} KiB): frontend {:.2} s, emit {:.2} s",
+        argv[0],
+        wall.as_secs_f64(),
+        jit.blocks_emitted,
+        jit.code_bytes_emitted >> 10,
+        jit.translate_ns as f64 / 1e9,
+        jit.emit_ns as f64 / 1e9
+    );
     let s = |b: &Arc<parking_lot::Mutex<Vec<u8>>>| String::from_utf8_lossy(&b.lock()).into_owned();
     (status, s(&out), s(&err), seen)
 }
@@ -110,7 +127,27 @@ fn b_hello_dex_runs_on_art() {
     let low_4gb = |(start, end, _, _): &&Seen| *end <= 1 << 32 && *start < *end;
     let named = |f: fn(&str) -> bool| seen.iter().filter(|(_, _, n, _)| f(n)).collect::<Vec<&Seen>>();
     let heap = named(|n| n.starts_with("[anon:dalvik-main space"));
-    let image = named(|n| n.starts_with("[anon:dalvik-/system/framework/boot") && n.ends_with(".art]"));
+    // The boot image itself. Compressed (`OMNI_BOOT_IMAGE_UNCOMPRESSED=0`), ART decompresses each
+    // `.art` into anonymous memory it names after the file. Uncompressed (the default,
+    // `omni_linux::boot_image`), ART maps the file straight into its reservation, so the image is
+    // the `.art` *file* mappings below 4 GiB -- and none of it may have been decompressed into
+    // anonymous memory, or the views did not work and every process pays for a private copy.
+    let decompressed = named(|n| n.starts_with("[anon:dalvik-/system/framework/boot") && n.ends_with(".art]"));
+    let image = if omni_linux::boot_image::enabled() {
+        assert!(
+            decompressed.is_empty(),
+            "the uncompressed boot image was decompressed anyway: {decompressed:#x?}; named mappings:\n{seen:#x?}"
+        );
+        named(|n| n.starts_with("/system/framework/arm64/boot") && n.ends_with(".art")).into_iter().filter(|m| low_4gb(m)).collect()
+    } else {
+        decompressed
+    };
+    // The primary image is among them, whichever way it was mapped.
+    assert!(
+        // (`[anon:dalvik-/system/framework/boot.art]` decompressed, the `arm64/` file as a view.)
+        image.iter().any(|(_, _, n, _)| n.ends_with("/boot.art") || n.ends_with("/boot.art]")),
+        "no mapping of the primary boot image (boot.art) below 4 GiB: {image:#x?}"
+    );
     let code: Vec<&Seen> =
         named(|n| n.starts_with("/system/framework/arm64/boot") && n.ends_with(".oat")).into_iter().filter(|m| low_4gb(m)).collect();
     assert!(!code.is_empty(), "the boot image's code was not mapped below 4 GiB; named mappings:\n{seen:#x?}");
@@ -125,10 +162,20 @@ fn b_hello_dex_runs_on_art() {
         assert_eq!(!identity, based, "{name} at {start:#x}: based exactly where the host maps nothing that low");
     }
     eprintln!(
-        "ART's heap {:#x?}, boot image from {:#x}, boot code from {:#x}, {}",
+        "ART's heap {:#x?}, boot image ({}) from {:#x}, boot code from {:#x}, {}",
         heap.iter().map(|m| (m.0, m.1)).collect::<Vec<_>>(),
+        if omni_linux::boot_image::enabled() { "uncompressed, file views" } else { "decompressed" },
         image.iter().map(|m| m.0).min().unwrap_or(0),
         code.iter().map(|m| m.0).min().unwrap_or(0),
         if based { "in the low window (D41)" } else { "at the host's own addresses (D4)" }
+    );
+    // Where the shared libraries went: the same from run to run is what a translation saved by
+    // guest address could be reused under.
+    let lib_at = |name: &str| seen.iter().filter(|(_, _, n, _)| n.ends_with(name)).map(|m| m.0).min().unwrap_or(0);
+    eprintln!(
+        "libc.so at {:#x}, libart.so at {:#x}, linker64 at {:#x}",
+        lib_at("/libc.so"),
+        lib_at("/libart.so"),
+        lib_at("/linker64")
     );
 }
