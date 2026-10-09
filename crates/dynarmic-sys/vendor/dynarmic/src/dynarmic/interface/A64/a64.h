@@ -194,6 +194,7 @@ public:
         std::uint64_t snapshot_blocks_verified = 0;  ///< of those, found unchanged when first looked up and entered
         std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
         std::uint64_t snapshot_save_lock_ns = 0;     ///< the latest save's time holding the cache's lock (copying out)
+        std::uint64_t snapshot_pages_read = 0;       ///< patch 0075: pages of a lazily restored snapshot read in, as entered
     };
     Stats GetStats() const;
 
@@ -245,7 +246,10 @@ public:
     /// negative error (the cache unchanged). Same restriction as InvalidateCacheRange.
     void EnableSnapshots();
     std::int64_t SaveSnapshot(const char* path, const char* key, std::uint64_t max_bytes, bool include_unverified = true);
-    std::int64_t LoadSnapshot(const char* path, const char* key);
+    /// Omnidroid patch 0075: `lazily`, nothing of the code is read or committed at load; a page is
+    /// read in from the file (kept open) when a block on it is first entered, so code never entered
+    /// costs no memory.
+    std::int64_t LoadSnapshot(const char* path, const char* key, bool lazily = false);
 
     struct Impl;
     std::unique_ptr<Impl> impl;

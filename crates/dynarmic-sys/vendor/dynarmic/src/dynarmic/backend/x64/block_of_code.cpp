@@ -8,9 +8,12 @@
 #ifdef _WIN32
 #    define WIN32_LEAN_AND_MEAN
 #    include <windows.h>
+#    include <fcntl.h>
+#    include <io.h>
 #else
 #    include <sys/mman.h>
 #endif
+#include <filesystem>
 
 #ifdef __APPLE__
 #    include <errno.h>
@@ -579,6 +582,30 @@ size_t BlockOfCode::PreludeCommittedBytes() const {
     return committed_size;
 #else
     return 0;
+#endif
+}
+
+std::FILE* OpenSnapshotFileForRead(const char* utf8_path) {
+    const std::filesystem::path path{std::u8string{reinterpret_cast<const char8_t*>(utf8_path)}};
+#ifdef _WIN32
+    // Shared for deletion too: a process keeps its snapshot open to read pages from as they are
+    // entered (patch 0075), and its own next save replaces the file under it.
+    const HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    const int fd = _open_osfhandle(reinterpret_cast<intptr_t>(h), _O_RDONLY | _O_BINARY);
+    if (fd == -1) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    std::FILE* const f = _fdopen(fd, "rb");
+    if (f == nullptr) {
+        _close(fd);
+    }
+    return f;
+#else
+    return std::fopen(path.c_str(), "rb");
 #endif
 }
 

@@ -114,7 +114,7 @@ void EmitX64::SnapshotSitesIn(const u8* begin, const u8* end, std::vector<Snapsh
     }
 }
 
-void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count) {
+void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily) {
     ASSERT(shared_code && (size & UNVERIFIED_BLOCK) == 0);
     u8* const buffer = const_cast<u8*>(code.getCode());
     u32 first = NO_LINK;
@@ -124,7 +124,10 @@ void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size,
         for (size_t i = 0; i < slot_count; i++) {
             const SnapshotSlot& s = slots[i];
             // Unlinked, whatever it linked to when saved: nothing restored is entered unverified.
-            *reinterpret_cast<u64*>(buffer + s.slot) = reinterpret_cast<u64>(buffer + s.unlinked);
+            // (Patch 0075: lazily, nothing is there yet; set when the page is read in.)
+            if (!lazily) {
+                *reinterpret_cast<u64*>(buffer + s.slot) = reinterpret_cast<u64>(buffer + s.unlinked);
+            }
             const u32 index = NextLinkSerial();
             LinkRecord record{s.target, s.slot, s.unlinked, NO_LINK, NO_LINK};
             // Patch 0064: the head beside the target's block when it has one (restored before
@@ -166,7 +169,7 @@ void EmitX64::MarkVerified(IR::LocationDescriptor location) {
         for (u32 i = stored.first_link;; i++) {
             const LinkRecord& link = LinkAt(i);
             if (const auto target = GetBasicBlock(IR::LocationDescriptor{link.target})) {
-                std::atomic_ref<u64>{*LinkSlotOf(link)}.store(reinterpret_cast<u64>(target->entrypoint), std::memory_order_release);
+                StoreSlot(link, reinterpret_cast<u64>(target->entrypoint));
             }
             if (link.slot & LAST_LINK_OF_BLOCK) {
                 break;
@@ -175,6 +178,12 @@ void EmitX64::MarkVerified(IR::LocationDescriptor location) {
     }
     // And the links to it.
     Patch(location, block.entrypoint);
+}
+
+void EmitX64::RefreshSlot(u32 serial) {
+    const LinkRecord& link = LinkAt(serial);
+    const auto target = GetBasicBlock(IR::LocationDescriptor{link.target});
+    std::atomic_ref<u64>{*LinkSlotOf(link)}.store(target ? reinterpret_cast<u64>(target->entrypoint) : LinkUnlinkedOf(link), std::memory_order_release);
 }
 
 EmitX64::StoredBlock EmitX64::Store(const BlockDescriptor& b) const {
@@ -534,7 +543,7 @@ void EmitX64::Patch(const IR::LocationDescriptor& target_desc, CodePtr target_co
         for (u32 i = *head; i != NO_LINK; i = LinkAt(i).next) {
             const LinkRecord& link = LinkAt(i);
             const u64 value = target_code_ptr ? reinterpret_cast<u64>(target_code_ptr) : LinkUnlinkedOf(link);
-            std::atomic_ref<u64>{*LinkSlotOf(link)}.store(value, std::memory_order_release);
+            StoreSlot(link, value);
         }
         return;
     }
@@ -627,7 +636,7 @@ void EmitX64::ForgetOutgoingSlots(u32 first_link) {
     for (u32 i = first_link;; i++) {
         LinkRecord& link = LinkAt(i);
         // A thread still running the dropped block leaves it for the dispatcher at this link.
-        std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+        StoreSlot(link, LinkUnlinkedOf(link));
         // Out of its target's list; the record itself stays, dead, until the maps are emptied or
         // (patch 0028) the records of its region are dropped.
         if (link.prev != NO_LINK) {
@@ -654,7 +663,7 @@ void EmitX64::UnlinkAllSlots() {
     // block's code is still there (records are emptied with the maps, before any region they
     // name is given back).
     for (const LinkRecord& link : link_records) {
-        std::atomic_ref<u64>{*LinkSlotOf(link)}.store(LinkUnlinkedOf(link), std::memory_order_release);
+        StoreSlot(link, LinkUnlinkedOf(link));
     }
 }
 

@@ -337,7 +337,24 @@ struct SharedCodeCache::Impl final {
     // Omnidroid patch 0070: translation snapshots (see SharedCodeCache::SaveSnapshot).
     void EnableSnapshots();
     s64 SaveSnapshot(const char* path, const char* key, u64 max_bytes, bool include_unverified);
-    s64 LoadSnapshot(const char* path, const char* key);
+    s64 LoadSnapshot(const char* path, const char* key, bool lazily);
+    // Patch 0075: a snapshot restored lazily -- its code read in a page at a time, as blocks on it
+    // are first entered. The file stays open for that.
+    struct LazyRegion {
+        size_t index;
+        u64 file_offset;
+        u64 used;
+        std::vector<std::pair<u32, u32>> slots;  // (slot offset in the buffer, link serial), ascending
+    };
+    EmitX64::LazyPages lazy_pages;
+    std::vector<LazyRegion> lazy_regions;
+    std::FILE* lazy_file = nullptr;
+    u64 snapshot_pages_read = 0;
+    /// Read in the lazily restored pages of `[begin, end)` not read in yet, and set their slots.
+    /// False if one could not be read.
+    bool Materialize(const u8* begin, const u8* end);
+    /// Forget the lazy state of `region` (it is being evicted, or every block forgotten).
+    void DropLazy(size_t region);
     /// A restored block at `location`, unverified: its guest code read through `translator_conf`'s
     /// callbacks and compared. Its entry point if it is the same (and now entered), nothing if
     /// there is none or it was dropped.
@@ -821,7 +838,11 @@ SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes,
     StartRegion(0);
 }
 
-SharedCodeCache::Impl::~Impl() = default;
+SharedCodeCache::Impl::~Impl() {
+    if (lazy_file != nullptr) {
+        std::fclose(lazy_file);
+    }
+}
 
 void SharedCodeCache::Impl::Attach(SharedThreadState* thread) {
     std::lock_guard guard{attach_lock};
@@ -942,34 +963,68 @@ private:
     std::vector<u8>& out;
 };
 
+/// Reads a snapshot from its file as it parses -- the region bytes are skipped (their offsets
+/// noted) and read straight into the code buffer, or (patch 0075) a page at a time when entered,
+/// rather than the whole file first into memory.
 class Reader {
 public:
-    explicit Reader(std::vector<u8> data)
-            : data(std::move(data)) {}
+    explicit Reader(std::FILE* f)
+            : f(f) {
+#ifdef _WIN32
+        _fseeki64(f, 0, SEEK_END);
+        size = static_cast<u64>(_ftelli64(f));
+        _fseeki64(f, 0, SEEK_SET);
+#else
+        fseeko(f, 0, SEEK_END);
+        size = static_cast<u64>(ftello(f));
+        fseeko(f, 0, SEEK_SET);
+#endif
+    }
     template<typename T>
     bool Value(T& v) {
         static_assert(std::is_trivially_copyable_v<T>);
-        if (data.size() - at < sizeof(T)) {
+        return Bytes(&v, sizeof(T));
+    }
+    bool Bytes(void* out, size_t n) {
+        if (size - at < n || (n != 0 && std::fread(out, 1, n, f) != n)) {
             return false;
         }
-        std::memcpy(&v, data.data() + at, sizeof(T));
-        at += sizeof(T);
+        at += n;
         return true;
     }
-    const u8* Take(size_t n) {
-        if (data.size() - at < n) {
-            return nullptr;
+    bool Skip(u64 n) {
+        if (size - at < n) {
+            return false;
         }
-        const u8* p = data.data() + at;
         at += n;
-        return p;
+#ifdef _WIN32
+        return _fseeki64(f, static_cast<s64>(at), SEEK_SET) == 0;
+#else
+        return fseeko(f, static_cast<off_t>(at), SEEK_SET) == 0;
+#endif
     }
-    bool AtEnd() const { return at == data.size(); }
+    u64 Offset() const { return at; }
+    bool AtEnd() const { return at == size; }
 
 private:
-    std::vector<u8> data;
-    size_t at = 0;
+    std::FILE* f;
+    u64 size = 0;
+    u64 at = 0;
 };
+
+/// Read `n` bytes at `offset` of `f` into `out`.
+bool ReadAt(std::FILE* f, u64 offset, void* out, size_t n) {
+#ifdef _WIN32
+    if (_fseeki64(f, static_cast<s64>(offset), SEEK_SET) != 0) {
+        return false;
+    }
+#else
+    if (fseeko(f, static_cast<off_t>(offset), SEEK_SET) != 0) {
+        return false;
+    }
+#endif
+    return n == 0 || std::fread(out, 1, n, f) == n;
+}
 
 std::FILE* OpenFile(const char* path, bool write) {
     const std::filesystem::path p{std::u8string{reinterpret_cast<const char8_t*>(path)}};
@@ -994,7 +1049,7 @@ struct SavedBlock {
 struct SavedRegion {
     u32 index;
     u64 used;
-    const u8* bytes;  // into the reader's data
+    u64 file_offset;  // of its bytes in the snapshot file
     std::vector<SavedBlock> blocks;
 };
 
@@ -1209,7 +1264,17 @@ s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 m
         }
         w.Value(static_cast<u32>(r));
         w.Value(used[r]);
-        w.Bytes(regions[r].begin, used[r]);
+        // Patch 0075: a page restored lazily and never read in holds nothing -- written as zeros
+        // (no block saved lies on it: each saved one was entered, so its pages were read in).
+        for (u64 at = 0; at < used[r]; at += 4096) {
+            const u64 n = std::min<u64>(4096, used[r] - at);
+            if (lazy_pages.Pending(regions[r].begin + at)) {
+                static const u8 zeros[4096] = {};
+                w.Bytes(zeros, n);
+            } else {
+                w.Bytes(regions[r].begin + at, n);
+            }
+        }
         w.Value(static_cast<u64>(per_region[r].size()));
         for (const SavedBlock& b : per_region[r]) {
             w.Value(b.location);
@@ -1241,33 +1306,35 @@ s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 m
         return -5;
     }
     std::error_code error;
-    std::filesystem::rename(std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(temporary.c_str())}},
-                            std::filesystem::path{std::u8string{reinterpret_cast<const char8_t*>(path)}}, error);
+    const std::filesystem::path from{std::u8string{reinterpret_cast<const char8_t*>(temporary.c_str())}};
+    const std::filesystem::path to{std::u8string{reinterpret_cast<const char8_t*>(path)}};
+    std::filesystem::rename(from, to, error);
+    if (error) {
+        // Patch 0075: the file in the way may be open (a lazily loaded snapshot, shared for
+        // deletion): deleted first -- the open copy reads on -- then renamed into its place.
+        std::error_code ignored;
+        std::filesystem::remove(to, ignored);
+        error.clear();
+        std::filesystem::rename(from, to, error);
+    }
     if (error) {
         return -6;
     }
     return static_cast<s64>(blocks);
 }
 
-s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
-    // Read the whole file first, outside the lock.
-    std::vector<u8> data;
-    {
-        std::FILE* const file = OpenFile(path, false);
-        if (file == nullptr) {
-            return -1;
-        }
-        u8 chunk[1 << 16];
-        for (;;) {
-            const size_t n = std::fread(chunk, 1, sizeof(chunk), file);
-            data.insert(data.end(), chunk, chunk + n);
-            if (n < sizeof(chunk)) {
-                break;
-            }
-        }
-        std::fclose(file);
+s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool lazily) {
+    std::FILE* file = OpenSnapshotFileForRead(path);
+    if (file == nullptr) {
+        return -1;
     }
-    Reader in{std::move(data)};
+    // Closed on every way out but a lazy load's success, which keeps it to read pages from.
+    SCOPE_EXIT {
+        if (file != nullptr) {
+            std::fclose(file);
+        }
+    };
+    Reader in{file};
 
     std::unique_lock held{lock};
     // Only into a cache that has emitted nothing: the restored blocks' records and ranges are made
@@ -1282,8 +1349,14 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
     if (!in.Value(magic) || magic != SNAPSHOT_MAGIC || !in.Value(version) || version != SNAPSHOT_VERSION || !in.Value(key_len)) {
         return -8;
     }
-    const u8* const saved_key = in.Take(key_len);
-    if (saved_key == nullptr || key_len != std::strlen(key) || std::memcmp(saved_key, key, key_len) != 0) {
+    if (key_len != std::strlen(key) || key_len > (1u << 20)) {
+        return -9;
+    }
+    std::vector<char> saved_key(key_len);
+    if (!in.Bytes(saved_key.data(), key_len)) {
+        return -8;
+    }
+    if (std::memcmp(saved_key.data(), key, key_len) != 0) {
         return -9;
     }
     u64 shape = 0;
@@ -1298,10 +1371,11 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
     if (constant_count > pool.CapacityBytes() / 16) {
         return -8;
     }
-    const u8* const constants = in.Take(constant_count * 16);
-    if (constants == nullptr) {
+    std::vector<u8> constant_bytes(constant_count * 16);
+    if (!in.Bytes(constant_bytes.data(), constant_bytes.size())) {
         return -8;
     }
+    const u8* const constants = constant_bytes.data();
     const auto placed = pool.Placed();
     if (placed.size() > constant_count || std::memcmp(placed.data(), constants, placed.size_bytes()) != 0) {
         return -11;  // the prelude placed other constants
@@ -1323,9 +1397,9 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
         if (r.used > static_cast<u64>(region.end - region.begin)) {
             return -8;
         }
-        r.bytes = in.Take(r.used);
+        r.file_offset = in.Offset();
         u64 count = 0;
-        if (r.bytes == nullptr || !in.Value(count)) {
+        if (!in.Skip(r.used) || !in.Value(count) || count > r.used) {
             return -8;
         }
         const u64 lo = static_cast<u64>(region.begin - buffer);
@@ -1343,11 +1417,9 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
                 return -8;
             }
             b.slots.resize(slots);
-            const u8* p = in.Take(slots * sizeof(EmitX64::SnapshotSlot));
-            if (p == nullptr) {
+            if (!in.Bytes(b.slots.data(), slots * sizeof(EmitX64::SnapshotSlot))) {
                 return -8;
             }
-            std::memcpy(b.slots.data(), p, slots * sizeof(EmitX64::SnapshotSlot));
             for (const auto& s : b.slots) {
                 if (s.slot < b.entry || static_cast<u64>(s.slot) + 8 > static_cast<u64>(b.entry) + b.size || s.slot % 8 != 0 || s.unlinked >= hi) {
                     return -8;
@@ -1357,11 +1429,9 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
                 return -8;
             }
             b.sites.resize(sites);
-            p = in.Take(sites * sizeof(EmitX64::SnapshotSite));
-            if (p == nullptr) {
+            if (!in.Bytes(b.sites.data(), sites * sizeof(EmitX64::SnapshotSite))) {
                 return -8;
             }
-            std::memcpy(b.sites.data(), p, sites * sizeof(EmitX64::SnapshotSite));
             const u64 prelude_end = static_cast<u64>(static_cast<const u8*>(block_of_code.GetCodeBegin()) - buffer);
             for (const auto& s : b.sites) {
                 if (s.site < b.entry || s.site >= b.entry + b.size || s.resume < lo || s.resume >= hi || s.callback >= prelude_end) {
@@ -1389,6 +1459,10 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
         // A constant appears once in a pool; a snapshot whose pool repeats one is not ours.
         ASSERT(at == static_cast<const u8*>(writable_pool.Begin()) + i * 16);
     }
+    lazy_pages.base = block_of_code.getCode();  // patch 0075
+    if (lazily) {
+        emitter.lazy_pages = &lazy_pages;
+    }
     // The constructor started region 0; the snapshot's regions are started in its order instead.
     regions[0].state = Region::State::Free;
     current = NO_REGION;
@@ -1400,21 +1474,66 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key) {
         StartRegion(r.index);
         Region& region = regions[r.index];
         u8* const committed = std::min(AlignUp(region.begin + r.used, SHARED_GRANULE), region.end);
-        if (committed > region.begin) {
-            block_of_code.CommitRange(region.begin, static_cast<size_t>(committed - region.begin));
-            region.code_committed_end = committed;
+        if (!lazily) {
+            if (committed > region.begin) {
+                block_of_code.CommitRange(region.begin, static_cast<size_t>(committed - region.begin));
+            }
+            if (!ReadAt(file, r.file_offset, region.begin, r.used)) {
+                // Records not made yet: the region is simply forgotten (started again below).
+                block_of_code.DecommitRange(region.begin, static_cast<size_t>(region.end - region.begin));
+                return -8;
+            }
+        } else {
+            // Patch 0075: nothing read or committed; every page of it pending, read in when a block
+            // on it is first entered. The code after it, where emission goes on, is committed.
+            lazy_pages.Mark(region.begin, region.begin + r.used, true);
+            const u8* const tail = AlignDown(region.begin + r.used, 4096);
+            if (committed > tail) {
+                block_of_code.CommitRange(tail, static_cast<size_t>(committed - tail));
+            }
+            lazy_regions.push_back(LazyRegion{r.index, r.file_offset, r.used, {}});
         }
-        std::memcpy(region.begin, r.bytes, r.used);
+        region.code_committed_end = std::max(region.code_committed_end, committed);
         for (const SavedBlock& b : r.blocks) {
             const IR::LocationDescriptor location{b.location};
-            emitter.RestoreBlock(location, b.entry, b.size, b.slots.data(), b.slots.size(), b.sites.data(), b.sites.size());
+            if (lazily) {
+                const u32 first_serial = emitter.NextLinkSerial();
+                for (size_t i = 0; i < b.slots.size(); i++) {
+                    lazy_regions.back().slots.emplace_back(b.slots[i].slot, static_cast<u32>(first_serial + i));
+                }
+            }
+            emitter.RestoreBlock(location, b.entry, b.size, b.slots.data(), b.slots.size(), b.sites.data(), b.sites.size(), lazily);
             emitter.RestoreGuestRange(location, b.first, b.span);
             unverified[b.location] = Unverified{b.first, b.span, b.hash};
         }
+        if (lazily) {
+            std::sort(lazy_regions.back().slots.begin(), lazy_regions.back().slots.end());
+        }
         block_of_code.SetCodePtr(region.begin + r.used);
     }
+    if (lazily) {
+        lazy_file = file;
+        file = nullptr;  // kept open, to read pages from
+        // The page the next block is emitted on holds restored code below it: read in now. If it
+        // cannot be, nothing more is emitted into that region (EnsureRoom starts another).
+        if (current != NO_REGION) {
+            Region& region = regions[current];
+            const u8* const at = block_of_code.getCurr<const u8*>();
+            const u8* const tail = AlignDown(const_cast<u8*>(at), 4096);
+            if (tail < at && tail >= region.begin && !Materialize(tail, at)) {
+                region.state = Region::State::Full;
+                current = NO_REGION;
+            }
+        }
+    }
     if (current == NO_REGION) {
-        StartRegion(0);
+        // A free region to go on in (there is one: at most `live_limit` were restored).
+        for (size_t i = 0; i < regions.size(); i++) {
+            if (regions[i].state == Region::State::Free) {
+                StartRegion(i);
+                break;
+            }
+        }
     }
     snapshot_hashing = true;
     snapshot_restored += block_total;
@@ -1458,6 +1577,13 @@ std::optional<CodePtr> SharedCodeCache::Impl::VerifyRestored(IR::LocationDescrip
         block_of_code.DisableWriting();
     };
     if (hash && *hash == pending.hash) {
+        // Patch 0075: its code read in first, if it was restored lazily.
+        const u8* const entry = static_cast<const u8*>(any->first.entrypoint);
+        if (!Materialize(entry, entry + any->first.size)) {
+            emitter.InvalidateBasicBlocks({location});
+            snapshot_rejected++;
+            return std::nullopt;
+        }
         emitter.MarkVerified(location);
         block_hashes[location.Value()] = pending.hash;
         snapshot_verified++;
@@ -1466,6 +1592,55 @@ std::optional<CodePtr> SharedCodeCache::Impl::VerifyRestored(IR::LocationDescrip
     emitter.InvalidateBasicBlocks({location});
     snapshot_rejected++;
     return std::nullopt;
+}
+
+bool SharedCodeCache::Impl::Materialize(const u8* begin, const u8* end) {
+    if (lazy_regions.empty()) {
+        return true;
+    }
+    for (const u8* page = AlignDown(const_cast<u8*>(begin), 4096); page < end; page += 4096) {
+        if (!lazy_pages.Pending(page)) {
+            continue;
+        }
+        LazyRegion* lazy = nullptr;
+        for (LazyRegion& l : lazy_regions) {
+            const Region& r = regions[l.index];
+            if (page >= r.begin && page < r.begin + l.used) {
+                lazy = &l;
+            }
+        }
+        if (lazy == nullptr || lazy_file == nullptr) {
+            return false;
+        }
+        const Region& region = regions[lazy->index];
+        const u64 offset = static_cast<u64>(page - region.begin);
+        const size_t n = static_cast<size_t>(std::min<u64>(4096, lazy->used - offset));
+        u8* const writable = const_cast<u8*>(page);
+        block_of_code.CommitRange(writable, 4096);
+        if (!ReadAt(lazy_file, lazy->file_offset + offset, writable, n)) {
+            return false;
+        }
+        lazy_pages.Mark(page, page + 4096, false);
+        snapshot_pages_read++;
+        // Its slots, as they would be had they been written all along.
+        const u32 lo = static_cast<u32>(page - block_of_code.getCode());
+        auto it = std::lower_bound(lazy->slots.begin(), lazy->slots.end(), std::make_pair(lo, u32{0}));
+        for (; it != lazy->slots.end() && it->first < lo + 4096; ++it) {
+            emitter.RefreshSlot(it->second);
+        }
+    }
+    return true;
+}
+
+void SharedCodeCache::Impl::DropLazy(size_t index) {
+    for (auto it = lazy_regions.begin(); it != lazy_regions.end(); ++it) {
+        if (it->index == index) {
+            const Region& r = regions[index];
+            lazy_pages.Mark(r.begin, r.begin + it->used, false);
+            lazy_regions.erase(it);
+            return;
+        }
+    }
 }
 
 CodePtr SharedCodeCache::Impl::Emit(IR::LocationDescriptor location, const UserConfig& translator_conf, SharedThreadState& thread) {
@@ -1636,6 +1811,9 @@ void SharedCodeCache::Impl::Invalidate(bool entire, const boost::icl::interval_s
 
 void SharedCodeCache::Impl::ForgetEverything(SharedThreadState* thread) {
     blocks_invalidated += emitter.ForgetAllBlocks();
+    for (size_t i = 0; i < regions.size(); i++) {  // patch 0075: after the slots are unlinked
+        DropLazy(i);
+    }
     block_hashes = {};  // patch 0070: every block is forgotten
     unverified = {};
     unverified_count.store(0, std::memory_order_relaxed);
@@ -1765,6 +1943,7 @@ bool SharedCodeCache::Impl::EvictOldest(SharedThreadState* thread) {
     const auto t0 = std::chrono::steady_clock::now();
     evicted_scratch.clear();
     const size_t dropped = emitter.ForgetRegionBlocks(oldest->begin, oldest->end, oldest->first_range, end_range, evicted_scratch);
+    DropLazy(static_cast<size_t>(oldest - regions.data()));  // patch 0075: before its records go
     // Every record and range below the next live region's serials is dead now: the blocks they
     // named were this region's, an older region's, or invalidated.
     emitter.TrimLinkRecords(end_link);
@@ -1959,6 +2138,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
     s.snapshot_blocks_verified = snapshot_verified;
     s.snapshot_blocks_rejected = snapshot_rejected;
     s.snapshot_save_lock_ns = snapshot_save_lock_ns;
+    s.snapshot_pages_read = snapshot_pages_read;
     return s;
 }
 
@@ -2014,8 +2194,8 @@ std::int64_t SharedCodeCache::SaveSnapshot(const char* path, const char* key, st
     return impl->SaveSnapshot(path, key, max_bytes, include_unverified);
 }
 
-std::int64_t SharedCodeCache::LoadSnapshot(const char* path, const char* key) {
-    return impl->LoadSnapshot(path, key);
+std::int64_t SharedCodeCache::LoadSnapshot(const char* path, const char* key, bool lazily) {
+    return impl->LoadSnapshot(path, key, lazily);
 }
 
 // ------------------------------------------------------------------------------------------------

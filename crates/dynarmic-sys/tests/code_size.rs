@@ -435,6 +435,7 @@ fn a_snapshot_of_real_code_runs_it_the_same() {
     eprintln!("snapshot test: the first pass");
     let fresh = guest_visible_pass(&code, vaddr, len, &funcs, opts, &mut arena);
     let emitted = stats(first).blocks_emitted;
+    let first_code_bytes = stats(first).code_bytes_emitted;
     // SAFETY: no jit runs on it.
     let saved = unsafe { od_code_cache_save_snapshot(first, snapshot.as_ptr(), key.as_ptr(), u64::MAX, 0) };
     assert!(saved > 0 && saved as u64 <= emitted, "saved {saved} of {emitted}");
@@ -442,7 +443,8 @@ fn a_snapshot_of_real_code_runs_it_the_same() {
     // A second cache, the first still alive: elsewhere in memory.
     let (second, monitor2, opts2) = cache_and_opts(arena.as_mut_ptr());
     // SAFETY: a fresh cache.
-    let loaded = unsafe { od_code_cache_load_snapshot(second, snapshot.as_ptr(), key.as_ptr()) };
+    let lazily = std::env::var("OD_TEST_SNAPSHOT_LAZY").is_ok_and(|v| v == "1");
+    let loaded = unsafe { od_code_cache_load_snapshot(second, snapshot.as_ptr(), key.as_ptr(), if lazily { dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY } else { 0 }) };
     assert_eq!(loaded, saved);
     eprintln!("snapshot test: the restored pass ({loaded} blocks)");
     let restored = guest_visible_pass(&code, vaddr, len, &funcs, opts2, &mut arena);
@@ -458,6 +460,30 @@ fn a_snapshot_of_real_code_runs_it_the_same() {
         od_monitor_free(monitor2);
         od_code_cache_free(first);
         od_monitor_free(monitor);
+    }
+    // Patch 0075: loaded lazily, with only a tenth of the functions run -- what the guest sees is
+    // what a fresh cache running the same tenth gives, nothing is translated, and only the pages
+    // those blocks are on are read in.
+    let part = &funcs[..funcs.len() / 10];
+    let (third, monitor3, opts3) = cache_and_opts(arena.as_mut_ptr());
+    // SAFETY: a fresh cache.
+    let loaded = unsafe { od_code_cache_load_snapshot(third, snapshot.as_ptr(), key.as_ptr(), dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY) };
+    assert_eq!(loaded, saved);
+    let lazy_part = guest_visible_pass(&code, vaddr, len, part, opts3, &mut arena);
+    let s3 = stats(third);
+    let (fourth, monitor4, opts4) = cache_and_opts(arena.as_mut_ptr());
+    let fresh_part = guest_visible_pass(&code, vaddr, len, part, opts4, &mut arena);
+    let code_pages = first_code_bytes / 4096;
+    println!("lazily, a tenth of the functions: {} of ~{code_pages} pages read in; {s3:?}", s3.snapshot_pages_read);
+    assert_eq!(lazy_part, fresh_part, "what the guest saw differs from a fresh cache's");
+    assert_eq!(s3.blocks_emitted, 0, "{s3:?}");
+    assert!(s3.snapshot_pages_read > 0 && s3.snapshot_pages_read * 4 < code_pages, "{s3:?}");
+    // SAFETY: the Vms are gone.
+    unsafe {
+        od_code_cache_free(fourth);
+        od_monitor_free(monitor4);
+        od_code_cache_free(third);
+        od_monitor_free(monitor3);
     }
     let _ = std::fs::remove_file(&file);
 }

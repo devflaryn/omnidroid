@@ -22,6 +22,10 @@
 //!   Restored blocks that never verified are left out, so a snapshot is one run's working set and
 //!   does not grow across boots.
 //! - `OMNI_JIT_SNAPSHOT_MAX_MB=<MiB>` (default 512): no snapshot past that much code.
+//! - `OMNI_JIT_SNAPSHOT_LAZY=1` (default off; dynarmic patch 0075): read a snapshot's code a page at
+//!   a time, as blocks on the page are first entered, from the file kept open -- instead of all of it
+//!   into private memory at load. Code restored and never entered then costs nothing; the save line
+//!   says how many pages were read.
 //!
 //! **Library placement.** A block is reused only at the guest address it was translated at, and
 //! Android's dynamic linker places each library at a random offset inside the range it reserves
@@ -99,6 +103,11 @@ fn max_bytes() -> u64 {
     std::env::var("OMNI_JIT_SNAPSHOT_MAX_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20
 }
 
+fn lazy() -> bool {
+    static LAZY: OnceLock<bool> = OnceLock::new();
+    *LAZY.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_LAZY").is_ok_and(|v| v.trim() == "1"))
+}
+
 fn quiet_seconds() -> u64 {
     std::env::var("OMNI_JIT_SNAPSHOT_QUIET").ok().and_then(|v| v.parse().ok()).unwrap_or(20)
 }
@@ -172,7 +181,7 @@ pub(crate) fn attach(p: &Arc<Process>, exe: &[u8], argv: &[Vec<u8>]) {
     let mut loaded = 0;
     if path.exists() {
         let t0 = Instant::now();
-        let n = backend.load_translation_snapshot(&path, &key);
+        let n = backend.load_translation_snapshot(&path, &key, lazy());
         eprintln!(
             "[jit-snapshot] pid {} {}: {} ({:.0} ms)",
             p.sys.pid,
@@ -212,7 +221,7 @@ pub(crate) fn save(p: &Process, why: &str) {
     let size = std::fs::metadata(&target.path).map(|m| m.len()).unwrap_or(0);
     let held_ms = backend.code_cache_stats().map_or(0.0, |s| s.snapshot_save_lock_ns as f64 / 1e6);
     eprintln!(
-        "[jit-snapshot] pid {} {why}: {} ({:.1} MiB, {:.0} ms, {held_ms:.0} ms of it holding the code cache; {} blocks translated, {} restored, {} verified, {} rejected)",
+        "[jit-snapshot] pid {} {why}: {} ({:.1} MiB, {:.0} ms, {held_ms:.0} ms of it holding the code cache; {} blocks translated, {} restored, {} verified, {} rejected, {} pages read in)",
         p.sys.pid,
         if n >= 0 { format!("{n} blocks saved") } else { format!("not saved (error {n})") },
         size as f64 / (1u64 << 20) as f64,
@@ -220,7 +229,8 @@ pub(crate) fn save(p: &Process, why: &str) {
         stats.blocks_emitted,
         stats.snapshot_blocks_restored,
         stats.snapshot_blocks_verified,
-        stats.snapshot_blocks_rejected
+        stats.snapshot_blocks_rejected,
+        stats.snapshot_pages_read
     );
     *target.saved_emitted.lock() = (stats.blocks_emitted, Instant::now(), stats.blocks_emitted);
 }

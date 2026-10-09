@@ -1510,11 +1510,14 @@ impl DynarmicBackend {
     /// Install the translation snapshot at `path` (tagged `key`) into the shared code cache, which
     /// must not have translated anything yet: the blocks installed (each entered only once its guest
     /// code reads back unchanged), or a negative error and nothing changed.
-    pub fn load_translation_snapshot(&self, path: &std::path::Path, key: &str) -> i64 {
+    /// `lazily` (patch 0075): nothing of the code is read or committed at load; a page is read in
+    /// from the file when a block on it is first entered, so restored code never entered costs no
+    /// memory.
+    pub fn load_translation_snapshot(&self, path: &std::path::Path, key: &str, lazily: bool) -> i64 {
         let Some(cache) = self.shared.code_cache.as_ref() else { return -1 };
         let (Some(path), Ok(key)) = (path.to_str().and_then(|p| std::ffi::CString::new(p).ok()), std::ffi::CString::new(key)) else { return -1 };
         // SAFETY: as `save_translation_snapshot`.
-        unsafe { dynarmic_sys::od_code_cache_load_snapshot(cache.0, path.as_ptr(), key.as_ptr()) }
+        unsafe { dynarmic_sys::od_code_cache_load_snapshot(cache.0, path.as_ptr(), key.as_ptr(), if lazily { dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY } else { 0 }) }
     }
 
     /// The shared code cache's counters, or `None` without one.

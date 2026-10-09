@@ -683,3 +683,41 @@ so a game's ~230 MiB held every guest thread for as long as the disk took. The t
 held is kept in the stats as `snapshot_save_lock_ns` (ABI 8). Measured on `b_hello_dex`: 3-8 ms for
 5 MiB / 12k blocks and 18-22 ms for 30 MiB / 67k blocks. That scales to about 150-200 ms for the
 game's ~525k blocks, once per boot.
+
+### 0075 — x64: a snapshot's code read in as it is entered (switch, off by default)
+
+x64, shared caches (0070). A snapshot loaded eagerly copies all of its code into committed, private
+memory. Restored code that never runs again costs as much as code that does; on the device that
+was +0.25 GB of private working set (s20). `LoadSnapshot(path, key, lazily)`
+(`OD_SNAPSHOT_LOAD_LAZY`; omni-linux `OMNI_JIT_SNAPSHOT_LAZY=1`) instead reads and commits nothing of
+the code at load:
+
+- **At load.** The snapshot's regions are left reserved. Every page they cover is marked pending in
+  `LazyPages` (a bit per 4 KiB page of the buffer). Records, sites and ranges are made as before,
+  but slots are not written. The file stays open (shared for deletion, so a later save can replace
+  it) and its regions' file offsets are kept.
+- **On first entry.** When a block verifies, the pages it covers are committed and read from the
+  file (`Materialize`). The slots on each page are then set to what they would hold had they been
+  written all along: their target's entry if it is entered, their unlinked value otherwise
+  (`RefreshSlot`).
+- **Until then.** Every slot write (`StoreSlot`: linking, unlinking, forgetting) skips a pending
+  page; nothing executes code on one, since its blocks are not entered.
+- **Eviction and saves.** Evicting a region or forgetting everything drops its pending state. A
+  save writes a pending page as zeros: no block it saves lies on one, as each was entered.
+- **Load itself.** Both modes now stream the file rather than read all of it into memory first, so
+  the eager mode reads region bytes straight into the code buffer. The game's 281 MiB load no
+  longer has a 281 MiB transient.
+
+Stats: `snapshot_pages_read` (ABI 9).
+
+Verified: `tests/snapshot.rs` (the same program loaded lazily runs the same with nothing
+translated, and saves over the very file it keeps open; changed guest code drops exactly its block,
+lazily too). `tests/code_size.rs::a_snapshot_of_real_code_runs_it_the_same`: libc's 4,855 blocks
+loaded lazily with a tenth of the functions run give the guest-visible state of a fresh cache
+running that tenth, with nothing translated, and read in 64 of ~467 pages (14%). omni-linux
+`a2_proc` and `b_hello_dex` pass with it, three boots each (eager, then lazy twice). Read in, as a
+share of each snapshot: toybox 628 pages of 3.2 MiB (77%); dalvikvm64 5,703 pages of 30 MiB (74%),
+with 65,129 of 67,116 blocks verified. A snapshot is the last run's working set (0074), so a run
+like it re-enters most of it. The saving is the part a run does not enter, plus the share of every
+read-in page that holds no entered block. dalvikvm64's 2k-17k blocks translated on a reload vary
+from run to run the same way in either mode.

@@ -189,8 +189,41 @@ public:
     /// The fastmem sites recorded inside `[begin, end)`, ascending.
     void SnapshotSitesIn(const u8* begin, const u8* end, std::vector<SnapshotSite>& out) const;
     /// Install a block restored from a snapshot, unverified: its code is already in place at
-    /// `entry` (an offset); its slots are written unlinked and recorded, its sites recorded.
-    void RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count);
+    /// `entry` (an offset) -- or, `lazily` (patch 0075), will be when it is entered; its slots are
+    /// written unlinked (not `lazily`) and recorded, its sites recorded.
+    void RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily = false);
+    /// Omnidroid patch 0075: the pages of the code buffer restored lazily and not yet read in --
+    /// reserved, not committed, holding nothing. A slot there is not written (a page is filled,
+    /// and its slots set, when a block on it is first entered).
+    struct LazyPages {
+        const u8* base = nullptr;
+        std::vector<u64> bits;
+        bool Pending(const void* at) const {
+            if (bits.empty()) {
+                return false;
+            }
+            const size_t page = static_cast<size_t>(static_cast<const u8*>(at) - base) >> 12;
+            return page / 64 < bits.size() && ((bits[page / 64] >> (page % 64)) & 1) != 0;
+        }
+        void Mark(const void* begin, const void* end, bool pending) {
+            const size_t first = static_cast<size_t>(static_cast<const u8*>(begin) - base) >> 12;
+            const size_t last = (static_cast<size_t>(static_cast<const u8*>(end) - base) + 4095) >> 12;
+            if (pending && bits.size() * 64 < last) {
+                bits.resize((last + 63) / 64, 0);
+            }
+            for (size_t page = first; page < last && page / 64 < bits.size(); page++) {
+                if (pending) {
+                    bits[page / 64] |= u64{1} << (page % 64);
+                } else {
+                    bits[page / 64] &= ~(u64{1} << (page % 64));
+                }
+            }
+        }
+    };
+    const LazyPages* lazy_pages = nullptr;
+    /// Patch 0075: set the slot of link record `serial` as it should be now -- its target's entry if
+    /// that is entered, its unlinked value otherwise -- once its page has been read in.
+    void RefreshSlot(u32 serial);
     /// A restored block found unchanged: entered from now on, linked to and from.
     void MarkVerified(IR::LocationDescriptor location);
 
@@ -353,6 +386,15 @@ protected:
     /// The first record EmitPendingSlots made for the block being emitted, for RegisterBlock.
     u32 pending_first_link = NO_LINK;
     u64* LinkSlotOf(const LinkRecord& record) const;
+    /// Patch 0075: store `value` in `link`'s slot, unless the slot's page is restored lazily and
+    /// not read in yet (it is set when the page is).
+    void StoreSlot(const LinkRecord& link, u64 value) {
+        u64* const slot = LinkSlotOf(link);
+        if (lazy_pages != nullptr && lazy_pages->Pending(slot)) {
+            return;
+        }
+        std::atomic_ref<u64>{*slot}.store(value, std::memory_order_release);
+    }
     u64 LinkUnlinkedOf(const LinkRecord& record) const;
     /// Shared code cache only: unlink and forget the slots of a dropped block, whose first record
     /// is `first_link`, taking each out of its target's list.

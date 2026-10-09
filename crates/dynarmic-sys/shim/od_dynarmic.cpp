@@ -646,6 +646,7 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->snapshot_blocks_verified = s.snapshot_blocks_verified;
     out->snapshot_blocks_rejected = s.snapshot_blocks_rejected;
     out->snapshot_save_lock_ns = s.snapshot_save_lock_ns;
+    out->snapshot_pages_read = s.snapshot_pages_read;
 #else
     (void)p;
 #endif
@@ -772,11 +773,11 @@ int64_t od_code_cache_save_snapshot(void* p, const char* path, const char* key, 
     return -1;
 }
 
-int64_t od_code_cache_load_snapshot(void* p, const char* path, const char* key) {
+int64_t od_code_cache_load_snapshot(void* p, const char* path, const char* key, uint32_t flags) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     if (p != nullptr && path != nullptr && key != nullptr) {
         try {
-            return static_cast<OdCodeCache*>(p)->cache->LoadSnapshot(path, key);
+            return static_cast<OdCodeCache*>(p)->cache->LoadSnapshot(path, key, (flags & OD_SNAPSHOT_LOAD_LAZY) != 0);
         } catch (...) {
             return -8;
         }
@@ -785,6 +786,7 @@ int64_t od_code_cache_load_snapshot(void* p, const char* path, const char* key) 
     (void)p;
     (void)path;
     (void)key;
+    (void)flags;
 #endif
     return -1;
 }

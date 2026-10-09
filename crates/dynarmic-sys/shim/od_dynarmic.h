@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 8u
+#define OD_DYNARMIC_ABI_VERSION 9u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -425,6 +425,8 @@ typedef struct od_code_cache_stats {
     uint64_t snapshot_blocks_rejected;  /* of those, whose guest code had changed: dropped */
     /* ABI 8. */
     uint64_t snapshot_save_lock_ns;     /* the latest save's time holding the cache's lock */
+    /* ABI 9 (patch 0075). */
+    uint64_t snapshot_pages_read;       /* pages of a lazily loaded snapshot read in, as entered */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
 
@@ -477,7 +479,10 @@ void od_code_cache_enable_snapshots(void* cache);
  * since (written with their stored hashes otherwise). */
 #define OD_SNAPSHOT_ENTERED_ONLY 1u
 int64_t od_code_cache_save_snapshot(void* cache, const char* path, const char* key, uint64_t max_bytes, uint32_t flags);
-int64_t od_code_cache_load_snapshot(void* cache, const char* path, const char* key);
+/* `flags`: OD_SNAPSHOT_LOAD_LAZY (patch 0075) reads nothing of the code at load: a page is read in
+ * from the file, kept open, when a block on it is first entered. */
+#define OD_SNAPSHOT_LOAD_LAZY 1u
+int64_t od_code_cache_load_snapshot(void* cache, const char* path, const char* key, uint32_t flags);
 
 /* Where a jit's JitState keeps its two exclusive-monitor slot pointers, which code in a shared
  * cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot addresses

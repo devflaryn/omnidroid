@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <cstdio>
 #include <functional>
 #include <memory>
 #include <type_traits>
@@ -25,6 +26,10 @@
 #include "dynarmic/ir/cond.h"
 
 namespace Dynarmic::Backend::X64 {
+
+/// Omnidroid patch 0075: open a translation snapshot (a UTF-8 path) for reading, shared so that
+/// it can be replaced -- renamed over -- while it is open.
+std::FILE* OpenSnapshotFileForRead(const char* utf8_path);
 
 using CodePtr = const void*;
 

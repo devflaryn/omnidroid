@@ -36,9 +36,17 @@ struct Cache {
     cache: *mut c_void,
     monitor: *mut c_void,
     opts: VmOptions,
+    /// For loads: `OD_SNAPSHOT_LOAD_LAZY` (patch 0075) or 0.
+    load_flags: u32,
 }
 
 impl Cache {
+    fn lazy() -> Self {
+        // Not `..Self::new()`: that copies the pointers out of a temporary whose `Drop` frees them.
+        let mut cache = Self::new();
+        cache.load_flags = dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY;
+        cache
+    }
     fn new() -> Self {
         // SAFETY: freed in `Drop`.
         let monitor = unsafe { od_monitor_new(1) };
@@ -46,7 +54,7 @@ impl Cache {
         let opts = VmOptions { shared_monitor: monitor as usize, ..identity() };
         let cache = Vm::new_code_cache(&opts, monitor, std::ptr::null_mut(), TEST_SHARED_CACHE_BYTES, TEST_SHARED_REGION_BYTES, 0);
         assert!(!cache.is_null());
-        Cache { cache, monitor, opts: VmOptions { shared_cache: cache as usize, ..opts } }
+        Cache { cache, monitor, opts: VmOptions { shared_cache: cache as usize, ..opts }, load_flags: 0 }
     }
     fn vm(&self, code: Vec<u32>) -> Vm {
         Vm::new(code, self.opts.clone())
@@ -70,7 +78,7 @@ impl Cache {
         let p = CString::new(path.to_str().unwrap()).unwrap();
         let k = CString::new(key).unwrap();
         // SAFETY: as `save`.
-        unsafe { od_code_cache_load_snapshot(self.cache, p.as_ptr(), k.as_ptr()) }
+        unsafe { od_code_cache_load_snapshot(self.cache, p.as_ptr(), k.as_ptr(), self.load_flags) }
     }
 }
 
@@ -140,15 +148,25 @@ fn saved_snapshot(path: &std::path::Path, key: &str) -> (u64, (u64, u64, u64)) {
 
 #[test]
 fn a_loaded_snapshot_runs_the_same_with_nothing_translated() {
+    same(false);
+}
+
+/// The same, loaded lazily (patch 0075): every page read in as its blocks are entered.
+#[test]
+fn a_lazily_loaded_snapshot_runs_the_same_with_nothing_translated() {
+    same(true);
+}
+
+fn same(lazily: bool) {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let path = temp("same");
+    let path = temp(if lazily { "same-lazy" } else { "same" });
     let (emitted, first) = saved_snapshot(&path, "same");
     assert_eq!(first, (600, 200, 0x1234_5678));
 
     // Another cache: elsewhere in memory, another monitor -- keep a third alive meanwhile so it
     // cannot land where the first was.
     let _elsewhere = Cache::new();
-    let cache = Cache::new();
+    let cache = if lazily { Cache::lazy() } else { Cache::new() };
     assert_eq!(cache.load(&path, "same"), emitted as i64);
     let vm = cache.vm(program(1));
     let mut buffer = Box::new(0u64);
@@ -159,17 +177,46 @@ fn a_loaded_snapshot_runs_the_same_with_nothing_translated() {
     assert_eq!(s.snapshot_blocks_restored, emitted, "{s:?}");
     assert_eq!(s.snapshot_blocks_verified, emitted, "every restored block was run, verified: {s:?}");
     assert_eq!(s.snapshot_blocks_rejected, 0, "{s:?}");
+    if lazily {
+        assert!(s.snapshot_pages_read >= 1, "{s:?}");
+    } else {
+        assert_eq!(s.snapshot_pages_read, 0, "{s:?}");
+    }
+    // A lazily loaded cache saves again (its pages never read in are left as zeros: no block saved
+    // lies on one), and that snapshot loads and runs the same.
+    // Lazily, over the very file it keeps open to read pages from, as a process's next save does.
+    let again = if lazily { path.clone() } else { temp("same-again") };
+    assert_eq!(cache.save(&again, "same"), emitted as i64);
+    drop(cache);
+    let cache = Cache::new();
+    assert_eq!(cache.load(&again, "same"), emitted as i64);
+    let vm = cache.vm(program(1));
+    let mut buffer = Box::new(0u64);
+    assert_eq!(run(&vm, &mut *buffer), first);
+    drop(vm);
+    assert_eq!(cache.stats().blocks_emitted, 0);
     let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&again);
 }
 
 #[test]
 fn changed_guest_code_drops_exactly_the_blocks_it_touches() {
+    changed(false);
+}
+
+/// The same, loaded lazily (patch 0075).
+#[test]
+fn changed_guest_code_drops_exactly_the_blocks_it_touches_when_loaded_lazily() {
+    changed(true);
+}
+
+fn changed(lazily: bool) {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let path = temp("changed");
+    let path = temp(if lazily { "changed-lazy" } else { "changed" });
     let (emitted, first) = saved_snapshot(&path, "changed");
     assert_eq!(first.1, 200);
 
-    let cache = Cache::new();
+    let cache = if lazily { Cache::lazy() } else { Cache::new() };
     assert_eq!(cache.load(&path, "changed"), emitted as i64);
     // The leaf adds 2 now.
     let vm = cache.vm(program(2));

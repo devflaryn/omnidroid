@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 8;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 9;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -619,6 +619,8 @@ pub struct OdCodeCacheStats {
     /// ABI 8: the latest save's time holding the cache's lock, copying the snapshot out (guest
     /// threads that need the cache wait for it); the file is written after.
     pub snapshot_save_lock_ns: u64,
+    /// ABI 9 (patch 0075): pages of a lazily loaded snapshot read in, as blocks on them were entered.
+    pub snapshot_pages_read: u64,
 }
 
 /// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),
@@ -776,7 +778,7 @@ extern "C" {
     ///
     /// # Safety
     /// As [`od_code_cache_save_snapshot`].
-    pub fn od_code_cache_load_snapshot(cache: *mut c_void, path: *const core::ffi::c_char, key: *const core::ffi::c_char) -> i64;
+    pub fn od_code_cache_load_snapshot(cache: *mut c_void, path: *const core::ffi::c_char, key: *const core::ffi::c_char, flags: u32) -> i64;
 
     /// What the cache's per-block tables hold (a census: takes the cache's lock, shared, and walks
     /// what cannot be sized in O(1) -- for a report made every few minutes, not a hot path). All
@@ -1133,6 +1135,9 @@ extern "C" {
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_shrink_tables(on: u32) -> u32;
 }
+
+/// Patch 0075: [`od_code_cache_load_snapshot`]'s flag reading the code a page at a time, as entered.
+pub const OD_SNAPSHOT_LOAD_LAZY: u32 = 1;
 
 /// Patch 0070: [`od_code_cache_save_snapshot`]'s flag leaving out the blocks restored and never
 /// entered since.
