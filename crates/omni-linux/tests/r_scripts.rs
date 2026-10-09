@@ -14,13 +14,13 @@ fn the_defaults_are_the_fast_scripts_and_the_old_ones_stay_reachable() {
     std::env::remove_var("OMNI_R_FAST_SETUP");
     assert_eq!(r_scripts::link_delay(), 3);
     assert!(r_scripts::plant_first());
-    assert!(r_scripts::fast_setup());
+    assert!(!r_scripts::fast_setup(), "opt-in");
     std::env::set_var("OMNI_R_LINK_DELAY", "45");
     std::env::set_var("OMNI_R_PLANT_FIRST", "0");
-    std::env::set_var("OMNI_R_FAST_SETUP", "0");
+    std::env::set_var("OMNI_R_FAST_SETUP", "1");
     assert_eq!(r_scripts::link_delay(), 45);
     assert!(!r_scripts::plant_first());
-    assert!(!r_scripts::fast_setup());
+    assert!(r_scripts::fast_setup());
     std::env::set_var("OMNI_R_LINK_DELAY", "soon");
     assert_eq!(r_scripts::link_delay(), 3, "an unreadable value is the default");
     std::env::remove_var("OMNI_R_LINK_DELAY");

@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <algorithm>
 #include <cstdio>
-#include <map>
+#include <vector>
 
 #include <mcl/assert.hpp>
 #include <mcl/stdint.hpp>
@@ -29,18 +30,27 @@ void VerificationPass(const IR::Block& block) {
         }
     }
 
-    std::map<IR::Inst*, size_t> actual_uses;
+    // Omnidroid patch 0063: the same check -- every instruction used as an argument is used as many
+    // times as it counts -- over a sorted list in a per-thread buffer rather than a std::map (a
+    // node allocation per used instruction, every block translated).
+    thread_local std::vector<IR::Inst*> uses;
+    uses.clear();
     for (const auto& inst : block) {
         for (size_t i = 0; i < inst.NumArgs(); i++) {
             const auto arg = inst.GetArg(i);
             if (!arg.IsImmediate()) {
-                actual_uses[arg.GetInst()]++;
+                uses.push_back(arg.GetInst());
             }
         }
     }
-
-    for (const auto& pair : actual_uses) {
-        ASSERT(pair.first->UseCount() == pair.second);
+    std::sort(uses.begin(), uses.end());
+    for (size_t i = 0; i < uses.size();) {
+        size_t j = i + 1;
+        while (j < uses.size() && uses[j] == uses[i]) {
+            j++;
+        }
+        ASSERT(uses[i]->UseCount() == j - i);
+        i = j;
     }
 }
 

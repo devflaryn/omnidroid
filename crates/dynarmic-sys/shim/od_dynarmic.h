@@ -577,6 +577,11 @@ uint64_t od_tbi_sites_noted(void);
 uint32_t od_set_compact_code(uint32_t on);
 uint32_t od_codegen_census(uint64_t* out, uint32_t n);
 void od_codegen_census_reset(void);
+/* Patch 0062 (x64 only): `observer(ctx, guest_pc, host, code_bytes, total_bytes)` for every block
+ * emitted from now on, on the emitting thread (under the shared cache's lock); null stops it. For
+ * differential tests of the emitter. A no-op on arm64. */
+typedef void (*od_emit_observer)(void* ctx, uint64_t guest_pc, const void* host, size_t code_bytes, size_t total_bytes);
+void od_set_emit_observer(od_emit_observer observer, void* ctx);
 
 /* Patch 0042 (x64 only): non-zero emits the return-stack buffer's and the fast-dispatch table's
  * hit paths inside each RET/BR/BLR block, from the target still in a register, in blocks emitted

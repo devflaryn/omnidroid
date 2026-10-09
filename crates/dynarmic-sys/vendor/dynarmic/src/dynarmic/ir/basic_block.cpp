@@ -21,8 +21,10 @@
 
 namespace Dynarmic::IR {
 
+// Omnidroid patch 0063: slabs of 256 instructions, not 4,096 (~400 KiB malloc'd and freed for
+// every block translated, of which a block uses ~30 entries); a longer block takes more slabs.
 Block::Block(const LocationDescriptor& location)
-        : location{location}, end_location{location}, cond{Cond::AL}, instruction_alloc_pool{std::make_unique<Common::Pool>(sizeof(Inst), 4096)} {}
+        : location{location}, end_location{location}, cond{Cond::AL}, instruction_alloc_pool{std::make_unique<Common::Pool>(sizeof(Inst), 256)} {}
 
 Block::~Block() = default;
 

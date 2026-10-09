@@ -51,9 +51,10 @@ dynarmic/
                and ../patches/0050-x64-shared-cache-eviction-on-demand.patch
                and ../patches/0051-x64-fastmem-site-records-of-8-bytes.patch
                and ../patches/0052-x64-compact-block-map-link-heads-and-guest-ranges.patch
-               and ../patches/0053-x64-fastmem-fallbacks-in-flat-tables.patch
                and ../patches/0060-x64-codegen-census.patch
                and ../patches/0061-x64-compact-code.patch
+               and ../patches/0062-x64-emit-observer.patch
+               and ../patches/0063-x64-faster-emitter.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

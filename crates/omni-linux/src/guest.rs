@@ -34,6 +34,26 @@ pub trait Remote: Send + Sync {
 pub trait Resident: Send + Sync {
     /// Block until this side's view is the one in the address space.
     fn ensure(&self);
+    /// This side forks: block until its view is the one in the address space and keep it there
+    /// until [`release_fork`](Self::release_fork) -- the fork child runs in it until it executes a
+    /// program. False when the pair is over (nothing to keep).
+    fn claim_fork(&self) -> bool;
+    /// The fork claimed with [`claim_fork`](Self::claim_fork) is done with the memory.
+    fn release_fork(&self);
+    /// Which pair this is a side of (an identity to compare, nothing more).
+    fn pair_key(&self) -> usize;
+}
+
+/// A fork's hold on its side's view of a time-shared memory ([`GuestMem::hold_for_fork`]), let go
+/// when dropped.
+pub struct ForkHold(Option<Arc<dyn Resident>>);
+
+impl Drop for ForkHold {
+    fn drop(&mut self) {
+        if let Some(side) = self.0.take() {
+            side.release_fork();
+        }
+    }
 }
 
 /// Whether the kernel's reads of guest memory leave a lazy mapping's uncommitted pages
@@ -101,6 +121,16 @@ impl GuestMem {
         self.paired.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Pair `key` is over: if this view is its side (and not another pair's -- a process that forks
+    /// and whose child executes a program never shared its memory with that child, and must not
+    /// lose the pair it is a side of), copies are unconditional again.
+    pub(crate) fn unshare_from(&self, key: usize) {
+        let ours = self.resident.lock().as_ref().is_some_and(|s| s.pair_key() == key);
+        if ours {
+            self.unshare();
+        }
+    }
+
     /// The pair is over (the child executed a program or ended): copies are unconditional again.
     pub(crate) fn unshare(&self) {
         self.paired.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -110,6 +140,17 @@ impl GuestMem {
 
     /// Wait until this side's view is the one in the address space. Called before a copy takes the
     /// layout lock -- never while holding it, which is what a switch takes exclusively.
+    /// A fork of this process is starting: when it is one side of a live fork pair, wait until its
+    /// view is in the address space and keep it there while the fork's child runs in it (the
+    /// pair's switches wait), until the hold is dropped.
+    pub(crate) fn hold_for_fork(&self) -> ForkHold {
+        if !self.paired.load(std::sync::atomic::Ordering::Relaxed) {
+            return ForkHold(None);
+        }
+        let side = self.resident.lock().clone();
+        ForkHold(side.filter(|s| s.claim_fork()))
+    }
+
     pub(crate) fn ensure_resident(&self) {
         if !self.paired.load(std::sync::atomic::Ordering::Relaxed) {
             return;

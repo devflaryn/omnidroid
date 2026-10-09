@@ -519,14 +519,55 @@ suite with `OD_TEST_COMPACT` on, per-thread and shared. With the switch defaulte
 `a1_toybox`, `a4_threads`, `a5_signals`, `b_hello_dex` (ART; with `OMNI_BOOT_IMAGE_UNCOMPRESSED=0`,
 since that test's mapping-name check fails at HEAD either way) and `tbi_off`.
 
-### 0053 — x64: the fastmem fallbacks in flat tables
+### 0062 — x64: an emit observer, for differential tests of the emitter
 
-x64. `A64EmitX64`'s `read_fallbacks`, `write_fallbacks` and `exclusive_write_fallbacks` were
-`std::map`s of ~2,000 entries each, filled by the prelude: ~6,000 tree nodes, ~0.6 MiB of heap per
-code cache (`tests/resident.rs::what_a_new_code_cache_allocates`: +0.65 MiB before, nothing over
-256 KiB after) -- in the system's host process one cache per guest process (40 caches in a
-world, ~25 MiB). Now three arrays indexed by (ordered, bit size, address register, value register),
-20 KiB each, read through the same `operator[]` (a missing entry reads null, as the map's did).
-Verified: the dynarmic-sys suite, omni-cpu's exclusive/tbi/faults/thunk/lifecycle tests under
-`OD_TEST_SHARED_CACHE=1`.
+x64. `SetEmitObserver` (`od_set_emit_observer`): a callback told of every block emitted -- guest
+PC, host entry, the bytes of its code up to its link slots, and its size with them. Null by
+default: one relaxed load a block. `tests/code_size.rs::the_speed_of_emission` writes every block of
+a corpus with it (`OMNI_EMIT_DUMP`), and `tools/compare_emit_dumps.py` compares two such dumps:
+the same blocks, sizes and bytes, except inside host-address operands (`mov r64, imm64`, `call
+rel32`), which move with the executable. Two runs of one build: identical (11,005 blocks, 4.7 MB).
+
+### 0063 — x64: a faster emitter, the same code
+
+x64 (and the IR's allocation, both backends). Profiled with `OMNI_THREAD_CPU`'s `[thread-host]`
+on a real ART start (`omni-linux/tests/b_hello_dex.rs`). Emission spent its time in
+`RegAlloc::ValueLocation` (a `std::find` over 96 locations' vectors, for every argument and every
+definition's assert), `RegAlloc::EndOfAllocScope` (releasing all 96 after every IR instruction)
+and the heap, about a quarter of all samples together.
+
+- **`RegAlloc`.** A location's values are held inline (`HostLocValues`, three, then a vector)
+  instead of in a `std::vector`. The 96 locations live in place, not in a vector allocated per
+  block. `touched` marks the locations written since the last `EndOfAllocScope`, the only ones it
+  releases. `occupied` is a superset of the locations holding values, the only ones `ValueLocation`
+  searches, lowest first as before. `SelectARegister` runs the same two `std::partition`s over a
+  stack copy instead of a `std::vector`. The desired locations are a `std::span`, not a vector
+  built for every `ScratchGpr(loc)` / `Use(arg, loc)` / host call. The allocation orders are viewed
+  rather than copied, and A64's general-register order is made once.
+- **Deferred emits** are `DeferredEmit` (in place up to 256 bytes), not `std::function`, which
+  allocated for every memory access emitted.
+- **The fastmem fallbacks** are flat tables (A64), not `std::map`s searched for every access.
+- **The IR.** A block's instruction pool takes slabs of 256 instructions, not 4,096 (~400 KiB
+  malloc'd and freed for each block translated), and each thread keeps one slab for the next
+  block. `VerificationPass` counts uses over a sorted per-thread buffer, not a `std::map`. These
+  are the same checks.
+
+No decision changes. Verified bit for bit: `tests/code_size.rs::the_speed_of_emission` with
+`OMNI_EMIT_DUMP`, compared with 0062's dump of the same corpus by `tools/compare_emit_dumps.py`:
+11,005 blocks, 4.7 MB of code, identical except inside host-address operands. Also the dynarmic-sys
+suite per-thread and shared (and with `OD_TEST_COMPACT=1`), omni-cpu (only the known `low_window`
+and `subpage` failures), and omni-linux `a1_toybox`, `a4_threads`, `a5_signals`, `b_hello_dex`
+and `tbi_off`.
+
+Measured on the corpus, with four interleaved pairs of the 0062 and 0063 binaries (E-cores, idle
+priority, medians of 5 passes):
+
+| | Frontend (µs/block) | Emit (µs/block) | Both (µs/block) |
+|---|---|---|---|
+| 0062 | 12.2 | 36.7 | 48.9 |
+| 0063 | 9.2 | 19.0 | 28.2 |
+
+That is emit 1.93× and translation 1.73× faster; wall time 51 → 30 µs a block. On a real ART
+start (`b_hello_dex`, `dalvikvm64`, 67k blocks), emit went from 2.08 s to 1.12 s, the frontend
+from 0.67 s to 0.53 s, and the run from 3.9 s to 2.8 s.
 

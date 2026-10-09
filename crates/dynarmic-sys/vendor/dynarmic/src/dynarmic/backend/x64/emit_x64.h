@@ -24,6 +24,7 @@
 #include <xbyak/xbyak_util.h>
 
 #include "dynarmic/backend/exception_handler.h"
+#include "dynarmic/backend/x64/deferred_emit.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
 #include "dynarmic/backend/x64/shared_code_lock.h"
 #include "dynarmic/common/fp/fpcr.h"
@@ -103,7 +104,7 @@ struct EmitContext {
     RegAlloc& reg_alloc;
     IR::Block& block;
 
-    std::vector<std::function<void()>> deferred_emits;
+    std::vector<DeferredEmit> deferred_emits;  // Omnidroid patch 0063: in place, not std::function
 };
 
 using SharedLabel = std::shared_ptr<Xbyak::Label>;
