@@ -330,7 +330,9 @@ void A64EmitX64::AddGuestRange(IR::LocationDescriptor location, u64 first, u64 l
     // Patch 0052: a block's guest bytes are far fewer than 4 GiB.
     ASSERT(last < first || last - first < std::numeric_limits<u32>::max());
     const u32 span = last < first ? 0 : static_cast<u32>(last - first + 1);
-    guest_ranges.push_back(GuestRange{Key64{location}, static_cast<u32>(first), static_cast<u32>(first >> 32), span});
+    // Patch 0065: the first byte is the location's PC, read back from it.
+    ASSERT(first == A64::LocationDescriptor{location}.PC());
+    guest_ranges.push_back(GuestRange{Key64{location}, span});
     if (last < first) {
         return;
     }

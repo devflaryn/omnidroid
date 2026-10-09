@@ -204,16 +204,17 @@ protected:
     // Indices are serials: range `i` is `guest_ranges[i - range_base]`.
     /// Patch 0052: 20 bytes at 4-byte alignment (24 before): the location as a `Key64`, the first
     /// byte in two halves, and the length (0: an empty range, `last < first` as registered).
+    /// Patch 0065: 12 bytes. A block's range starts at its own location's PC -- `Emit`, the one
+    /// caller of `AddGuestRange`, passes `descriptor.PC()` -- so the first byte is not stored but
+    /// read from the location (in a world 636k ranges, 8 bytes each).
     struct GuestRange {
         Key64 location;
-        u32 first_lo;
-        u32 first_hi;
         u32 span;
-        u64 First() const { return static_cast<u64>(first_hi) << 32 | first_lo; }
+        u64 First() const { return A64::LocationDescriptor{location.Location()}.PC(); }
         /// The last guest byte, `closed(First(), Last())` as the pin registered it.
         u64 Last() const { return First() + span - 1; }
     };
-    static_assert(sizeof(GuestRange) == 20);
+    static_assert(sizeof(GuestRange) == 12 && alignof(GuestRange) == 4);
     static constexpr unsigned guest_page_bits = 12;
     /// A block covering more pages than this is kept in `wide_guest_ranges`, checked on every
     /// invalidation, instead of in every page it covers.
@@ -223,6 +224,7 @@ protected:
     const GuestRange& RangeAt(u32 serial) const { return guest_ranges[serial - range_base]; }
     tsl::robin_map<u64, std::vector<u32>> guest_range_pages;
     std::vector<u32> wide_guest_ranges;
+    /// Patch 0065: `first` must be `location`'s PC (the range is stored without it).
     void AddGuestRange(IR::LocationDescriptor location, u64 first, u64 last);
     /// Every location registered with a range intersecting one of `ranges` -- what
     /// `BlockRangeInformation::InvalidateRanges` returned.

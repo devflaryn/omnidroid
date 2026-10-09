@@ -585,3 +585,10 @@ medians): the locked dispatcher lookup 115 -> 70 ns, threaded dispatch with Fast
 28.0 ns/op. Verified: the dynarmic-sys suite, `a64_exec`/`hostile`/`host_fault` under
 `OD_TEST_SHARED_CACHE=1`, omni-cpu's exclusive/tbi/faults/thunk/lifecycle/exclusive_store_fault.
 
+### 0065 — x64: a guest range without its first byte
+
+x64. A block's `GuestRange` (patch 0026's per-block record, 20 bytes since 0052) kept its first
+guest byte, which is always its own location's PC: `Emit`, the only caller of `AddGuestRange`,
+passes `descriptor.PC()` (now asserted). `GuestRange::First()` reads it back from the location; the
+record is 12 bytes. In a world's game host (`OMNI_MEM_TRACE` 2026-10-09: 636,522 ranges) -4.9 MiB,
+in the system host (233k-380k ranges over 40 caches) -1.8 to -2.9 MiB. The same behaviour.

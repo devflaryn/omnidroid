@@ -56,6 +56,7 @@ dynarmic/
                and ../patches/0062-x64-emit-observer.patch
                and ../patches/0063-x64-faster-emitter.patch
                and ../patches/0064-x64-a-translated-target-s-link-head-beside-its-block.patch
+               and ../patches/0065-x64-a-guest-range-without-its-first-byte.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
