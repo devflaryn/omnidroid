@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 6;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 7;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -610,6 +610,12 @@ pub struct OdCodeCacheStats {
     pub regions_live: u64,
     /// How many may be (`live_bytes` in regions).
     pub regions_live_max: u64,
+    /// Patch 0070 (ABI 7): blocks installed from a translation snapshot, unverified.
+    pub snapshot_blocks_restored: u64,
+    /// Of those, found unchanged at their first lookup, and entered.
+    pub snapshot_blocks_verified: u64,
+    /// Of those, whose guest code had changed: dropped and translated again.
+    pub snapshot_blocks_rejected: u64,
 }
 
 /// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),
@@ -747,6 +753,27 @@ extern "C" {
     /// # Safety
     /// `cache` must be live (or null, which zeroes `out`); `out` must be writable.
     pub fn od_code_cache_stats_of(cache: *mut c_void, out: *mut OdCodeCacheStats);
+
+    /// Patch 0070: hash the guest code of every block emitted from now on, for a snapshot.
+    ///
+    /// # Safety
+    /// `cache` is null or a live cache.
+    pub fn od_code_cache_enable_snapshots(cache: *mut c_void);
+
+    /// Patch 0070: write a translation snapshot of `cache` to `path` (UTF-8, NUL-terminated),
+    /// tagged `key`. The blocks written, or negative (see the header).
+    ///
+    /// # Safety
+    /// `cache` is null or a live cache; `path` and `key` are NUL-terminated. Not from inside a
+    /// callback of a jit on the cache.
+    pub fn od_code_cache_save_snapshot(cache: *mut c_void, path: *const core::ffi::c_char, key: *const core::ffi::c_char, max_bytes: u64, flags: u32) -> i64;
+
+    /// Patch 0070: install the translation snapshot at `path` into `cache`, which must have emitted
+    /// nothing. The blocks installed, or negative (see the header).
+    ///
+    /// # Safety
+    /// As [`od_code_cache_save_snapshot`].
+    pub fn od_code_cache_load_snapshot(cache: *mut c_void, path: *const core::ffi::c_char, key: *const core::ffi::c_char) -> i64;
 
     /// What the cache's per-block tables hold (a census: takes the cache's lock, shared, and walks
     /// what cannot be sized in O(1) -- for a report made every few minutes, not a hot path). All
@@ -1093,6 +1120,10 @@ extern "C" {
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_fast_dispatch_inline(on: u32) -> u32;
 }
+
+/// Patch 0070: [`od_code_cache_save_snapshot`]'s flag leaving out the blocks restored and never
+/// entered since.
+pub const OD_SNAPSHOT_ENTERED_ONLY: u32 = 1;
 
 /// Patch 0062: see [`od_set_emit_observer`].
 pub type OdEmitObserver = unsafe extern "C" fn(ctx: *mut c_void, guest_pc: u64, host: *const c_void, code_bytes: usize, total_bytes: usize);

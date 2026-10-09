@@ -28,6 +28,14 @@ public:
 
     Xbyak::Address GetConstant(const Xbyak::AddressFrame& frame, u64 lower, u64 upper = 0);
 
+    /// Omnidroid patch 0070: the constants placed so far, in place order (each at
+    /// `Begin() + 16 * index`), for a translation snapshot.
+    std::span<const std::pair<u64, u64>> Placed() const { return {pool.data(), insertion_point}; }
+    const void* Begin() const { return pool.data(); }
+    std::size_t CapacityBytes() const { return pool.size_bytes(); }
+    /// Place a constant as GetConstant does (or find it); where it is.
+    const void* Place(u64 lower, u64 upper);
+
 private:
     static constexpr size_t align_size = 16;  // bytes
 

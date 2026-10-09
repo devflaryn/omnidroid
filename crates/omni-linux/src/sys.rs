@@ -715,9 +715,12 @@ fn sys_clock_nanosleep(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
-fn sys_getrandom(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_getrandom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let mut buf = vec![0u8; (a[1] as usize).min(1 << 20)];
-    omni_platform::process::random_bytes(&mut buf).map_err(|_| EIO)?;
+    // `OMNI_JIT_SNAPSHOT`: the dynamic linker's randomness derived, not drawn (crate::jit_snapshot).
+    if !crate::jit_snapshot::linker_random(p, t.pc, &mut buf) {
+        omni_platform::process::random_bytes(&mut buf).map_err(|_| EIO)?;
+    }
     p.mem.write(a[0], &buf)?;
     Ok(buf.len() as u64)
 }
