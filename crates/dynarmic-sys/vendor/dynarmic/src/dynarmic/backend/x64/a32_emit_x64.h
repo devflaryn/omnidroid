@@ -124,6 +124,9 @@ protected:
 
     // Memory access helpers
     void EmitCheckMemoryAbort(A32EmitContext& ctx, IR::Inst* inst, Xbyak::Label* end = nullptr);
+    /// Omnidroid patch 0061: A32 keeps the inline abort check.
+    bool CompactFaultStub() const { return false; }
+    static u64 FaultStubPc(IR::Inst*) { return 0; }
     template<std::size_t bitsize, auto callback>
     void EmitMemoryRead(A32EmitContext& ctx, IR::Inst* inst);
     template<std::size_t bitsize, auto callback>

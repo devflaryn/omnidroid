@@ -81,6 +81,10 @@ pub struct Ctx {
     pub panic_msg: Option<String>,
     /// Test hook: make the next `read8` panic, to prove containment works.
     pub panic_on_read8: bool,
+    /// Test hook: a slow-path read of this guest address raises a memory abort
+    /// (`OD_HALT_MEMORY_ABORT`, as omni-cpu does for a guest SIGSEGV) and reads 0, once -- the
+    /// hook clears itself. 0 = off.
+    pub abort_on_read: u64,
     /// Test hook: make `call_svc` re-enter `od_jit_run`, which must be refused.
     pub reenter_on_svc: bool,
     /// What the refused `od_jit_run` re-entry returned.
@@ -281,6 +285,12 @@ macro_rules! read_cb {
                     if c.panic_on_read8 {
                         c.panic_on_read8 = false;
                         panic!("callback panic, on purpose");
+                    }
+                    if c.abort_on_read != 0 && c.abort_on_read == vaddr {
+                        c.abort_on_read = 0;
+                        // `od_jit_halt` only sets an atomic flag; callable from a callback.
+                        od_jit_halt(c.jit, OD_HALT_MEMORY_ABORT);
+                        return 0;
                     }
                     let a = (vaddr as usize) & (MEM_SIZE - 1);
                     let b = c.bytes();
@@ -612,6 +622,20 @@ pub fn every_vm_on_a_shared_cache() -> bool {
     std::env::var("OD_TEST_SHARED_CACHE").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `OD_TEST_COMPACT=<bits>` (1 fault stubs, 2 link tails, 3 both) turns patch 0061's compact code
+/// on once, before the first `Vm`: the suite run this way is the compact emission under every
+/// existing test. (A test that sets the switch itself, as `compact_code.rs` does, still can.)
+fn compact_code_from_environment() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Only a non-zero value: `OD_TEST_COMPACT=0` leaves a switch the test set before its first `Vm`.
+        if let Some(bits) = std::env::var("OD_TEST_COMPACT").ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|&b| b != 0) {
+            // SAFETY: stores one process-wide atomic.
+            unsafe { od_set_compact_code(bits) };
+        }
+    });
+}
+
 /// The `OdConfig` a `Vm` with `opts` builds, for pointers the caller supplies.
 #[allow(clippy::too_many_arguments)]
 pub fn config_for(
@@ -680,6 +704,7 @@ pub struct Vm {
 impl Vm {
     /// Build a guest running `code` at [`CODE_BASE`].
     pub fn new(code: Vec<u32>, opts: VmOptions) -> Self {
+        compact_code_from_environment();
         let mut mem = vec![0u64; (MEM_SIZE + MEM_GUARD) / 8];
         let arena = if opts.shared_arena != 0 { opts.shared_arena as *mut u64 } else { mem.as_mut_ptr() };
         let ctx = Box::new(UnsafeCell::new(Ctx {
@@ -698,6 +723,7 @@ impl Vm {
             ticks_used: 0,
             panic_msg: None,
             panic_on_read8: false,
+            abort_on_read: 0,
             reenter_on_svc: false,
             reenter_result: None,
             reenter_step_result: None,

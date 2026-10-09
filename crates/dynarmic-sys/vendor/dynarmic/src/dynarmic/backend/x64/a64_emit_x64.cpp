@@ -40,6 +40,58 @@ using namespace Xbyak::util;
 std::atomic<std::uint32_t> live_fp_optimizations{0};
 std::atomic<std::uint32_t> live_precise_get_set{1};
 std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPart::Count)> codegen_census{};
+
+std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n) {
+    const std::size_t count = std::min(n, codegen_census.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        out[i] = codegen_census[i].load(std::memory_order_relaxed);
+    }
+    return codegen_census.size();
+}
+
+void ResetCodegenCensus() {
+    for (auto& c : codegen_census) {
+        c.store(0, std::memory_order_relaxed);
+    }
+}
+
+namespace {
+void CodegenCount(CodegenPart part, std::uint64_t n) {
+    codegen_census[static_cast<std::size_t>(part)].fetch_add(n, std::memory_order_relaxed);
+}
+
+CodegenPart PartOf(const IR::Inst& inst) {
+    switch (inst.GetOpcode()) {
+    case IR::Opcode::A64GetW:
+    case IR::Opcode::A64GetX:
+    case IR::Opcode::A64GetS:
+    case IR::Opcode::A64GetD:
+    case IR::Opcode::A64GetQ:
+    case IR::Opcode::A64GetSP:
+    case IR::Opcode::A64SetW:
+    case IR::Opcode::A64SetX:
+    case IR::Opcode::A64SetS:
+    case IR::Opcode::A64SetD:
+    case IR::Opcode::A64SetQ:
+    case IR::Opcode::A64SetSP:
+        return CodegenPart::GetSet;
+    case IR::Opcode::A64GetNZCVRaw:
+    case IR::Opcode::A64SetNZCVRaw:
+    case IR::Opcode::A64SetNZCV:
+    case IR::Opcode::A64GetCFlag:
+    case IR::Opcode::GetCarryFromOp:
+    case IR::Opcode::GetOverflowFromOp:
+    case IR::Opcode::GetNZCVFromOp:
+    case IR::Opcode::GetNZFromOp:
+        return CodegenPart::Flags;
+    case IR::Opcode::A64SetPC:
+        return CodegenPart::SetPc;
+    default:
+        return inst.IsMemoryReadOrWrite() ? CodegenPart::Memory : CodegenPart::Other;
+    }
+}
+}  // namespace
 
 A64EmitContext::A64EmitContext(const A64::UserConfig& conf, RegAlloc& reg_alloc, IR::Block& block)
         : EmitContext(reg_alloc, block), conf(conf) {}
@@ -121,13 +173,16 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
     A64EmitContext ctx{conf, reg_alloc, block};
 
     // Start emitting.
+    const u8* const before_align = code.getCurr();
     code.align();
     const u8* const entrypoint = code.getCurr();
+    CodegenCount(CodegenPart::Align, static_cast<u64>(entrypoint - before_align));  // patch 0060
 
     ASSERT(block.GetCondition() == IR::Cond::AL);
 
     for (auto iter = block.begin(); iter != block.end(); ++iter) {
         IR::Inst* inst = &*iter;
+        const u8* const inst_start = code.getCurr();  // patch 0060
 
         // Call the relevant Emit* member function.
         switch (inst->GetOpcode()) {
@@ -155,26 +210,44 @@ A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
         if (conf.very_verbose_debugging_output) {
             EmitVerboseDebuggingOutput(reg_alloc);
         }
+        // Patch 0060.
+        CodegenCount(PartOf(*inst), static_cast<u64>(code.getCurr() - inst_start));
+        CodegenCount(CodegenPart::IrInsts, 1);
+        if (inst->IsMemoryReadOrWrite()) {
+            CodegenCount(CodegenPart::MemoryOps, 1);
+        }
     }
 
     reg_alloc.AssertNoMoreUses();
 
+    const u8* const cycles_start = code.getCurr();  // patch 0060
     if (conf.enable_cycle_counting) {
         EmitAddCycles(block.CycleCount());
     }
+    const u8* const terminal_start = code.getCurr();
     EmitX64::EmitTerminal(block.GetTerminal(), ctx.Location().SetSingleStepping(false), ctx.IsSingleStep());
     code.int3();
+    const u8* const far_start = code.getCurr();
 
     for (auto& deferred_emit : ctx.deferred_emits) {
         deferred_emit();
     }
     code.int3();
+    const u8* const slots_start = code.getCurr();
     if (shared_code) {
         // Omnidroid patch 0022: the block's link slots, right after its code.
         EmitPendingSlots(block.Location());
         // Patch 0025: the block's fastmem sites, now that its code is complete.
         CommitSharedFastmemSites();
     }
+    // Patch 0060.
+    CodegenCount(CodegenPart::Cycles, static_cast<u64>(terminal_start - cycles_start));
+    CodegenCount(CodegenPart::Terminal, static_cast<u64>(far_start - terminal_start));
+    CodegenCount(CodegenPart::Far, static_cast<u64>(slots_start - far_start));
+    CodegenCount(CodegenPart::Slots, static_cast<u64>(code.getCurr() - slots_start));
+    CodegenCount(CodegenPart::Deferred, ctx.deferred_emits.size());
+    CodegenCount(CodegenPart::Blocks, 1);
+    CodegenCount(CodegenPart::GuestInsts, (A64::LocationDescriptor{block.EndLocation()}.PC() - A64::LocationDescriptor{block.Location()}.PC()) / 4);
 
     const size_t size = static_cast<size_t>(code.getCurr() - entrypoint);
 
@@ -1093,6 +1166,28 @@ void A64EmitX64::EmitTerminalImpl(IR::Term::LinkBlock terminal, IR::LocationDesc
         // than a `jg` that is rewritten when the target appears or goes. Same outcomes: linked,
         // straight to the target; unlinked, the dispatcher; budget spent (or halt raised, without
         // cycle counting), leave Run with the PC stored.
+        if ((live_compact_code.load(std::memory_order_relaxed) & kCompactLinkTails) != 0) {
+            // Omnidroid patch 0061: a spent budget (or a halt) leaves through the slot's own tail --
+            // store the PC, enter the dispatcher, whose loop top checks the same two things and
+            // returns -- instead of a second copy of that tail with a forced return: 22 bytes less a
+            // link, the same outcome. (Measured 9-18% slower on a loop of eight linked two-
+            // instruction blocks, though the hot path's bytes are the same: layout. Its own bit.)
+            auto tail = std::make_shared<Xbyak::Label>();
+            Xbyak::Label& slot = NewLinkSlot(terminal.next, 0, tail);
+            if (conf.enable_cycle_counting) {
+                code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);
+                code.jng(*tail, code.T_NEAR);
+            } else {
+                code.cmp(dword[r15 + offsetof(A64JitState, halt_reason)], 0);
+                code.jne(*tail, code.T_NEAR);
+            }
+            code.jmp(qword[rip + slot]);
+            code.L(*tail);
+            code.mov(rax, A64::LocationDescriptor{terminal.next}.PC());
+            code.mov(qword[r15 + offsetof(A64JitState, pc)], rax);
+            code.jmp(code.GetReturnFromRunCodeAddress());
+            return;
+        }
         Xbyak::Label exit;
         if (conf.enable_cycle_counting) {
             code.cmp(qword[rsp + ABI_SHADOW_SPACE + offsetof(StackLayout, cycles_remaining)], 0);

@@ -34,11 +34,16 @@ extern std::atomic<std::uint32_t> live_fp_optimizations;
 extern std::atomic<std::uint32_t> live_precise_get_set;
 /* Patch 0042's switch, likewise. */
 extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
+/* Patch 0060's census (a64_emit_x64.cpp). */
+std::size_t ReadCodegenCensus(std::uint64_t* out, std::size_t n);
+void ResetCodegenCensus();
 /* Patch 0039's switch, likewise. */
 extern std::atomic<std::uint32_t> live_scalar_fp_in_xmm;
 /* Patch 0040's switch, likewise. */
 extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
 extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
+/* Patch 0061's switch. */
+extern std::atomic<std::uint32_t> live_compact_code;
 /* Patch 0041 (declared in emit_x64.h). */
 extern std::atomic<std::uint64_t> tbi_sites_noted;
 std::vector<std::uint64_t> TbiSitesFrom(std::size_t first);
@@ -1015,6 +1020,32 @@ uint32_t od_set_fast_dispatch_inline(uint32_t on) {
 #else
     (void)on;
     return 0;
+#endif
+}
+
+uint32_t od_set_compact_code(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_compact_code.store(on & 3u, std::memory_order_relaxed);
+    return on & 3u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_codegen_census(uint64_t* out, uint32_t n) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    return static_cast<uint32_t>(Dynarmic::Backend::X64::ReadCodegenCensus(out, n));
+#else
+    (void)out;
+    (void)n;
+    return 0;
+#endif
+}
+
+void od_codegen_census_reset(void) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::ResetCodegenCensus();
 #endif
 }
 

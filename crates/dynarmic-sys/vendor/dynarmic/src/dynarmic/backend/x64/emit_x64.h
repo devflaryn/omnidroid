@@ -60,6 +60,14 @@ extern std::atomic<std::uint32_t> live_fastmem_mask_by_and;
 /// read when a block is emitted.
 extern std::atomic<std::uint32_t> live_fastmem_tbi_unmasked;
 
+/// Omnidroid patch 0061: bits that emit smaller code -- `kCompactFaultStubs`: a fastmem site's slow
+/// path calls one shared memory-abort check (the PC as data) instead of carrying ~38 bytes of its
+/// own; `kCompactLinkTails`: a shared cache's link leaves through its slot's own tail instead of a
+/// second copy of it. The same behaviour; process-wide, read when a block is emitted.
+extern std::atomic<std::uint32_t> live_compact_code;
+inline constexpr std::uint32_t kCompactFaultStubs = 1;
+inline constexpr std::uint32_t kCompactLinkTails = 2;
+
 /// Omnidroid patch 0041: guest instructions (by A64 location descriptor, process-wide) that
 /// accessed memory through a tagged address while the mask was off (`live_fastmem_tbi_unmasked`).
 /// Such a site is emitted masked from then on; the rest stay unmasked. `NoteTbiTaggedSite` is
@@ -163,6 +171,8 @@ protected:
     /// Omnidroid patch 0041: notes `rax` (a guest location) with `NoteTbiTaggedSite`, every caller-saved
     /// register kept. Emitted with the fastmem fallbacks (A64 only); null elsewhere.
     const void* tbi_note_thunk = nullptr;
+    /// Omnidroid patch 0061: the shared memory-abort check (A64 only; null elsewhere).
+    const void* memory_abort_check_thunk = nullptr;
 
     // Microinstruction emitters
 #define OPCODE(name, type, ...) void Emit##name(EmitContext& ctx, IR::Inst* inst);

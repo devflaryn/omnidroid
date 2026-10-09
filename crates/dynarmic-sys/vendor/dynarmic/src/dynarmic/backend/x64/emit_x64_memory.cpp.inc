@@ -125,7 +125,7 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
 
     if (fastmem_marker) {
         // Use fastmem
-        bool require_abort_handling;
+        bool require_abort_handling = false;  // Omnidroid patch 0061: read below, so set (EmitFastmemVAddr only ever sets it true)
         bool tbi_unmasked = false;
         const u64 site = inst->GetArg(0).GetU64();
         const auto src_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
@@ -133,9 +133,19 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
         const auto location = EmitReadMemoryMov<bitsize>(code, value_idx, src_ptr, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+            // Omnidroid patch 0061: the abort check as one call to a shared thunk, the PC as data.
+            // And the call into the fallback only where something jumps to `abort` (a bounds check):
+            // a host fault reaches the fallback by a faked call that returns to `resume` directly.
+            const bool compact = CompactFaultStub();
             code.L(*abort);
-            code.call(wrapped_fn);
+            if (!compact || require_abort_handling) {
+                code.call(wrapped_fn);
+            }
             const auto resume = code.getCurr();
+            if (compact) {
+                code.call(memory_abort_check_thunk);
+                code.dq(FaultStubPc(inst));
+            }
             if (tbi_unmasked) {
                 EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
             }
@@ -143,7 +153,9 @@ void AxxEmitX64::EmitMemoryRead(AxxEmitContext& ctx, IR::Inst* inst) {
             RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            if (!compact) {
+                EmitCheckMemoryAbort(ctx, inst, end.get());
+            }
             code.jmp(*end, code.T_NEAR);
         });
     } else {
@@ -212,7 +224,7 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
 
     if (fastmem_marker) {
         // Use fastmem
-        bool require_abort_handling;
+        bool require_abort_handling = false;  // Omnidroid patch 0061: read below, so set (EmitFastmemVAddr only ever sets it true)
         bool tbi_unmasked = false;
         const u64 site = inst->GetArg(0).GetU64();
         const auto dest_ptr = EmitFastmemVAddr(code, ctx, *abort, vaddr, require_abort_handling, std::nullopt, site, &tbi_unmasked);
@@ -220,9 +232,19 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
         const auto location = EmitWriteMemoryMov<bitsize>(code, dest_ptr, value_idx, ordered);
 
         ctx.deferred_emits.emplace_back([=, this, &ctx] {
+            // Omnidroid patch 0061: the abort check as one call to a shared thunk, the PC as data.
+            // And the call into the fallback only where something jumps to `abort` (a bounds check):
+            // a host fault reaches the fallback by a faked call that returns to `resume` directly.
+            const bool compact = CompactFaultStub();
             code.L(*abort);
-            code.call(wrapped_fn);
+            if (!compact || require_abort_handling) {
+                code.call(wrapped_fn);
+            }
             const auto resume = code.getCurr();
+            if (compact) {
+                code.call(memory_abort_check_thunk);
+                code.dq(FaultStubPc(inst));
+            }
             if (tbi_unmasked) {
                 EmitTbiNote(code, tbi_note_thunk, vaddr, site);  // Omnidroid patch 0041
             }
@@ -230,7 +252,9 @@ void AxxEmitX64::EmitMemoryWrite(AxxEmitContext& ctx, IR::Inst* inst) {
             RecordFastmemSite(mcl::bit_cast<u64>(location), mcl::bit_cast<u64>(resume),
                               mcl::bit_cast<u64>(wrapped_fn), *fastmem_marker, conf.recompile_on_fastmem_failure);
 
-            EmitCheckMemoryAbort(ctx, inst, end.get());
+            if (!compact) {
+                EmitCheckMemoryAbort(ctx, inst, end.get());
+            }
             code.jmp(*end, code.T_NEAR);
         });
     } else {

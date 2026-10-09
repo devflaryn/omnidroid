@@ -1051,6 +1051,29 @@ extern "C" {
     /// None beyond an ordinary FFI call: it loads one process-wide atomic.
     pub fn od_tbi_sites_noted() -> u64;
 
+    /// Patch 0060 (x64 only): a census of the emitted code, process-wide -- up to `n` counters into
+    /// `out`, in [`CODEGEN_PARTS`] order. Returns how many counters there are (0 on arm64).
+    ///
+    /// # Safety
+    /// `out` is valid for `n` writes.
+    pub fn od_codegen_census(out: *mut u64, n: u32) -> u32;
+
+    /// Patch 0061 (x64 only): bits that emit smaller code in blocks emitted from now on:
+    /// [`OD_COMPACT_FAULT_STUBS`], each fastmem site's slow path calls one shared memory-abort check
+    /// (its PC as data) instead of carrying the check inline; [`OD_COMPACT_LINK_TAILS`], a shared
+    /// cache's link leaves through its slot's own tail. The same behaviour. Returns the bits in
+    /// force; 0 and a no-op on arm64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_compact_code(on: u32) -> u32;
+
+    /// Patch 0060: zero the census.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call.
+    pub fn od_codegen_census_reset();
+
     /// Patch 0042 (x64 only): non-zero emits the return-stack buffer's and the fast-dispatch
     /// table's hit paths inside each `RET`/`BR`/`BLR` block -- from the target PC still in a
     /// register, with an indirect jump of the site's own -- instead of a jump to one shared handler
@@ -1061,3 +1084,17 @@ extern "C" {
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_fast_dispatch_inline(on: u32) -> u32;
 }
+
+/// Patch 0061: [`od_set_compact_code`]'s bit for the shared memory-abort check behind each fastmem
+/// site (the bulk of the saving: out-of-line code 44 -> 18 bytes a memory access on `libc.so`).
+pub const OD_COMPACT_FAULT_STUBS: u32 = 1;
+/// Patch 0061: [`od_set_compact_code`]'s bit for shared-cache links that leave through their slot's
+/// tail (~20 bytes a block; measured 9-18% slower on tight loops of tiny linked blocks).
+pub const OD_COMPACT_LINK_TAILS: u32 = 2;
+
+/// Patch 0060: the names of [`od_codegen_census`]'s counters, in order. The first ten are bytes,
+/// the last five counts.
+pub const CODEGEN_PARTS: [&str; 15] = [
+    "align", "memory", "getset", "flags", "setpc", "other", "cycles", "terminal", "far", "slots",
+    "blocks", "ir_insts", "guest_insts", "memory_ops", "deferred",
+];

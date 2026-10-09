@@ -20,6 +20,12 @@
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
 //!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
+//! - `jit_compact=0|1|2|3`: smaller translated code (patch 0061, `omni_cpu::dynarmic::
+//!   set_compact_code`), bits: `1` one shared memory-abort check behind every fastmem site (-21%
+//!   bytes a block on `libc.so`, speed unchanged in the bench), `2` links that leave through their
+//!   slot's tail (-5%, but +17% time on tight loops of tiny blocks), `3` both (-26%). The same
+//!   behaviour. Every process's translations are dropped. Off by default; `OMNI_JIT_COMPACT=<bits>`
+//!   from the start.
 //! - `jit_hle=0|1`: native host implementations of hot `libc.so` functions -- `memcpy`,
 //!   `memmove`, `memset` -- run for the guest instead of its own code (`crate::hle`,
 //!   `omni_cpu::dynarmic::set_hle`): args X0-X2, result X0, a fault inside the copy becomes the
@@ -165,6 +171,18 @@ pub fn apply(line: &str) -> Option<String> {
                 p.trim_code();
             }
             Some(format!("jit_fpxmm={}: {} processes' translations dropped", u8::from(kept), live.len()))
+        }
+        "jit_compact" => {
+            let bits = match value.trim() {
+                v @ ("0" | "1" | "2" | "3") => v.parse::<u32>().expect("a digit"),
+                _ => return None,
+            };
+            let kept = omni_cpu::dynarmic::set_compact_code(bits);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_compact={kept}: {} processes' translations dropped", live.len()))
         }
         "jit_hle" => {
             let on = match value.trim() {
@@ -686,6 +704,18 @@ mod tests {
         assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
         assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
         assert_eq!(apply("jit_getset=on"), None);
+    }
+
+    #[test]
+    fn the_compact_lever_is_understood() {
+        let x64 = cfg!(target_arch = "x86_64");
+        for bits in ["1", "2", "3"] {
+            let done = apply(&format!("jit_compact={bits}")).expect("understood");
+            assert!(done.starts_with(&format!("jit_compact={}", if x64 { bits } else { "0" })), "{done}");
+        }
+        assert!(apply("jit_compact=0").expect("understood").starts_with("jit_compact=0"));
+        assert_eq!(apply("jit_compact=4"), None);
+        assert_eq!(apply("jit_compact=on"), None);
     }
 
     #[test]

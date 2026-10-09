@@ -33,6 +33,7 @@ using namespace Xbyak::util;
 
 std::atomic<std::uint32_t> live_fastmem_mask_by_and{0};
 std::atomic<std::uint32_t> live_fastmem_tbi_unmasked{0};
+std::atomic<std::uint32_t> live_compact_code{0};
 
 // Omnidroid patch 0041.
 std::atomic<std::uint64_t> tbi_sites_noted{0};
@@ -164,6 +165,27 @@ void A64EmitX64::GenFastmemFallbacks() {
     ABI_PopCallerSaveRegistersAndAdjustStack(code);
     code.ret();
     PerfMapRegister(tbi_note_thunk, code.getCurr(), "a64_tbi_note");
+
+    // Omnidroid patch 0061: the memory-abort check of a fastmem site's slow path, shared. Called
+    // right after the fallback, with the faulting instruction's guest PC as 8 bytes of data after
+    // the call: no abort -- step the return address over the data and return (flags only
+    // touched); an abort -- take the PC from the data, store it, leave Run, as
+    // `EmitCheckMemoryAbort` does inline (~38 bytes a site, against 5 + 8 here).
+    {
+        code.align();
+        memory_abort_check_thunk = code.getCurr<const void*>();
+        Xbyak::Label exit;
+        code.test(code.byte[code.r15 + offsetof(A64JitState, halt_reason)], static_cast<u8>(HaltReason::MemoryAbort));
+        code.jnz(exit);
+        code.add(code.qword[code.rsp], 8);
+        code.ret();
+        code.L(exit);
+        code.pop(code.rax);
+        code.mov(code.rax, code.qword[code.rax]);
+        code.mov(code.qword[code.r15 + offsetof(A64JitState, pc)], code.rax);
+        code.ForceReturnFromRunCode();
+        PerfMapRegister(memory_abort_check_thunk, code.getCurr(), "a64_memory_abort_check");
+    }
 
     const std::initializer_list<int> idxes{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
     const std::array<std::pair<size_t, ArgCallback>, 4> read_callbacks{{
