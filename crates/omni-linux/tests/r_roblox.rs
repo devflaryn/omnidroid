@@ -395,7 +395,13 @@ fn the_apk_is_installed_started_and_draws() {
                 join_script(id, 120)
             )
         });
-        format!("{booted}{lean_after}input keyevent KEYCODE_WAKEUP; {resolve}rm -f /data/local/tmp/app-died; {start}{open}{wait}{extra}")
+        // The package installer disabled after the start, off its path (it is idle either way).
+        let launcher = common::r_scripts::launcher(resolve, common::r_scripts::launcher_saved());
+        if common::r_scripts::launcher_saved() {
+            format!("{booted}input keyevent KEYCODE_WAKEUP; {launcher}rm -f /data/local/tmp/app-died; {start}{lean_after}{open}{wait}{extra}")
+        } else {
+            format!("{booted}{lean_after}input keyevent KEYCODE_WAKEUP; {resolve}rm -f /data/local/tmp/app-died; {start}{open}{wait}{extra}")
+        }
     };
     let then = if warm {
         let g = golden.as_ref().expect("a saved device");
@@ -438,7 +444,8 @@ fn the_apk_is_installed_started_and_draws() {
         };
         let setup = setup(if saving { "" } else { &lean_after });
         let planted = if plant_first { common::r_scripts::plant("/data/local/tmp/cookies.db") } else { String::new() };
-        format!("{booted}{setup}{resolve}{planted}am start -W -n \"$act\"; echo \"[r] am start: $?\"; {sign_in}{rest}")
+        let launcher = common::r_scripts::launcher(resolve, common::r_scripts::launcher_saved());
+        format!("{booted}{setup}{launcher}{planted}am start -W -n \"$act\"; echo \"[r] am start: $?\"; {sign_in}{rest}")
     };
     let kept = instance.clone();
     let mut boot = common::boot::Boot::start(&sysroot, instance, &boot_args, &then);

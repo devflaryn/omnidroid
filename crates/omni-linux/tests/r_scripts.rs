@@ -81,8 +81,26 @@ fn the_scripts_parse() {
         format!("{}{}", r_scripts::lean(&["com.a"], true), r_scripts::lean_wait(true)),
         r_scripts::lean(&["com.a"], false),
         r_scripts::stay_on(true).to_string(),
+        r_scripts::launcher("pkg=a; act=a/.B; ", true),
     ] {
         let ok = std::process::Command::new("sh").arg("-n").arg("-c").arg(&script).status().expect("sh").success();
         assert!(ok, "sh -n refuses: {script}");
     }
+}
+
+#[test]
+fn a_saved_launcher_is_read_and_a_resolved_one_kept() {
+    let resolve = "pkg=$(pm list packages -3 | head -1); act=$(cmd package resolve-activity x); ";
+    assert_eq!(r_scripts::launcher(resolve, false), resolve, "off: resolved every boot, as before");
+    let l = r_scripts::launcher(resolve, true);
+    for part in [
+        "read pkg act 2>/dev/null < /data/local/launcher",
+        "echo \"[r] launcher $act (saved)\"",
+        resolve,
+        "echo \"$pkg $act\" > /data/local/launcher",
+    ] {
+        assert!(l.contains(part), "{part:?} in {l}");
+    }
+    // Not under /data/local/tmp, which a saved device leaves out.
+    assert!(!r_scripts::LAUNCHER_FILE.starts_with("/data/local/tmp"));
 }

@@ -91,3 +91,29 @@ pub fn plant(store: &str) -> String {
          then echo \"[r] cookie planted: ok\"; else echo \"[r] cookie planted: failed\"; fi; rm -f {store}; "
     )
 }
+
+/// Where a device keeps its app's package and launcher activity once resolved (`$pkg $act`): in
+/// `/data/local`, which a saved device keeps (`/data/local/tmp` is the run's own).
+pub const LAUNCHER_FILE: &str = "/data/local/launcher";
+
+/// `OMNI_R_LAUNCHER_SAVED` (default 1; `0` resolves every boot, as before): a saved device reads
+/// its app's package and launcher activity from [`LAUNCHER_FILE`] with the shell's own `read` -- no
+/// process -- instead of resolving them again (`pm list packages`, `head`, `sed`, `cmd package
+/// resolve-activity`, `tail`: five processes, ~1.5-2 s before the app starts).
+#[must_use]
+pub fn launcher_saved() -> bool {
+    std::env::var("OMNI_R_LAUNCHER_SAVED").as_deref() != Ok("0")
+}
+
+/// The script that sets `$pkg` and `$act`: read from [`LAUNCHER_FILE`] when it is there (and
+/// `launcher_saved`), else `resolve` -- whose answer is then written there for the next boot.
+#[must_use]
+pub fn launcher(resolve: &str, saved: bool) -> String {
+    if !saved {
+        return resolve.to_string();
+    }
+    format!(
+        "if read pkg act 2>/dev/null < {f} && [ -n \"$act\" ]; then echo \"[r] package $pkg\"; echo \"[r] launcher $act (saved)\";          else {resolve}[ -n \"$act\" ] && echo \"$pkg $act\" > {f}; fi; ",
+        f = LAUNCHER_FILE
+    )
+}
