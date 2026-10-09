@@ -134,6 +134,20 @@ pub mod age {
     /// in the 5 s windows around it). `OMNI_CODE_AGE_SF=0` or the lever leaves it alone.
     pub static SURFACEFLINGER: AtomicBool = AtomicBool::new(true);
     static KICK: AtomicBool = AtomicBool::new(false);
+    /// An app's host process (the game's) too, every this many minutes; 0 (the default): never.
+    /// Its oldest regions hold its start-up and sign-in code, run once; what it still runs is
+    /// translated again into a new region (a hitch while that happens). `OMNI_CODE_AGE_GAME`, the
+    /// lever `code_age_game`.
+    pub static GAME_MINUTES: AtomicU64 = AtomicU64::new(0);
+    /// MiB of translations the game keeps (`OMNI_CODE_AGE_GAME_KEEP_MB`, `code_age_game_keep`).
+    pub static GAME_KEEP_MB: AtomicU64 = AtomicU64::new(96);
+    static KICK_GAME: AtomicBool = AtomicBool::new(false);
+
+    /// The game's period, from the lever; a period set starts with a pass.
+    pub fn set_game_minutes(m: u64) {
+        GAME_MINUTES.store(m, Ordering::Relaxed);
+        KICK_GAME.store(m != 0, Ordering::Relaxed);
+    }
 
     /// The period, from the lever; a period set starts with a pass.
     pub fn set_minutes(m: u64) {
@@ -157,6 +171,12 @@ pub mod age {
         // compaction). `OMNI_CODE_AGE=0` or the lever `code_age=0` turns it off.
         let m = std::env::var("OMNI_CODE_AGE").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(10);
         set_minutes(m);
+        if let Some(mb) = std::env::var("OMNI_CODE_AGE_GAME_KEEP_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+            GAME_KEEP_MB.store(mb, Ordering::Relaxed);
+        }
+        if let Some(g) = std::env::var("OMNI_CODE_AGE_GAME").ok().and_then(|v| v.parse::<u64>().ok()) {
+            GAME_MINUTES.store(g, Ordering::Relaxed);
+        }
         if std::env::var_os("OMNI_CODE_AGE").is_some() && m != 0 {
             eprintln!("[lever] OMNI_CODE_AGE: code_age={m} (keep {} MiB)", KEEP_MB.load(Ordering::Relaxed));
         }
@@ -164,22 +184,26 @@ pub mod age {
             let mut last = Instant::now();
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                let minutes = MINUTES.load(Ordering::Relaxed);
-                if minutes == 0 || crate::remote::is_remote() {
+                let game = crate::remote::is_remote();
+                let (minutes, kick, keep) = if game {
+                    (GAME_MINUTES.load(Ordering::Relaxed), &KICK_GAME, GAME_KEEP_MB.load(Ordering::Relaxed))
+                } else {
+                    (MINUTES.load(Ordering::Relaxed), &KICK, KEEP_MB.load(Ordering::Relaxed))
+                };
+                if minutes == 0 {
                     continue;
                 }
-                if !KICK.swap(false, Ordering::Relaxed) && last.elapsed() < Duration::from_secs(minutes * 60) {
+                if !kick.swap(false, Ordering::Relaxed) && last.elapsed() < Duration::from_secs(minutes * 60) {
                     continue;
                 }
                 last = Instant::now();
-                pass();
+                pass(keep << 20);
             }
         });
     }
 
-    /// One pass over the live processes.
-    pub fn pass() {
-        let keep = KEEP_MB.load(Ordering::Relaxed) << 20;
+    /// One pass over the live processes, each keeping `keep` bytes of translations.
+    pub fn pass(keep: u64) {
         for p in crate::process::all_live() {
             let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
             if name == "surfaceflinger" && !SURFACEFLINGER.load(Ordering::Relaxed) {

@@ -129,6 +129,8 @@
 //!
 //! - `code_age=<minutes>`, `code_age_keep=<MiB>`, `code_age_sf=0|1`: the system host's age pass
 //!   (`crate::code_trim::age`): a process's oldest translations retired past the kept size. Off.
+//! - `code_age_game=<minutes>`, `code_age_game_keep=<MiB>`: the same in an app's host process (the
+//!   game's). Off (0) by default; keeps 96 MiB.
 //! - `read_no_commit=0|1`: the kernel's reads of guest memory read a lazy mapping's uncommitted
 //!   pages as zeros instead of committing them (`crate::guest::READ_NO_COMMIT`; on by default).
 //! - `binder_spawn=kernel|eager`: when a guest process is asked for another binder looper -- the
@@ -385,6 +387,16 @@ pub fn apply(line: &str) -> Option<String> {
             let mb: u64 = value.trim().parse().ok()?;
             crate::code_trim::age::KEEP_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
             Some(format!("code_age_keep={mb} MiB"))
+        }
+        "code_age_game" => {
+            let minutes: u64 = value.trim().parse().ok()?;
+            crate::code_trim::age::set_game_minutes(minutes);
+            Some(format!("code_age_game={minutes}"))
+        }
+        "code_age_game_keep" => {
+            let mb: u64 = value.trim().parse().ok()?;
+            crate::code_trim::age::GAME_KEEP_MB.store(mb, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("code_age_game_keep={mb} MiB"))
         }
         "code_age_sf" => {
             let on = match value.trim() {
@@ -812,6 +824,11 @@ mod tests {
         apply("code_age=0").expect("understood");
         assert_eq!(crate::code_trim::age::MINUTES.load(Ordering::Relaxed), 0);
         assert_eq!(apply("code_age_sf=2"), None);
+        apply("code_age_game_keep=64").expect("understood");
+        assert_eq!(crate::code_trim::age::GAME_KEEP_MB.load(Ordering::Relaxed), 64);
+        apply("code_age_game_keep=96").expect("understood");
+        apply("code_age_game=0").expect("understood");
+        assert_eq!(crate::code_trim::age::GAME_MINUTES.load(Ordering::Relaxed), 0);
         apply("binder_spawn=kernel").expect("understood");
         assert!(crate::binder::spawn::KERNEL_RULE.load(Ordering::Relaxed));
         apply("binder_spawn=eager").expect("understood");
