@@ -23,7 +23,12 @@ param(
   [string]$Cookie = "C:\Users\berat\Desktop\cookies\HeZmI_ImYu1080.txt",
   [string]$Place = "8737899170",
   [string]$Sysroot = "C:\Users\berat\Desktop\Omni Apps\omnidroid\sysroot\aosp-35",
-  [string]$ExtraEnv = ""
+  [string]$ExtraEnv = "",
+  # Free commit a boot waits for (GB). 13 is safe on a quiet host; one lean instance commits ~4-5 GB.
+  [double]$MinCommitGB = $(if ($env:OMNI_AB_MIN_COMMIT_GB) { [double]$env:OMNI_AB_MIN_COMMIT_GB } else { 13 }),
+  # CPU affinity mask (hex) for the run and every host process it spawns (they inherit it), to
+  # stand in for a weaker PC: e.g. F0000 = four E-cores of the i7-13700F. Empty = all CPUs.
+  [string]$Affinity = $(if ($env:OMNI_AB_AFFINITY) { $env:OMNI_AB_AFFINITY } else { "" })
 )
 $ErrorActionPreference = "Continue"
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
@@ -74,8 +79,24 @@ Start-Sleep 3
 # A boot needs ~13 GB of free commit; below that it would starve this host's other processes (the
 # owner's games) as well as itself. Wait for it (up to 30 min); never boot without it.
 $okCommit = $false
-for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge 13GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
-if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under 13 GB for 30 min; not booting"; exit 3 }
+for ($i = 0; $i -lt 900; $i++) { if ((Get-CimInstance Win32_OperatingSystem).FreeVirtualMemory -ge $MinCommitGB * 1GB / 1KB) { $okCommit = $true; break }; Start-Sleep 2 }
+if (-not $okCommit) { Write-Output "LOWCOMMIT: free commit stayed under $MinCommitGB GB for 30 min; not booting"; exit 3 }
+
+# The network: Roblox is ISP-blocked here, and a run without the bypass (WARP) gets its TLS
+# connections reset -- the app never initialises and (Delta's build) dies ~20 s after start, which
+# looks like a crash, not a network fault (2026-10-09 22:2x). Wait for roblox.com to answer.
+$netOk = $false; $warp = ""
+for ($i = 0; $i -lt 180; $i++) {
+  try {
+    $r = Invoke-WebRequest -UseBasicParsing -Uri "https://www.roblox.com/" -TimeoutSec 10 -Method Head
+    if ($r.StatusCode -lt 500) {
+      try { $warp = ((Invoke-WebRequest -UseBasicParsing -Uri "https://www.cloudflare.com/cdn-cgi/trace" -TimeoutSec 10).Content -split "`n" | Where-Object { $_ -like "warp=*" }) -replace "warp=", "" } catch {}
+      $netOk = $true; break
+    }
+  } catch {}
+  Start-Sleep 10
+}
+if (-not $netOk) { Write-Output "NONET: roblox.com did not answer for 30 min; not booting"; exit 5 }
 
 $crate = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $Exe)))  # <tree>/target/release/deps -> <tree>
 $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "--exact", "the_apk_is_installed_started_and_draws" `
@@ -83,14 +104,15 @@ $proc = Start-Process -FilePath $Exe -ArgumentList "--ignored", "--nocapture", "
 # A launch that failed (e.g. an exe outside <tree>/target/release/deps) must not wait out the join
 # timeout and then kill whatever guests are running by then.
 if (-not $proc) { Write-Output "NOSTART: $Exe did not start"; exit 4 }
+if ($Affinity) { try { $proc.ProcessorAffinity = [IntPtr][Convert]::ToInt64($Affinity, 16) } catch { Write-Output "AFFINITY: could not set $Affinity" } }
 $log = Join-Path $env:TEMP ("omni-linux-r-{0}.log" -f $proc.Id)
 
 function Guests { @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" }) }
 function Result($status, $extra) {
-  $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o) }
+  $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o); warp = $warp }
   if ($extra) { foreach ($k in $extra.Keys) { $row[$k] = $extra[$k] } }
   $obj = [pscustomobject]$row
-  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads"
+  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads,loaded_s,cores,affinity,warp"
   if (-not (Test-Path $Csv)) { Set-Content -Path $Csv -Value $cols -Encoding utf8 }
   $line = ($cols.Split(",") | ForEach-Object { $v = $obj.$_; if ($null -eq $v) { "" } else { [string]$v } }) -join ","
   Add-Content -Path $Csv -Value $line -Encoding utf8
@@ -106,7 +128,12 @@ while (((Get-Date) - $t0).TotalMinutes -lt $JoinTimeoutMin) {
 }
 if (-not $joined) { Stop-Guests; Result "nojoin" @{}; exit 1 }
 $join_s = [int]($joined - $t0).TotalSeconds
-Start-Sleep $SettleSec
+# The settle, watching for the world itself (onGameLoaded) to time the load.
+$loaded_s = $null; $sEnd = (Get-Date).AddSeconds($SettleSec)
+while ((Get-Date) -lt $sEnd) {
+  Start-Sleep 2
+  if (-not $loaded_s -and (Select-String -Path $log -Pattern "onGameLoaded" -Quiet)) { $loaded_s = [int]((Get-Date) - $t0).TotalSeconds }
+}
 
 # 2. The window: thread CPU at both ends, memory every 15 s, the [display] lines in between.
 function Snap {
@@ -172,4 +199,7 @@ Result ($(if ($kicked) { "kicked" } else { "ok" })) ([ordered]@{
   sys_wspriv_gb = "{0:N3}" -f ((Med $sysWsPriv) / 1GB)
   threads = (Med $threadsAll)
   sys_threads = (Med $sysThreads)
+  loaded_s = $loaded_s
+  cores = "{0:N2}" -f (($s1.all - $s0.all) / 1000 / $wall)
+  affinity = $Affinity
 })

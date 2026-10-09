@@ -42,6 +42,14 @@ pub fn fast_setup() -> bool {
     std::env::var("OMNI_R_FAST_SETUP").as_deref() == Ok("1")
 }
 
+/// Whether the screen is kept on through the setting (`settings`, native) rather than `svc` (a
+/// Java tool whose VM aborts on every new device: a whole doomed ART start in the setup, ~3,600
+/// log lines, and the screen not kept on after all). Default on; `OMNI_R_SVC_STAYON=1` is the old way.
+#[must_use]
+pub fn stay_on_native() -> bool {
+    std::env::var("OMNI_R_SVC_STAYON").as_deref() != Ok("1")
+}
+
 /// Keeping the screen on: `svc power stayon true` (a Java tool), or the setting it writes
 /// (`Settings.Global.STAY_ON_WHILE_PLUGGED_IN`: AC, USB and wireless, 7) through `settings`, a
 /// native command.

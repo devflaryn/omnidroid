@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     omni_linux::code_trim::start();
     omni_linux::lever::start();
     omni_linux::proccpu::start();
+    omni_linux::jit_time::start();
     omni_linux::zero_reclaim::start();
     omni_linux::alloc_trace::start();
     let mut args = std::env::args().skip(1);

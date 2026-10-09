@@ -170,7 +170,7 @@ fn settings_script() -> String {
          settings put global window_animation_scale 0; settings put global transition_animation_scale 0; \
          settings put global animator_duration_scale 0; settings put secure immersive_mode_confirmations confirmed; \
          {}{}",
-        common::r_scripts::stay_on(common::r_scripts::fast_setup()),
+        common::r_scripts::stay_on(common::r_scripts::stay_on_native()),
         resizable_script(),
         lean_script()
     )
