@@ -185,6 +185,13 @@ impl Properties {
             let verbose = if std::env::var("OMNI_BOOT_IMAGE_VERBOSE").as_deref() == Ok("1") { " -verbose:image" } else { "" };
             let opts = format!("{} {}{verbose}", self.get("dalvik.vm.extra-opts").unwrap_or_default(), crate::boot_image::NO_RELOCATE);
             self.set("dalvik.vm.extra-opts", opts.trim());
+        } else if crate::jit_snapshot::fixed_layout() {
+            // Translation snapshots with `OMNI_JIT_SNAPSHOT_LIB_ZONE=1`: the boot image -- and with it
+            // boot.oat, the framework's compiled code that every Java process runs -- at the address
+            // it was compiled for, not moved by a random delta each boot (measured: boot.oat at
+            // 0x71494000 in one run, 0x71e28000 in the next), so its restored blocks verify.
+            let opts = format!("{} {}", self.get("dalvik.vm.extra-opts").unwrap_or_default(), crate::boot_image::NO_RELOCATE);
+            self.set("dalvik.vm.extra-opts", opts.trim());
         }
         // The GPU drivers: on Vulkan (D3a) the image's own ANGLE for GLES on omnidroid's Vulkan
         // driver (`/vendor/lib64/hw/vulkan.omni.so`); on GL omnidroid's GLES driver

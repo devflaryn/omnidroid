@@ -473,6 +473,38 @@ void A64EmitX64::TrimGuestRanges(u32 base) {
     }
 }
 
+size_t A64EmitX64::PruneGuestRangeIndex(u32 first, u32 end) {
+    first = std::max(first, range_base);
+    end = std::min(end, NextRangeSerial());
+    if (first >= end) {
+        return 0;
+    }
+    std::vector<bool> gone(end - first);
+    for (u32 serial = first; serial != end; serial++) {
+        gone[serial - first] = block_descriptors.find(RangeAt(serial).location) == block_descriptors.end();
+    }
+    const auto is_gone = [&](u32 serial) { return serial >= first && serial < end && gone[serial - first]; };
+    size_t dropped = 0;
+    for (auto it = guest_range_pages.begin(); it != guest_range_pages.end();) {
+        std::vector<u32>& indices = it.value();
+        const size_t before = indices.size();
+        std::erase_if(indices, is_gone);  // order kept: TrimGuestRanges needs it ascending
+        dropped += before - indices.size();
+        if (indices.empty()) {
+            it = guest_range_pages.erase(it);
+            continue;
+        }
+        if (indices.capacity() > 2 * indices.size() + 16) {
+            indices.shrink_to_fit();
+        }
+        ++it;
+    }
+    const size_t wide = wide_guest_ranges.size();
+    std::erase_if(wide_guest_ranges, is_gone);
+    dropped += wide - wide_guest_ranges.size();
+    return dropped;
+}
+
 void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
     // Patch 0025: a shared cache's sites are records of the region, given back with it.
     PurgeFastmemSites(begin, end);

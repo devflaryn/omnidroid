@@ -22,7 +22,7 @@ extern "C" {
 /* Bumped whenever anything below changes shape. `od_dynarmic_abi_version()` is
  * compiled into the C++ side; the Rust side compares against its own copy so a
  * stale object file is a clean error rather than silent memory corruption. */
-#define OD_DYNARMIC_ABI_VERSION 9u
+#define OD_DYNARMIC_ABI_VERSION 10u
 
 /* ---------------------------------------------------------------------------
  * Callbacks: the host side of the boundary.
@@ -427,6 +427,8 @@ typedef struct od_code_cache_stats {
     uint64_t snapshot_save_lock_ns;     /* the latest save's time holding the cache's lock */
     /* ABI 9 (patch 0075). */
     uint64_t snapshot_pages_read;       /* pages of a lazily loaded snapshot read in, as entered */
+    /* ABI 10 (patch 0076). */
+    uint64_t snapshot_blocks_forgotten; /* restored blocks never entered, forgotten */
 } od_code_cache_stats;
 void od_code_cache_stats_of(void* cache, od_code_cache_stats* out);
 
@@ -483,6 +485,12 @@ int64_t od_code_cache_save_snapshot(void* cache, const char* path, const char* k
  * from the file, kept open, when a block on it is first entered. */
 #define OD_SNAPSHOT_LOAD_LAZY 1u
 int64_t od_code_cache_load_snapshot(void* cache, const char* path, const char* key, uint32_t flags);
+/* Patch 0076: forget every block restored from a snapshot and not entered yet, and shrink the
+ * tables. How many were forgotten (0 on an arm64 host). Same restriction as the clear. */
+int64_t od_code_cache_forget_unverified(void* cache);
+/* Patch 0076: the guest PCs of the restored blocks not entered yet, up to `capacity` into `out`
+ * (in no order). How many there are (0 on an arm64 host). */
+uint64_t od_code_cache_unverified_pcs(void* cache, uint64_t* out, uint64_t capacity);
 
 /* Where a jit's JitState keeps its two exclusive-monitor slot pointers, which code in a shared
  * cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot addresses

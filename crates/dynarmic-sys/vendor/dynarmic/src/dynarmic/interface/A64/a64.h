@@ -195,6 +195,7 @@ public:
         std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
         std::uint64_t snapshot_save_lock_ns = 0;     ///< the latest save's time holding the cache's lock (copying out)
         std::uint64_t snapshot_pages_read = 0;       ///< patch 0075: pages of a lazily restored snapshot read in, as entered
+        std::uint64_t snapshot_blocks_forgotten = 0; ///< patch 0076: restored blocks never entered, forgotten by ForgetUnverified
     };
     Stats GetStats() const;
 
@@ -250,6 +251,14 @@ public:
     /// read in from the file (kept open) when a block on it is first entered, so code never entered
     /// costs no memory.
     std::int64_t LoadSnapshot(const char* path, const char* key, bool lazily = false);
+    /// Omnidroid patch 0076: forget every restored block not entered yet -- its block-map entry,
+    /// its links, its fastmem sites, its guest range's page-index entries, what verifying it needed
+    /// -- and shrink the tables. A location looked up later is translated as usual. Returns how
+    /// many were forgotten. Same restriction as InvalidateCacheRange.
+    std::int64_t ForgetUnverified();
+    /// Patch 0076: the guest PCs of the restored blocks not entered yet -- up to `capacity` of
+    /// them into `out` (in no order). Returns how many there are.
+    std::size_t UnverifiedPcs(std::uint64_t* out, std::size_t capacity) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl;

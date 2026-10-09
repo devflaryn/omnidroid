@@ -647,6 +647,7 @@ void od_code_cache_stats_of(void* p, od_code_cache_stats* out) {
     out->snapshot_blocks_rejected = s.snapshot_blocks_rejected;
     out->snapshot_save_lock_ns = s.snapshot_save_lock_ns;
     out->snapshot_pages_read = s.snapshot_pages_read;
+    out->snapshot_blocks_forgotten = s.snapshot_blocks_forgotten;
 #else
     (void)p;
 #endif
@@ -771,6 +772,34 @@ int64_t od_code_cache_save_snapshot(void* p, const char* path, const char* key, 
     (void)flags;
 #endif
     return -1;
+}
+
+uint64_t od_code_cache_unverified_pcs(void* p, uint64_t* out, uint64_t capacity) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr && (out != nullptr || capacity == 0)) {
+        return static_cast<OdCodeCache*>(p)->cache->UnverifiedPcs(out, static_cast<size_t>(capacity));
+    }
+#else
+    (void)p;
+    (void)out;
+    (void)capacity;
+#endif
+    return 0;
+}
+
+int64_t od_code_cache_forget_unverified(void* p) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    if (p != nullptr) {
+        try {
+            return static_cast<OdCodeCache*>(p)->cache->ForgetUnverified();
+        } catch (...) {
+            return -1;
+        }
+    }
+#else
+    (void)p;
+#endif
+    return 0;
 }
 
 int64_t od_code_cache_load_snapshot(void* p, const char* path, const char* key, uint32_t flags) {

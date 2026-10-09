@@ -714,6 +714,61 @@ void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
     fastmem_site_runs.push_back(FastmemSiteRun{b, e, {}});
 }
 
+size_t EmitX64::ForgetUnverifiedBlocks(const std::vector<u64>& locations, std::vector<std::pair<u32, u32>>& dead_links, std::vector<std::pair<const u8*, const u8*>>& dead_code) {
+    ASSERT(shared_code);
+    code.EnableWriting();
+    SCOPE_EXIT {
+        code.DisableWriting();
+    };
+    size_t forgotten = 0;
+    for (const u64 value : locations) {
+        const IR::LocationDescriptor location{value};
+        const auto it = block_descriptors.find(Key64{location});
+        if (it == block_descriptors.end() || (it->second.size & UNVERIFIED_BLOCK) == 0) {
+            continue;  // dropped since, or verified (or translated again)
+        }
+        const StoredBlock stored = it->second;
+        if (stored.first_link != NO_LINK) {
+            u32 last = stored.first_link;
+            while ((LinkAt(last).slot & LAST_LINK_OF_BLOCK) == 0) {
+                last++;
+            }
+            dead_links.emplace_back(stored.first_link, last);
+        }
+        const u8* const entry = code.getCode() + stored.entry;
+        dead_code.emplace_back(entry, entry + (stored.size & ~UNVERIFIED_BLOCK));
+        Unpatch(location);
+        ForgetOutgoingSlots(stored.first_link);
+        KeepHeadOf(it->first, stored);  // patch 0064
+        block_descriptors.erase(it);
+        forgotten++;
+    }
+    return forgotten;
+}
+
+size_t EmitX64::ForgetFastmemSitesIn(const std::vector<std::pair<const u8*, const u8*>>& spans) {
+    ASSERT(shared_code);
+    // Whether `at` lies in one of the spans: the last span starting at or below it.
+    const auto dead = [&spans](const u8* at) {
+        auto it = std::upper_bound(spans.begin(), spans.end(), at, [](const u8* a, const auto& span) { return a < span.first; });
+        return it != spans.begin() && at < std::prev(it)->second;
+    };
+    size_t dropped = 0;
+    for (FastmemSiteRun& run : fastmem_site_runs) {
+        const size_t before = run.sites.size() + run.wide.size();
+        const u8* const base = run.begin;
+        std::erase_if(run.sites, [&](const FastmemSite& s) { return dead(base + s.site); });
+        std::erase_if(run.wide, [&](const WideFastmemSite& s) { return dead(base + s.site); });
+        const size_t after = run.sites.size() + run.wide.size();
+        if (after != before) {
+            run.sites.shrink_to_fit();
+            run.wide.shrink_to_fit();
+        }
+        dropped += before - after;
+    }
+    return dropped;
+}
+
 void EmitX64::PurgeFastmemSites(const void* begin, const void* end) {
     ASSERT(shared_code);
     const u8* const b = static_cast<const u8*>(begin);

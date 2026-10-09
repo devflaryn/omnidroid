@@ -92,7 +92,7 @@ use core::ffi::c_void;
 /// ABI version of the C shim. Compared against the C++ side's own copy by
 /// [`od_dynarmic_abi_version`]; a mismatch means a stale object file, which
 /// would otherwise be silent memory corruption.
-pub const OD_DYNARMIC_ABI_VERSION: u32 = 9;
+pub const OD_DYNARMIC_ABI_VERSION: u32 = 10;
 
 /// `kind` values passed to [`OdCallbacks::exception_raised`]. These mirror
 /// `Dynarmic::A64::Exception`, which the shim checks with `static_assert`.
@@ -621,6 +621,9 @@ pub struct OdCodeCacheStats {
     pub snapshot_save_lock_ns: u64,
     /// ABI 9 (patch 0075): pages of a lazily loaded snapshot read in, as blocks on them were entered.
     pub snapshot_pages_read: u64,
+    /// ABI 10 (patch 0076): restored blocks never entered, forgotten by
+    /// [`od_code_cache_forget_unverified`].
+    pub snapshot_blocks_forgotten: u64,
 }
 
 /// What one of a shared code cache's per-block tables holds on the C heap (vendored patch 0024),
@@ -779,6 +782,21 @@ extern "C" {
     /// # Safety
     /// As [`od_code_cache_save_snapshot`].
     pub fn od_code_cache_load_snapshot(cache: *mut c_void, path: *const core::ffi::c_char, key: *const core::ffi::c_char, flags: u32) -> i64;
+
+    /// Patch 0076: forget every block restored from a snapshot and not entered yet (its map entry,
+    /// links, fastmem sites, guest-range index entries and verification record), and shrink the
+    /// tables. How many were forgotten.
+    ///
+    /// # Safety
+    /// As [`od_code_cache_save_snapshot`].
+    pub fn od_code_cache_forget_unverified(cache: *mut c_void) -> i64;
+
+    /// Patch 0076: the guest PCs of the restored blocks not entered yet, up to `capacity` into
+    /// `out` (in no order). How many there are.
+    ///
+    /// # Safety
+    /// A live cache; `out` writable for `capacity` values.
+    pub fn od_code_cache_unverified_pcs(cache: *mut c_void, out: *mut u64, capacity: u64) -> u64;
 
     /// What the cache's per-block tables hold (a census: takes the cache's lock, shared, and walks
     /// what cannot be sized in O(1) -- for a report made every few minutes, not a hot path). All

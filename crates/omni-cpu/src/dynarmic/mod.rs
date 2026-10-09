@@ -1520,6 +1520,28 @@ impl DynarmicBackend {
         unsafe { dynarmic_sys::od_code_cache_load_snapshot(cache.0, path.as_ptr(), key.as_ptr(), if lazily { dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY } else { 0 }) }
     }
 
+    /// Patch 0076: forget every block restored from a snapshot and not entered yet, and give
+    /// their tables' memory back. How many were forgotten (0 without a shared cache).
+    pub fn forget_unverified_translations(&self) -> i64 {
+        let Some(cache) = self.shared.code_cache.as_ref() else { return 0 };
+        // SAFETY: a live cache.
+        unsafe { dynarmic_sys::od_code_cache_forget_unverified(cache.0) }
+    }
+
+    /// Patch 0076: the guest PCs of the restored blocks not entered yet (empty without a shared
+    /// cache).
+    #[must_use]
+    pub fn unverified_translation_pcs(&self) -> Vec<u64> {
+        let Some(cache) = self.shared.code_cache.as_ref() else { return Vec::new() };
+        // SAFETY: a live cache; a null `out` with no capacity only counts.
+        let n = unsafe { dynarmic_sys::od_code_cache_unverified_pcs(cache.0, std::ptr::null_mut(), 0) };
+        let mut out = vec![0u64; n as usize + 1024];
+        // SAFETY: `out` holds its length.
+        let n = unsafe { dynarmic_sys::od_code_cache_unverified_pcs(cache.0, out.as_mut_ptr(), out.len() as u64) };
+        out.truncate((n as usize).min(out.len()));
+        out
+    }
+
     /// The shared code cache's counters, or `None` without one.
     #[must_use]
     pub fn code_cache_stats(&self) -> Option<OdCodeCacheStats> {

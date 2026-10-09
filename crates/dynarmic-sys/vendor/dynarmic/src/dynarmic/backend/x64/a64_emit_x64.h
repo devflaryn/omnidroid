@@ -150,6 +150,10 @@ public:
     /// Patch 0028: drop the guest ranges below serial `base` (with their page-index entries):
     /// every one names a block forgotten with the region it was emitted into.
     void TrimGuestRanges(u32 base);
+    /// Omnidroid patch 0076: take the guest ranges with serials in `[first, end)` whose location
+    /// has no block now out of the page index (the ranges themselves stay, as serials). How many
+    /// index entries were dropped.
+    size_t PruneGuestRangeIndex(u32 first, u32 end);
     /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
     /// back and nothing can execute it any more (patch 0025: the region's records, whole).
     void PurgeFastmemPatchInfo(const void* begin, const void* end);

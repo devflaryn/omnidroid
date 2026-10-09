@@ -1,0 +1,281 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index b287554..c008292 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -473,6 +473,38 @@ void A64EmitX64::TrimGuestRanges(u32 base) {
+     }
+ }
+ 
++size_t A64EmitX64::PruneGuestRangeIndex(u32 first, u32 end) {
++    first = std::max(first, range_base);
++    end = std::min(end, NextRangeSerial());
++    if (first >= end) {
++        return 0;
++    }
++    std::vector<bool> gone(end - first);
++    for (u32 serial = first; serial != end; serial++) {
++        gone[serial - first] = block_descriptors.find(RangeAt(serial).location) == block_descriptors.end();
++    }
++    const auto is_gone = [&](u32 serial) { return serial >= first && serial < end && gone[serial - first]; };
++    size_t dropped = 0;
++    for (auto it = guest_range_pages.begin(); it != guest_range_pages.end();) {
++        std::vector<u32>& indices = it.value();
++        const size_t before = indices.size();
++        std::erase_if(indices, is_gone);  // order kept: TrimGuestRanges needs it ascending
++        dropped += before - indices.size();
++        if (indices.empty()) {
++            it = guest_range_pages.erase(it);
++            continue;
++        }
++        if (indices.capacity() > 2 * indices.size() + 16) {
++            indices.shrink_to_fit();
++        }
++        ++it;
++    }
++    const size_t wide = wide_guest_ranges.size();
++    std::erase_if(wide_guest_ranges, is_gone);
++    dropped += wide - wide_guest_ranges.size();
++    return dropped;
++}
++
+ void A64EmitX64::PurgeFastmemPatchInfo(const void* begin, const void* end) {
+     // Patch 0025: a shared cache's sites are records of the region, given back with it.
+     PurgeFastmemSites(begin, end);
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index b58a8c5..9312f24 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -150,6 +150,10 @@ public:
+     /// Patch 0028: drop the guest ranges below serial `base` (with their page-index entries):
+     /// every one names a block forgotten with the region it was emitted into.
+     void TrimGuestRanges(u32 base);
++    /// Omnidroid patch 0076: take the guest ranges with serials in `[first, end)` whose location
++    /// has no block now out of the page index (the ranges themselves stay, as serials). How many
++    /// index entries were dropped.
++    size_t PruneGuestRangeIndex(u32 first, u32 end);
+     /// Drop the fastmem records of faulting sites in `[begin, end)`: that memory is being given
+     /// back and nothing can execute it any more (patch 0025: the region's records, whole).
+     void PurgeFastmemPatchInfo(const void* begin, const void* end);
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index 71656a5..d996edd 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -338,6 +338,23 @@ struct SharedCodeCache::Impl final {
+     void EnableSnapshots();
+     s64 SaveSnapshot(const char* path, const char* key, u64 max_bytes, bool include_unverified);
+     s64 LoadSnapshot(const char* path, const char* key, bool lazily);
++    /// Patch 0076: SharedCodeCache::ForgetUnverified.
++    s64 ForgetUnverified();
++    u64 snapshot_forgotten = 0;
++    size_t UnverifiedPcs(u64* out, size_t capacity) const {
++        std::shared_lock guard{lock};
++        size_t i = 0;
++        for (const auto& [location, pending] : unverified) {
++            if (i < capacity) {
++                out[i] = A64::LocationDescriptor{IR::LocationDescriptor{location}}.PC();
++            }
++            i++;
++        }
++        return unverified.size();
++    }
++    /// The guest-range serials the last load registered (its restored blocks'), `[first, end)`.
++    u32 restored_ranges_first = 0;
++    u32 restored_ranges_end = 0;
+     // Patch 0075: a snapshot restored lazily -- its code read in a page at a time, as blocks on it
+     // are first entered. The file stays open for that.
+     struct LazyRegion {
+@@ -1460,6 +1477,7 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool
+         ASSERT(at == static_cast<const u8*>(writable_pool.Begin()) + i * 16);
+     }
+     lazy_pages.base = block_of_code.getCode();  // patch 0075
++    restored_ranges_first = emitter.NextRangeSerial();  // patch 0076
+     if (lazily) {
+         emitter.lazy_pages = &lazy_pages;
+     }
+@@ -1536,6 +1554,7 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool
+         }
+     }
+     snapshot_hashing = true;
++    restored_ranges_end = emitter.NextRangeSerial();  // patch 0076
+     snapshot_restored += block_total;
+     unverified_count.store(unverified.size(), std::memory_order_relaxed);
+     return static_cast<s64>(block_total);
+@@ -1594,6 +1613,43 @@ std::optional<CodePtr> SharedCodeCache::Impl::VerifyRestored(IR::LocationDescrip
+     return std::nullopt;
+ }
+ 
++s64 SharedCodeCache::Impl::ForgetUnverified() {
++    std::unique_lock held{lock};
++    if (unverified.empty()) {
++        return 0;
++    }
++    std::vector<u64> locations;
++    locations.reserve(unverified.size());
++    for (const auto& [location, pending] : unverified) {
++        locations.push_back(location);
++    }
++    std::vector<std::pair<u32, u32>> dead_links;
++    std::vector<std::pair<const u8*, const u8*>> dead_code;
++    const size_t forgotten = emitter.ForgetUnverifiedBlocks(locations, dead_links, dead_code);
++    // What verifying them needed: emptied, and its array given back.
++    tsl::robin_map<u64, Unverified>{}.swap(unverified);
++    unverified_count.store(0, std::memory_order_relaxed);
++    // A lazily restored page read in later sets only the slots of blocks still known.
++    std::sort(dead_links.begin(), dead_links.end());
++    const auto dead_serial = [&dead_links](u32 serial) {
++        auto it = std::upper_bound(dead_links.begin(), dead_links.end(), serial, [](u32 s, const auto& span) { return s < span.first; });
++        return it != dead_links.begin() && serial <= std::prev(it)->second;
++    };
++    for (LazyRegion& l : lazy_regions) {
++        const size_t before = l.slots.size();
++        std::erase_if(l.slots, [&](const std::pair<u32, u32>& s) { return dead_serial(s.second); });
++        if (l.slots.size() != before) {
++            l.slots.shrink_to_fit();
++        }
++    }
++    std::sort(dead_code.begin(), dead_code.end());
++    emitter.ForgetFastmemSitesIn(dead_code);
++    emitter.PruneGuestRangeIndex(restored_ranges_first, restored_ranges_end);
++    emitter.ShrinkTables();  // patch 0066's, whatever its switch
++    snapshot_forgotten += forgotten;
++    return static_cast<s64>(forgotten);
++}
++
+ bool SharedCodeCache::Impl::Materialize(const u8* begin, const u8* end) {
+     if (lazy_regions.empty()) {
+         return true;
+@@ -2139,6 +2195,7 @@ SharedCodeCache::Stats SharedCodeCache::Impl::GetStats() const {
+     s.snapshot_blocks_rejected = snapshot_rejected;
+     s.snapshot_save_lock_ns = snapshot_save_lock_ns;
+     s.snapshot_pages_read = snapshot_pages_read;
++    s.snapshot_blocks_forgotten = snapshot_forgotten;  // patch 0076
+     return s;
+ }
+ 
+@@ -2194,6 +2251,14 @@ std::int64_t SharedCodeCache::SaveSnapshot(const char* path, const char* key, st
+     return impl->SaveSnapshot(path, key, max_bytes, include_unverified);
+ }
+ 
++std::size_t SharedCodeCache::UnverifiedPcs(std::uint64_t* out, std::size_t capacity) const {
++    return impl->UnverifiedPcs(out, capacity);
++}
++
++std::int64_t SharedCodeCache::ForgetUnverified() {
++    return impl->ForgetUnverified();
++}
++
+ std::int64_t SharedCodeCache::LoadSnapshot(const char* path, const char* key, bool lazily) {
+     return impl->LoadSnapshot(path, key, lazily);
+ }
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index a807566..2f29342 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -714,6 +714,61 @@ void EmitX64::BeginFastmemSites(const void* begin, const void* end) {
+     fastmem_site_runs.push_back(FastmemSiteRun{b, e, {}});
+ }
+ 
++size_t EmitX64::ForgetUnverifiedBlocks(const std::vector<u64>& locations, std::vector<std::pair<u32, u32>>& dead_links, std::vector<std::pair<const u8*, const u8*>>& dead_code) {
++    ASSERT(shared_code);
++    code.EnableWriting();
++    SCOPE_EXIT {
++        code.DisableWriting();
++    };
++    size_t forgotten = 0;
++    for (const u64 value : locations) {
++        const IR::LocationDescriptor location{value};
++        const auto it = block_descriptors.find(Key64{location});
++        if (it == block_descriptors.end() || (it->second.size & UNVERIFIED_BLOCK) == 0) {
++            continue;  // dropped since, or verified (or translated again)
++        }
++        const StoredBlock stored = it->second;
++        if (stored.first_link != NO_LINK) {
++            u32 last = stored.first_link;
++            while ((LinkAt(last).slot & LAST_LINK_OF_BLOCK) == 0) {
++                last++;
++            }
++            dead_links.emplace_back(stored.first_link, last);
++        }
++        const u8* const entry = code.getCode() + stored.entry;
++        dead_code.emplace_back(entry, entry + (stored.size & ~UNVERIFIED_BLOCK));
++        Unpatch(location);
++        ForgetOutgoingSlots(stored.first_link);
++        KeepHeadOf(it->first, stored);  // patch 0064
++        block_descriptors.erase(it);
++        forgotten++;
++    }
++    return forgotten;
++}
++
++size_t EmitX64::ForgetFastmemSitesIn(const std::vector<std::pair<const u8*, const u8*>>& spans) {
++    ASSERT(shared_code);
++    // Whether `at` lies in one of the spans: the last span starting at or below it.
++    const auto dead = [&spans](const u8* at) {
++        auto it = std::upper_bound(spans.begin(), spans.end(), at, [](const u8* a, const auto& span) { return a < span.first; });
++        return it != spans.begin() && at < std::prev(it)->second;
++    };
++    size_t dropped = 0;
++    for (FastmemSiteRun& run : fastmem_site_runs) {
++        const size_t before = run.sites.size() + run.wide.size();
++        const u8* const base = run.begin;
++        std::erase_if(run.sites, [&](const FastmemSite& s) { return dead(base + s.site); });
++        std::erase_if(run.wide, [&](const WideFastmemSite& s) { return dead(base + s.site); });
++        const size_t after = run.sites.size() + run.wide.size();
++        if (after != before) {
++            run.sites.shrink_to_fit();
++            run.wide.shrink_to_fit();
++        }
++        dropped += before - after;
++    }
++    return dropped;
++}
++
+ void EmitX64::PurgeFastmemSites(const void* begin, const void* end) {
+     ASSERT(shared_code);
+     const u8* const b = static_cast<const u8*>(begin);
+diff --git a/src/dynarmic/backend/x64/emit_x64.h b/src/dynarmic/backend/x64/emit_x64.h
+index 690fdb9..bbd9895 100644
+--- a/src/dynarmic/backend/x64/emit_x64.h
++++ b/src/dynarmic/backend/x64/emit_x64.h
+@@ -226,6 +226,14 @@ public:
+     void RefreshSlot(u32 serial);
+     /// A restored block found unchanged: entered from now on, linked to and from.
+     void MarkVerified(IR::LocationDescriptor location);
++    /// Omnidroid patch 0076: forget the blocks at `locations` that are restored and still
++    /// unverified, as an invalidation would (their links out undone, the links waiting for them
++    /// kept as waiting). Appends the serials of their link records (first, last) and their code's
++    /// spans. Nothing has ever entered them. How many were forgotten.
++    size_t ForgetUnverifiedBlocks(const std::vector<u64>& locations, std::vector<std::pair<u32, u32>>& dead_links, std::vector<std::pair<const u8*, const u8*>>& dead_code);
++    /// Patch 0076: drop the fastmem records of the sites inside `spans` (ascending, disjoint) --
++    /// code nothing executes. How many were dropped.
++    size_t ForgetFastmemSitesIn(const std::vector<std::pair<const u8*, const u8*>>& spans);
+ 
+     /// Empties the entire cache.
+     virtual void ClearCache();
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index dc4ed93..106239a 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -195,6 +195,7 @@ public:
+         std::uint64_t snapshot_blocks_rejected = 0;  ///< of those, whose guest code had changed: dropped, translated again
+         std::uint64_t snapshot_save_lock_ns = 0;     ///< the latest save's time holding the cache's lock (copying out)
+         std::uint64_t snapshot_pages_read = 0;       ///< patch 0075: pages of a lazily restored snapshot read in, as entered
++        std::uint64_t snapshot_blocks_forgotten = 0; ///< patch 0076: restored blocks never entered, forgotten by ForgetUnverified
+     };
+     Stats GetStats() const;
+ 
+@@ -250,6 +251,14 @@ public:
+     /// read in from the file (kept open) when a block on it is first entered, so code never entered
+     /// costs no memory.
+     std::int64_t LoadSnapshot(const char* path, const char* key, bool lazily = false);
++    /// Omnidroid patch 0076: forget every restored block not entered yet -- its block-map entry,
++    /// its links, its fastmem sites, its guest range's page-index entries, what verifying it needed
++    /// -- and shrink the tables. A location looked up later is translated as usual. Returns how
++    /// many were forgotten. Same restriction as InvalidateCacheRange.
++    std::int64_t ForgetUnverified();
++    /// Patch 0076: the guest PCs of the restored blocks not entered yet -- up to `capacity` of
++    /// them into `out` (in no order). Returns how many there are.
++    std::size_t UnverifiedPcs(std::uint64_t* out, std::size_t capacity) const;
+ 
+     struct Impl;
+     std::unique_ptr<Impl> impl;
