@@ -64,6 +64,10 @@
 //!   (blended there), its pixels composed on the CPU only for a reader (`crate::gpu::share`). Needs
 //!   the app's devices made with `OMNI_PRESENT_ZERO=ready` (or `=1`, on from the start). Off by
 //!   default.
+//! - `first_sweep=<s>` (`OMNI_FIRST_SWEEP`, 12 by default; 0: a period after the start, as
+//!   before): a host process's first zero sweep once it has settled after its start
+//!   (`crate::settle`), no sooner than `<s>` seconds. `first_trim=0|1` (`OMNI_FIRST_TRIM=1`; off by
+//!   default): the code trim's first look then too.
 //! - `region_lazy=0|1` (`OMNI_REGION_LAZY=1`): under `present_zero`, a buffer whose last frame the
 //!   composer took from its share image skips the release's region copy (GPU -> staging -> CPU);
 //!   any reader of the region fills it from the share image on demand
@@ -439,6 +443,20 @@ pub fn apply(line: &str) -> Option<String> {
             crate::gpu::native::RELEASE_WAIT_US.store(us, std::sync::atomic::Ordering::Relaxed);
             Some(format!("release_poll={us}: release_wait=poll, the fence asked every {us} us"))
         }
+        "first_sweep" => {
+            let s: u64 = value.trim().parse().ok()?;
+            crate::settle::FIRST_S.store(s, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("first_sweep={s}: {}", if s == 0 { "the first sweep a period after the start" } else { "the first sweep once settled after the start" }))
+        }
+        "first_trim" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::settle::FIRST_TRIM.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("first_trim={}", u8::from(on)))
+        }
         "region_lazy" => {
             let on = match value.trim() {
                 "1" => true,
@@ -627,6 +645,13 @@ mod tests {
         assert!(crate::gpu::share::lazy_on());
         apply("region_lazy=0").expect("understood");
         assert!(!crate::gpu::share::lazy_on());
+        assert!(apply("first_sweep=20").expect("understood").starts_with("first_sweep=20"));
+        assert_eq!(crate::settle::FIRST_S.load(Ordering::Relaxed), 20);
+        apply("first_sweep=12").expect("understood");
+        assert_eq!(apply("first_trim=1").as_deref(), Some("first_trim=1"));
+        assert!(crate::settle::FIRST_TRIM.load(Ordering::Relaxed));
+        apply("first_trim=0").expect("understood");
+        assert_eq!(apply("first_sweep=soon"), None);
     }
 
     #[test]
