@@ -1,6 +1,6 @@
 # Handoff
 
-## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09, ~20 h, Windows; branch `perf/ps99-60fps` @ the docs commit after 212550c, not merged, not pushed)
+## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09, ~20 h, Windows; branch `perf/ps99-60fps`, **merged into `main` and pushed** 2026-10-09 at 28b6eee)
 
 Goal (owner): PS99 fully loaded toward 60 fps, CPU and RAM well below, no feature removed. Morning
 report `docs/MORNING-2026-10-09-ps99-60fps.md` (with the two checkpoints); every A/B (winners and
@@ -22,7 +22,7 @@ and ~3.12 GB with them (s23, one clean pair: -296 MB more), threads ~1,220 -> ~8
   but +80..+250 MB: the game and system_server verify only 2-11% of what they restore (their
   libraries land elsewhere each boot; the perf harness also reinstalls the APK into a new random
   path every boot -- a saved device would not). `OMNI_JIT_SNAPSHOT_LAZY=1` reads restored code in as
-  entered (works: the game read ~3-4k pages). **Next:** branch `perf/jit-snapshot-fixes` @f5003bf has
+  entered (works: the game read ~3-4k pages). **Next:** branch `perf/jit-snapshot-fixes` @f5003bf (pushed to GitHub, not in `main`) has
   the unbuilt WIP for per-library placement (`OMNI_JIT_SNAPSHOT_LIB_ZONE=1`), forgetting unentered
   restored blocks (0076, `OMNI_JIT_SNAPSHOT_FORGET=1`) and `OMNI_JIT_SNAPSHOT_WHY=1` (which says where
   never-entered blocks went) -- build, test, A/B on a saved device (`OMNI_R_GOLDEN`).
