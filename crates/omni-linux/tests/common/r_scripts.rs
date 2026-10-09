@@ -2,8 +2,8 @@
 //! each behind a switch, kept here so a test that boots nothing can check them
 //! (`tests/r_scripts.rs`). **The fast forms are the defaults** since the fresh-boot A/B of
 //! 2026-10-09 (PS99, `startup2-1009.csv`, ABBA: "Joining game" at 115/115 s against 185/180 s, the
-//! same in-world fps and CPU); `OMNI_R_LINK_DELAY=45 OMNI_R_PLANT_FIRST=0 OMNI_R_FAST_SETUP=0` is
-//! the old path.
+//! same in-world fps and CPU) -- the link delay and the cookie planted first; `OMNI_R_LINK_DELAY=45
+//! OMNI_R_PLANT_FIRST=0` is the old path. `OMNI_R_FAST_SETUP` stays opt-in.
 //!
 //! Timeline of a new device before them (five runs, 2026-10-09, `[t]` seconds; `omni-linux-r-*.log`):
 //! boot_completed 45-50, settings + idle apps disabled 61-66, `pm install` 66-72, the app's first
@@ -30,14 +30,16 @@ pub fn plant_first() -> bool {
     std::env::var("OMNI_R_PLANT_FIRST").as_deref() != Ok("0")
 }
 
-/// `OMNI_R_FAST_SETUP` (default 1; `0` the old order): a new device's setup overlaps the idle apps' disabling with the APK's
+/// `OMNI_R_FAST_SETUP=1` (opt-in; default 0, the old order): a new device's setup overlaps the idle apps' disabling with the APK's
 /// install (18 `cmd package disable-user`, ~7 s, then `pm install`, ~5 s, one after the other
 /// before), and keeps the screen on with the setting `svc power stayon true` writes -- `svc` is a
 /// Java tool, and its VM aborts on every new device here ("Failed anonymous mmap(0x0, 67108864):
 /// Out of memory" in the shell's `app_process`, every run of 2026-10-09), so it never took effect.
 #[must_use]
 pub fn fast_setup() -> bool {
-    std::env::var("OMNI_R_FAST_SETUP").as_deref() != Ok("0")
+    // Not a default: its background subshell is a fork without exec, which crashed the setup's
+    // `sh` once in four boots on 2026-10-09 (SIGSEGV on a 0x80-filled pointer, s14) -- for ~5-8 s.
+    std::env::var("OMNI_R_FAST_SETUP").as_deref() == Ok("1")
 }
 
 /// Keeping the screen on: `svc power stayon true` (a Java tool), or the setting it writes
