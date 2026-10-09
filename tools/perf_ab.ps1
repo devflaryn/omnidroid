@@ -41,7 +41,22 @@ Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
 
 function Stop-Guests {
+  # The run's own instance first, through its stop file: it shuts down and removes its instance
+  # directory itself (a killed run leaves ~0.8 GB in %TEMP% for good). Then whatever is left.
+  if ($proc -and -not $proc.HasExited) {
+    $inst = Join-Path $env:TEMP ("omni-linux-r-{0}" -f $proc.Id)
+    $stop = Join-Path $inst "data\local\tmp\stop"
+    if (Test-Path (Split-Path -Parent $stop)) { Set-Content -Path $stop -Value "stop" -ErrorAction SilentlyContinue }
+    for ($i = 0; $i -lt 40 -and -not $proc.HasExited; $i++) { Start-Sleep 1 }
+  }
   Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+  if ($proc) {
+    Start-Sleep 2
+    foreach ($d in @(("omni-linux-r-{0}" -f $proc.Id), ("omni-linux-r-{0}-shots" -f $proc.Id))) {
+      $full = Join-Path $env:TEMP $d
+      if (Test-Path $full) { Remove-Item $full -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+  }
 }
 Stop-Guests
 Start-Sleep 3
