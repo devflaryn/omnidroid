@@ -218,8 +218,8 @@ available physical memory, `mc_gb` the system's compressed store.
 
 | arm | fps | all ms/frame | private WS | system host | **available** | compressed store | system_server | boot_completed | DID_LOG_IN | onGameLoaded |
 |---|---|---|---|---|---|---|---|---|---|---|
-| base | 59.46 | 38.92 | 3.022 | 0.809 | 9.206 | 0.661 | 10.3 | 28.5 | 56.9 | 87.6 |
-| idle (`OMNI_WS_TRIM_IDLE=30`) | 59.51 | 37.60 | 2.765 | 0.821 | 9.312 | 0.662 | 10.4 | 29.4 | 58.2 | 86.3 |
+| base | 59.46 / 59.51 | 38.92 / 38.12 | 3.022 / 2.954 | 0.809 / 0.813 | 9.206 / 9.268 | 0.661 / 0.691 | 10.3 / 10.3 | 28.5 / 28.9 | 56.9 / 57.0 | 87.6 / 84.5 |
+| idle (`OMNI_WS_TRIM_IDLE=30`) | 59.51 / 59.39 | 37.60 / 41.64 | 2.765 / 2.774 | 0.821 / 0.815 | 9.312 / 9.300 | 0.662 / 0.696 | 10.4 / 10.3 | 29.4 / 28.9 | 58.2 / 56.9 | 86.3 / 84.0 |
 | **trim** (`OMNI_WS_TRIM=120`) | 59.49 / 59.57 | 37.50 / 39.05 | **0.727 / 0.632** | 0.139 / 0.127 | **11.134 / 11.084** | 1.679 / 1.664 | 10.4 / 10.3 | 28.7 / 28.7 | 56.8 / 56.7 | 81.8 / 86.3 |
 | **par** (`OMNI_INIT_PARALLEL=1`) | 59.39 / 59.37 | 40.67 / 40.88 | 2.984 / 3.001 | 0.821 / 0.823 | 9.288 / 9.144 | 0.682 / 0.651 | **8.4 / 9.2** | **27.6 / 27.4** | **55.7 / 55.5** | 85.8 / 81.6 |
 
@@ -227,7 +227,8 @@ available physical memory, `mc_gb` the system's compressed store.
   of which ~1.0 GB lands compressed in the system's store: omnidroid's real footprint drops by
   1.2-1.9 GB of ~3 GB. fps, CPU a frame and the vsync pacer's worst lateness a 30 s period (0.9-5.7
   ms against 1.0-7.7 on base) unchanged.
-- The idle trim: Android's five idle helper apps 205-266 MB -> 0-12 MB each; private WS -257 MB.
+- The idle trim: Android's five idle helper apps 205-266 MB -> 0-12 MB each; private WS -257 / -180
+  MB, available +106 / +32 MB: real but small next to the periodic trim.
 - class_start side by side: 2,371 -> 416-419 ms; system_server's runtime 10.3 -> 8.4/9.2 s.
 - `[init] boot commands 7.5-7.7 s` -- of which `exec_start` ~2 s; the rest is timed by the next build.
 
