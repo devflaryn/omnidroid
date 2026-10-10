@@ -67,6 +67,11 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 13 | init's class_start side by side | s10, 2 runs | class_start 2.37 -> 0.42 s; system_server 10.3 -> 8.4/9.2 s; boot -1.0 s, sign-in -1.4 s | **yes, default** |
 | 11 | the game's live code 512 MiB (`OMNI_JIT_SHARED_CACHE_LIVE_MB=512`, default 256) | s7, 2 pairs | 2 regions retired during the start instead of ~18; onGameLoaded and private WS unchanged | no (neutral; with snapshots: s9) |
 | 10 | the place's link at once after sign-in (`OMNI_R_LINK_DELAY=0`, default 3) | s6, 2 runs | Joining 71.8/63.6 vs 70.6/67.7: the sign-in-to-Joining gap swings 5-14 s run to run (matchmaking, network) | no (inconclusive; default unchanged) |
+| 14 | **one `Sysroot` per host process** (`OMNI_SYSROOT_SHARED=0` = one per open); object sizes checked once per pin (a marker in `objects/`) | Linux i5-4460, `omni-linux-run` with services; 535 opens counted in one PS99 session's log | a spawn after the first **70 -> 3 ms**; a host process's first open 27.7 -> 20.6 ms; init's setprop/wait_for_prop no longer open it | yes (5f524ca); device A/B s14 |
+| 15 | dynarmic **0084**: Xbyak writes a byte in place, grows out of line | `the_speed_of_emission`, now `OD_PROD=1` (the device's switches), byte-identical | emit **11.06 -> 10.51 us/block (-5%)**, 3/3 | yes |
+| 16 | dynarmic **0086**: `Inst::GetArg` inline; `SetArg`'s type check with `OMNI_JIT_VERIFY=1` | same | frontend **4.80 -> 4.62 (-4%)**, emit **10.54 -> 10.26 (-3%)**, 4/4 | yes |
+| 17 | dynarmic **0087**: opcode return types and the passes' predicates from tables | same | frontend **4.61 -> 4.28 (-7%)**, emit **10.26 -> 10.02 (-2%)**, 4/4 | yes |
+| - | (0085) the allocator's per-block state kept per thread; (0088) `SelectARegister`'s partitions replayed over bitmasks (same choice) | same | 10.61 -> 10.52 (noise); 10.12 -> 10.47 (**+3.5%**, slower) | no, dropped |
 
 **Why the in-world worker got cheaper with faster translation:** the game keeps translating in the
 measured window -- after its code-aging pass (3 min) it translates the hot code again in bursts of
@@ -235,3 +240,27 @@ available physical memory, `mc_gb` the system's compressed store.
 **All three are the defaults now** (c9eab23); `OMNI_WS_TRIM=0`, `OMNI_WS_TRIM_IDLE=0`,
 `OMNI_INIT_PARALLEL=0` turn them off. **Note for later A/Bs:** with the trims on, `wspriv_gb` measures
 what is touched between trims; RAM comparisons now go by `avail_gb`, or set `OMNI_WS_TRIM=0`.
+
+## Between s10 and s14 (05:10-): spawns, and the JIT's own speed on the i5-4460
+
+**Every spawn opened the sysroot again.** `OMNI_SPAWN_TIME=1` on the Linux box: `[spawn]
+/system/bin/toybox: 66.0 ms (sysroot 61.7, ...)` -- `Sysroot::open` hashed the 0.5 MB manifest and
+0.4 MB meta, looked at each of ~5,000 objects, read the device overlay and built its maps, for every
+guest process, and again for each `setprop`/`wait_for_prop` init ran (`properties()`), 535 times in
+one PS99 session (`[bootimage] pid` lines). Without `OMNI_GPU` set it also probed the host's Vulkan
+(40 ms; the device runs set it). Now one per host process: `[spawn] servicemanager: 3.1 ms (sysroot
+0.0, ...)`. Each guest process also kept its own copy of the maps (~2-3 MB of heap; 62 in the system
+host) and its own `Backing` per library; they share both now. The size check of the objects runs
+once per sysroot pin (`objects/.sizes-checked-<manifest sha>`).
+
+**Emission, profiled with the device's switches** (`OD_PROD=1`, a SIGPROF sampler on the Linux box):
+flat -- libc 10% (allocation, copying), `SelectARegister` 4.7%, `Xbyak::CodeArray::db` 4.3% (a call
+per emitted byte), `A64GetSetElimination` 3.5%, `ValueLocation` 2.8%, `SetArg`/`GetArg` 2.7/2.5%, small
+out-of-line IR predicates ~4% together. 0084/0086/0087 took the call-per-byte, the argument accessors
+and the predicates: **frontend 4.80 -> 4.28 us/block (-11%), emit 11.06 -> 10.02 (-9%)** on the
+i5-4460, the same bytes throughout (`compare_emit_dumps.py`: 11 blocks differ between any two runs of
+one build, a jump displacement 0x2000 apart; the same 11 with each patch).
+
+Why it matters: a fresh helper app's host translates 145-213k blocks (~1.7 s of CPU), the system
+host ~1.4 M in its first 20 s, the game ~9 s + ~22 s of translate + emit a boot -- on a 4-core
+machine most of that is on the boot's critical path.
