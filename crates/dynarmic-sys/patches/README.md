@@ -967,3 +967,15 @@ same IR, so the same bytes (`compare_emit_dumps.py`); `OMNI_JIT_VERIFY=1` passes
 
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0090): frontend **4.26/4.32/4.27/4.24 -> 3.95/3.96/3.98/3.98 us/block (-7%)**; emit unchanged.
+
+### 0092 — x64: `SelectARegister` takes a free, empty first candidate at once
+
+`SelectARegister` copies the candidates and runs two `std::partition`s (unlocked, then empty) to
+pick the first of the result: the largest single function of emission after 0084-0091 (5.5% of
+samples). When the first candidate is unlocked and empty, both partitions keep it first --
+`std::partition` swaps only elements behind the first one that fails -- so it is the choice, and is
+returned without looking at the others. Exactly the same choice, so the same bytes
+(`compare_emit_dumps.py`).
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0091): emit **9.61/9.64/9.78/9.65 -> 9.45/9.50/9.56/9.47 us/block (-1.8%)**.

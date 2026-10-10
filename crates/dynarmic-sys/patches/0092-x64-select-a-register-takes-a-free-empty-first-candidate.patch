@@ -1,0 +1,21 @@
+diff --git a/src/dynarmic/backend/x64/reg_alloc.cpp b/src/dynarmic/backend/x64/reg_alloc.cpp
+index 79434bd7..8380f6a1 100644
+--- a/src/dynarmic/backend/x64/reg_alloc.cpp
++++ b/src/dynarmic/backend/x64/reg_alloc.cpp
+@@ -531,6 +531,16 @@ void RegAlloc::EmitVerboseDebuggingOutput() {
+ }
+ 
+ HostLoc RegAlloc::SelectARegister(Locations desired_locations) const {
++    // Omnidroid patch 0092: when the first candidate is free and empty, both partitions below keep
++    // it first (`std::partition` only swaps elements behind the first one that fails), so it is
++    // the choice; nothing else needs a look.
++    if (!desired_locations.empty()) {
++        const HostLocInfo& first = LocInfo(desired_locations[0]);
++        if (!first.IsLocked() && first.IsEmpty()) {
++            return desired_locations[0];
++        }
++    }
++
+     // Omnidroid patch 0063: the same two partitions over a copy on the stack rather than a
+     // `std::vector` (the same algorithm on the same elements, so the same choice).
+     std::array<HostLoc, NonSpillHostLocCount> storage;
