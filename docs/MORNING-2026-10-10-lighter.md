@@ -71,7 +71,7 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   both measured in s23). Small daemons verify 99.9%, apps 99.7%, the game 91%. One switch now:
   **`OMNI_JIT_SNAPSHOT=1`** (the temporary directory's `omni-jit-snapshot`, with lazy pages, the library
   zone, forgetting and 512 MiB of live code by default). **Their crash is found and fixed (dynarmic
-  0101, 56d6f8c), being confirmed (s35):** on four E-cores the game's host had died in 7 of 12 snapshot
+  0101, 56d6f8c; s35: 0 crashes in the 3 runs that restored, forgot and retired regions):** on four E-cores the game's host had died in 7 of 12 snapshot
   runs (s17, s26, s32). s32's two crashes, caught by the kept crash filter, were the same instruction:
   `EmitX64::ForgetOutgoingSlots`, a write through a link record already trimmed. Forgetting a restored
   loop that was never entered left a dead record at the head of the links to it (a loop links to
@@ -94,6 +94,6 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 
 ## For you to decide
 
-- Translation snapshots on by default -- if s35 shows the fix holds on slow cores (above).
+- Translation snapshots on by default: crash fixed (s35), the world 10-30 s sooner, sign-in up to 30 s sooner on slow cores -- for +190 MB of commit. Your call: boot speed against RAM.
 - Saved devices by hard link instead of a ~780 MB copy per boot; ~3 GB of old `-gutted` saved
   devices in `%TEMP%\omni-golden` (yours to delete).

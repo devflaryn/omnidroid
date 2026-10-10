@@ -597,3 +597,18 @@ is an E-core arm, the weak-PC stand-in -- full-CPU runs stay at 58-60.)
 **Not taken**: the discards are as many as without it, the commit the same. The variable reaches the
 app's host as `--env` (the harness splits only the first `=`); either Roblox's mimalloc sets its own
 options or these `MADV_DONTNEED`s are not its delayed purges. Dropped; the switch stays (harmless).
+
+## Session s35 (12:41-13:10): the e4 snapshot crash config on the fixed build (`s35-fix-e4.csv`, build 56d6f8c: 0101)
+
+| run (`F0000`, `MAX_MB=512`) | game: restored / forgotten unverified / regions retired | crash | fps | boot_completed | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|
+| 1 | 0 (0101 changed the code: every snapshot refilled) / -- / 27 | no | 25.59 | 45.9 | 133.4 | 175.8 |
+| 2 | 902,541 / 4,063 / 27 | no | 29.41 | 36.6 | 66.0 | **109.8** |
+| 3 | 1,293,511 / 142,246 / 26 | no | 31.68 | 35.8 | 79.7 | 132.8 |
+| 4 | 1,190,832 / 1,942 / 27 | no | 26.88 | 34.5 | 63.9 | **118.0** |
+
+**No crash in the three runs that restored, forgot and retired** -- the sequence that crashed 7 of
+12 runs before (s17, s26, s32; at that rate three clean runs happen 7% of the time), run 3 with as
+many forgotten as s32's crashing runs (142k against ~151k). With the deterministic test (SIGSEGV
+before, passes after), the crash is fixed. Snapshots on four E-cores: the world in 110-133 s against
+~140 s without (s17), sign-in 64-80 s against ~95 s.
