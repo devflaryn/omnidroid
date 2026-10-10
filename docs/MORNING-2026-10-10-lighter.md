@@ -8,64 +8,69 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 
 ## Where things stand (fresh boots, PS99 fully loaded)
 
-| | `main` (dc72223, s1) | branch now | change |
+| | `main` (dc72223, s1) | branch now (s13) | change |
 |---|---|---|---|
-| fps (60 Hz cap) | 57.4-59.0 | 59.0-59.6 | at the cap |
-| CPU a frame, all hosts | 42.5-47.4 ms | 38.6-45 ms | lower, noisy |
-| engine worker ms/frame | 13.8-14.0 (s3 `old`) | 10.6-12.3 | **-2..-3 ms** (faster translation in-world) |
-| private working set (Task Manager) | 3.04-3.21 GB | **0.63-0.73 GB** (trims, default) | -2.4 GB shown; **+1.9 GB available to the machine** |
-| system host | 0.90-0.92 GB | **0.82 GB**; 0.14 GB trimmed | -90 MB |
-| system_server starts | 12.1-12.5 s | **8.4-9.2 s** | -3..-4 s |
-| boot_completed | 30.8 s | **28.6-29.6 s** | -1.3..-2 s |
-| world loaded (onGameLoaded) | 87-88 s | **84-86 s**; 76-82 s with snapshots (s5) | -2..-5 s; -6..-10 s |
-| 8 E-cores (weaker PC): world loaded | 188 s | **160 s** | -28 s |
-| 4 E-cores | (not measured working) | **plays at ~33 fps**, world at 179 s | Delta's 20 s window met |
+| fps (60 Hz cap) | 57.4-59.0 | 59.2-59.6 | at the cap |
+| CPU a frame, all hosts | 42.5-47.4 ms | 37.9-41.5 ms | lower, noisy |
+| engine worker ms/frame | 13.8-14.0 (s3 `old`) | 10.4-12.3 | -2..-3 ms |
+| private commit, all hosts | 4.0-4.1 GB (s11) | **3.83-3.87 GB** | **-165 MB** |
+| private working set (Task Manager) | 3.04-3.21 GB | **0.70-0.73 GB** (trims, default) | **+1.7-1.9 GB available to the machine** |
+| system host (no trims) | 0.90-0.92 GB | **0.65-0.66 GB** | -250 MB |
+| system_server starts | 12.1-12.5 s | **4.0-4.1 s** | **-8 s** |
+| boot_completed | 30.8 s | **21.2-21.3 s** | **-9.5 s** |
+| world loaded (onGameLoaded) | 87-88 s | **71.8-73.1 s** | **-15 s** |
+| ... with translation snapshots | -- | 66.7 s on the s10 build (s12) | -18 s more, opt-in |
+| 8 E-cores (weaker PC): CPU a frame | -- | **-11%** with 0081-0083 (53 vs 59.5 ms) | |
+| 8 E-cores: world loaded | 188 s | 157-164 s (s11, older build) | -25..-30 s |
 
 ## What changed (each measured; numbers in the ledger)
 
-1. **JIT translation ~30% cheaper** (dynarmic patches 0077 IR accessors inline + verification on
-   request, 0079 Xbyak labels without heap nodes, 0080 register-allocator location hint; all
-   byte-identical code): i5-4460 first translation 24.5 -> 17.2 us/block. In-world the game keeps
-   translating (after code aging), so the engine worker got ~2 ms/frame cheaper and fps +0.9.
-2. **Fault thunks 94% smaller** (0078): a fresh code cache 0.88 -> 0.13 MiB resident, every guest
-   process starts faster. It exposed a code-aging floor that small services then fell under; the
-   floor is now 6 MiB: **-90..-110 MB private WS**.
-3. **Boot: no fixed 1.5 s sleep before system_server** (it waits for servicemanager, which was ready
-   "after 0 ms"): system_server -2 s, world -2.5 s. Sign-in polled every 0.2 s.
-4. **The game's hottest loop, Luau's bytecode dispatch** (`ldrb w8,[x26,#4]!; ldr x8,[x21,x8,lsl #3];
-   br x8`, the engine worker's top function), translated without a store-and-reload of X8 (0081: a
-   register read forwarded across a W/X width change) and without stack spills while registers are
-   free (0082: a value moved out of the way goes to a free callee-saved register). Both checked with a
-   new guest-visible differential (every register after every block, ~385k block runs over five
-   libraries including libroblox: identical on and off; it caught a wrong first version of 0081).
-   In-world A/B queued (s11).
-5. **RAM: most of what omnidroid held resident was cold** -- two minutes after a working-set trim
-   the system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of
-   ~150. Now every host process trims its working set every 120 s, and an idle one after 30 s:
-   **the machine gains ~1.9 GB of available memory** (9.2 -> 11.1 GB, twice; ~1.0 GB of it held
-   compressed by Windows), Task Manager's figure 3.0 -> ~0.7 GB, with fps, CPU a frame and frame
-   pacing unchanged (s10). `OMNI_WS_TRIM=0` / `OMNI_WS_TRIM_IDLE=0` turn them off.
-6. **Boot: init's services started side by side** (2.37 -> 0.42 s): system_server -1.1..-1.9 s,
-   boot_completed -1 s (s10). `OMNI_INIT_PARALLEL=0` is the old order.
-7. **Measurement**: the harness simulates weaker PCs (`-Affinity`), refuses to run without the
-   network bypass (a run without WARP looked exactly like Delta's 20 s crash), times boot milestones
-   from the log's own clock, and records available memory and the compressed store;
-   `OMNI_JIT_TIME`, `[boot-ms]`, `[init] exec_start ... in N ms`.
+1. **One sysroot per host process** (5f524ca). Every spawn, and every `setprop` and `wait_for_prop`
+   init ran, opened the AOSP image again: hashed its 0.9 MB manifest and meta, looked at ~5,000
+   files, built its maps (535 times a session; 62 copies of the maps kept in the system host).
+   **init's boot commands 7.7 -> 3.8 s, system_server 10.3 -> 4.0 s, a spawn 70 -> 4 ms**, the system
+   host -150 MB. `OMNI_SYSROOT_SHARED=0` is the old way (s14 measures it side by side).
+2. **The JIT ~25% cheaper per block** (dynarmic 0077, 0079, 0080 last night; tonight 0084 Xbyak
+   writes bytes in place, 0086/0087/0093 IR accessors and predicates inline or from tables, 0089
+   labels from a free list, 0090 no atomics per instruction, 0091 get/set elimination without
+   per-access sweeps, 0092 a free register taken at once, 0094 no perf-map name per block; all
+   byte-identical code, measured with the device's own switches): i5-4460 frontend 4.80 -> 3.8
+   us/block, emit 11.06 -> 8.8. On the device: JIT CPU to the world 56 -> 51 s, the game 13.4 -> 11.4
+   us/block.
+3. **The game's hottest loop, Luau's dispatch, translated tighter** (0081 a register read forwarded
+   across a W/X width change, 0082 spills to free callee-saved registers, 0083 no re-zero-extension
+   of a zero-extended load; checked with a new guest-visible differential): **on 8 E-cores the
+   game's CPU a frame 59.5 -> 53 ms (-11%, 2/2)**; at full CPU at the cap either way.
+4. **Snapshots install 28% faster** (0095: buffered reads, flat arrays, one commit a region): the
+   game's 1.4 M-block snapshot took 1.3 s at its process start.
+5. **RAM: most of what omnidroid held resident was cold** -- every host process trims its working
+   set every 120 s, an idle one after 30 s: **~1.7-1.9 GB more available memory** (twice in s10,
+   twice in s13), Task Manager's figure 3.0 -> ~0.7 GB. s13 hints at a small CPU cost of the
+   periodic trim (2/2, +1-2.5 ms a frame); s18 tries trimming once instead. `OMNI_WS_TRIM=0` /
+   `OMNI_WS_TRIM_IDLE=0` turn them off.
+6. **Boot**: init's services started side by side (2.37 -> 0.42 s); no fixed 1.5 s sleep before
+   system_server; fault thunks 94% smaller (0078) and code aging's floor 6 MiB (-90..-110 MB).
+7. **Measurement**: weaker PCs simulated (`-Affinity`), the network bypass checked before a run,
+   boot milestones from the log's own clock, available memory and the compressed store recorded;
+   `OMNI_JIT_TIME`, `OMNI_SPAWN_TIME`, `[boot-ms]`, `[init] ... in N ms`; new benchmarks for
+   snapshot installs and for threads translating side by side.
 
+## Found, being measured (queued sessions s14-s20)
 
-## Found, being measured
-
-- **Translation snapshots: 4-16 s sooner into the world (about 5 s typical)** (last night's WIP, now built, fixed and on
-  this branch; opt-in). With the game's live code budget at 512 MiB its snapshot survives, and from
-  the second run on it verifies up to 70% of what it restores: world at 81.6 / 68.6 / 79.6 s against 84.8-85.9 s without
-  (s9). Cost: +145 MB private WS and 2.2 GB of snapshot files, rebuilt after every new host binary.
-  system_server's part is still weak (8% verify; s12 names where its code moves). Yours to weigh:
-  `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1 OMNI_JIT_SNAPSHOT_LIB_ZONE=1
-  OMNI_JIT_SNAPSHOT_FORGET=1 OMNI_JIT_SHARED_CACHE_LIVE_MB=512`.
-- **init's boot commands take 7.5 s** before system_server can start (`exec_start` ~2 s of it):
-  the rest is now timed (`wait_for_prop`, `init_user0`, linkerconfig, each spawn's phases).
+- **Translation snapshots: 18 s sooner into the world, and no longer a RAM cost** (s12: world 84.5
+  -> 66.7 s, private commit -67 MB, available +164 MB with lazy pages and forgetting; small daemons
+  verify 99.9%, apps 99.7%, the game 91%). Cost: **2.2 GB of disk** (one directory per
+  configuration; rewritten after every new host binary). The directory is now made NTFS-compressed
+  (c887b87; the files compress to about a third), to be measured. s16/s17 measure them on tonight's
+  build, at full CPU and on 4 E-cores. Opt-in: `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1
+  OMNI_JIT_SNAPSHOT_LIB_ZONE=1 OMNI_JIT_SNAPSHOT_FORGET=1 OMNI_JIT_SHARED_CACHE_LIVE_MB=512`.
+  **My recommendation: on by default** -- yours to weigh against the disk.
+- The idle apps left out of the image on 4 E-cores (s15), trimming once vs every 120 s (s18), the
+  saved-device path you actually boot (s19), and who holds the system host's 13-16 MiB blocks (380
+  MiB of its 1.03 GB commit; s20).
 
 ## For you to decide
 
-See the ledger's "For the owner to decide": saved devices by hard link instead of a 781 MB copy per
-boot; ~3 GB of old `-gutted` saved devices in `%TEMP%\omni-golden`.
+- Translation snapshots on by default (above).
+- Saved devices by hard link instead of a ~780 MB copy per boot; ~3 GB of old `-gutted` saved
+  devices in `%TEMP%\omni-golden` (yours to delete).
