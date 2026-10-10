@@ -1047,3 +1047,14 @@ MEASURED (i5-4460, 3 interleaved runs against 0095): `the_speed_of_snapshot_inst
 -> 490/493/488 ns a block (-12%)**; `the_speed_of_emission` (`OD_PROD=1`) emit 9.10/8.86/9.00 ->
 8.91/8.74/8.85 us/block (-1.7%). The same bytes; the snapshot test passes lazily and not (Linux,
 first cache freed first).
+
+### 0097 — x64: a snapshot's fields read from the buffer in place
+
+After 0095 a snapshot's records come from the reader's own buffer, but every field still went
+through `Bytes(&v, sizeof(T))`: a size known only at run time, so a call to `memcpy` for each 4- or
+8-byte field (~8% of an install's samples). `Reader::Value<T>` copies a field that is wholly in the
+buffer with a constant size -- a move -- and leaves the rest to `Bytes`.
+
+MEASURED (`the_speed_of_snapshot_install`, i5-4460, 3 interleaved runs against 0096): **488/487/486
+-> 476/479/472 ns a block (-2.3%)**. The snapshot test passes lazily and not (Linux, first cache
+freed first).

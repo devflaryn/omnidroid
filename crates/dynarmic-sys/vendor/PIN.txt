@@ -81,6 +81,7 @@ dynarmic/
                and ../patches/0094-x64-a-block-s-perf-map-name-only-with-a-perf-map.patch
                and ../patches/0095-x64-a-snapshot-installs-faster.patch
                and ../patches/0096-x64-fastmem-sites-in-order-not-sorted-again.patch
+               and ../patches/0097-x64-a-snapshot-s-fields-read-in-place.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

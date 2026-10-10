@@ -1014,6 +1014,14 @@ public:
     template<typename T>
     bool Value(T& v) {
         static_assert(std::is_trivially_copyable_v<T>);
+        // Omnidroid patch 0097: a field in the buffer is copied in place (a constant size: a move,
+        // not a call to `memcpy`), the rest through `Bytes`.
+        if (sizeof(T) <= len - pos && sizeof(T) <= size - at) {
+            std::memcpy(&v, buffer.data() + pos, sizeof(T));
+            pos += sizeof(T);
+            at += sizeof(T);
+            return true;
+        }
         return Bytes(&v, sizeof(T));
     }
     // Omnidroid patch 0095: read through a buffer of its own, a large `fread` at a time -- the
