@@ -64,7 +64,12 @@ impl Space {
     /// A space whose cache keeps `live_bytes` of regions live (0: all but one).
     fn with_live(opts: VmOptions, processors: u64, cache_bytes: u64, region_bytes: u64, live_bytes: u64, code: &[u32]) -> Arc<Self> {
         let arena: &'static mut [u64] = Box::leak(vec![0u64; (MEM_SIZE + MEM_GUARD) / 8].into_boxed_slice());
-        let arena = arena.as_mut_ptr();
+        Self::with_arena(opts, processors, cache_bytes, region_bytes, live_bytes, code, arena.as_mut_ptr())
+    }
+
+    /// [`with_live`](Self::with_live) on an arena already made (another space's, leaked like every
+    /// arena here): the same fastmem base, so the same code shape -- what a snapshot is keyed on.
+    fn with_arena(opts: VmOptions, processors: u64, cache_bytes: u64, region_bytes: u64, live_bytes: u64, code: &[u32], arena: *mut u64) -> Arc<Self> {
         // SAFETY: freed in `Drop`, after every jit using it.
         let monitor = unsafe { od_monitor_new(processors) };
         assert!(!monitor.is_null());
@@ -1448,4 +1453,131 @@ fn an_eviction_on_demand_keeps_the_newest_region_and_w_runs_on() {
         again.as_secs_f64() * 1e3,
         again.as_secs_f64() * 1e6 / w_blocks as f64
     );
+}
+
+/// **Restored code runs while its regions are evicted under it** (s17/s26, 2026-10-10: with
+/// translation snapshots on four E-cores the game's host died of an access violation while its
+/// cache retired regions -- 3 runs of 4; never without snapshots, never at full CPU). A cache's
+/// translations of a chain longer than a region are saved; a fresh cache with room for two regions
+/// restores them lazily, and four jits run the chain again and again while another thread evicts
+/// down to one region and forgets what was never entered. Every pass must count the whole chain.
+/// Run it on few cores (`taskset -c 0,1`) to widen the races, as the E-cores did.
+#[test]
+#[ignore = "a stress test, run alone (other caches alive change the code shape: load -10): --ignored --exact"]
+fn restored_code_runs_while_its_regions_are_evicted() {
+    restored_code_under_eviction(&chain(120_000), 120_000);
+}
+
+/// The same with calls: `n` functions, each called once (`BL`) and returning (`RET`) -- what the
+/// return-stack buffer holds, host addresses in restored code, must not outlive their region.
+#[test]
+#[ignore = "a stress test, run alone (other caches alive change the code shape: load -10): --ignored --exact"]
+fn restored_calls_return_while_their_regions_are_evicted() {
+    restored_code_under_eviction(&calls(60_000), 60_000);
+}
+
+/// `X0 += 1` in each of `n` functions, called in turn from a straight run of `BL`s; then `SVC #0`.
+fn calls(n: usize) -> Vec<u32> {
+    let mut code = Vec::with_capacity(n * 3 + 1);
+    for i in 0..n {
+        // The caller's BL at index i; function i at n + 1 + 2 i.
+        let target = (n + 1 + 2 * i) as i32;
+        code.push(a64::bl(target - i as i32));
+    }
+    code.push(a64::svc(0));
+    for _ in 0..n {
+        code.push(a64::add_imm(0, 0, 1));
+        code.push(a64::ret(30));
+    }
+    code
+}
+
+fn restored_code_under_eviction(program: &[u32], count: u64) {
+    use std::ffi::CString;
+    let path = std::env::temp_dir().join(format!("od-shared-snapshot-{}", std::process::id()));
+    let p = CString::new(path.to_str().unwrap()).unwrap();
+    let key = CString::new("stress").unwrap();
+    let first = Space::with_live(VmOptions::default(), 4, 40 << 20, 8 << 20, 16 << 20, program);
+    // SAFETY: a live cache, nothing emitted yet.
+    unsafe { od_code_cache_enable_snapshots(first.cache as *mut c_void) };
+    for (x0, _, _) in run_all(&first, 4, true) {
+        assert_eq!(x0, count);
+    }
+    // SAFETY: live; no jit is running.
+    let saved = unsafe { od_code_cache_save_snapshot(first.cache as *mut c_void, p.as_ptr(), key.as_ptr(), u64::MAX, 0) };
+    assert!(saved > 0, "saved {saved}");
+    let arena = first.arena as *mut u64;
+    drop(first);
+
+    let space = Space::with_arena(VmOptions::default(), 4, 40 << 20, 8 << 20, 16 << 20, program, arena);
+    // SAFETY: as above.
+    unsafe { od_code_cache_enable_snapshots(space.cache as *mut c_void) };
+    let loaded = unsafe { od_code_cache_load_snapshot(space.cache as *mut c_void, p.as_ptr(), key.as_ptr(), OD_SNAPSHOT_LOAD_LAZY) };
+    assert!(loaded > 0, "loaded {loaded}");
+    let _ = std::fs::remove_file(&path);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let evictor = {
+        let space = Arc::clone(&space);
+        let stop = Arc::clone(&stop);
+        let (p, key) = (p.clone(), key.clone());
+        let words = program.len() as u64;
+        std::thread::spawn(move || {
+            // As in the game: the restored code runs first; what was never entered is forgotten
+            // once, later; regions are retired all along (the live limit, code aging).
+            let (mut evicted, mut forgotten, mut saves) = (0u64, 0i64, 0u128);
+            let again = CString::new(format!("{}.again", p.to_str().unwrap())).unwrap();
+            let started = Instant::now();
+            std::thread::sleep(Duration::from_millis(50));
+            while !stop.load(Ordering::Relaxed) {
+                // SAFETY: both are made to be called while jits run on the cache (code aging does).
+                evicted += unsafe { od_code_cache_evict_to(space.cache as *mut c_void, 0) };
+                if forgotten == 0 && started.elapsed() > Duration::from_secs(3) {
+                    forgotten = unsafe { od_code_cache_forget_unverified(space.cache as *mut c_void) }.max(1);
+                }
+                // Guest code invalidated here and there (the game's host invalidated thousands of
+                // ranges a run): its callers' links in restored code are unlinked.
+                let at = (evicted.wrapping_mul(2_654_435_761) ^ started.elapsed().as_nanos() as u64) % words;
+                // SAFETY: a live cache; invalidation is made to be called while jits run.
+                unsafe { od_code_cache_invalidate_range(space.cache as *mut c_void, CODE_BASE + 4 * at, 4) };
+                // And saved again as it runs, as omni-linux re-saves a process's snapshot.
+                if saves < started.elapsed().as_millis() / 700 {
+                    saves += 1;
+                    // SAFETY: a live cache; a save takes the cache's lock, as the game's do.
+                    unsafe { od_code_cache_save_snapshot(space.cache as *mut c_void, again.as_ptr(), key.as_ptr(), u64::MAX, 0) };
+                }
+                std::thread::sleep(Duration::from_micros(300));
+            }
+            (evicted, forgotten)
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(std::env::var("OD_STRESS_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(20));
+    let mut passes = 0;
+    while Instant::now() < deadline {
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let space = Arc::clone(&space);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let vm = space.vm(i, true);
+                    vm.start(u64::MAX >> 2);
+                    barrier.wait();
+                    // Every retirement halts every jit: many rounds.
+                    assert_eq!(vm.run_to_completion(1 << 20) & HALT_DONE, HALT_DONE);
+                    vm.reg(0)
+                })
+            })
+            .collect();
+        for (i, h) in handles.into_iter().enumerate() {
+            assert_eq!(h.join().expect("guest thread"), count, "pass {passes}, jit {i}");
+        }
+        passes += 1;
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (evicted, forgotten) = evictor.join().expect("evictor");
+    let _ = std::fs::remove_file(format!("{}.again", path.display()));
+    let stats = space.stats();
+    println!("{passes} passes; {evicted} regions evicted, {forgotten} forgotten; {stats:?}");
+    assert!(passes >= 2 && evicted >= 2, "{passes} {evicted}");
 }
