@@ -417,6 +417,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_screen_shows_the_panels_the_log_and_the_prompt() {
+        let mut config = omni_pool::Config::default();
+        config.warm_on_start = false;
+        let pool = Pool::start(config, None, std::path::PathBuf::from("omnidroid"));
+        pool.say("hello from the pool");
+        let mut app = App::new(Arc::clone(&pool), None);
+        app.input = "run x.apk".into();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
+        let (devices, instances) = pool.snapshot();
+        terminal.draw(|f| app.draw(f, &devices, &instances)).unwrap();
+        let screen: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
+        for want in [" Omnidroid ", "Androids", "Instances", "Log", "hello from the pool", "> run x.apk", "MCP off"] {
+            assert!(screen.contains(want), "{want:?} not on the screen");
+        }
+        app.execute("set keep_warm 2", &instances);
+        assert_eq!(pool.config().keep_warm, 2);
+        app.execute("nonsense", &instances);
+        assert!(pool.log().last().unwrap().contains("unknown command"));
+        pool.shutdown(false);
+    }
+
+    #[test]
     fn durations_read_short() {
         assert_eq!(ago(Duration::from_secs(12)), "12s");
         assert_eq!(ago(Duration::from_secs(185)), "3m05s");

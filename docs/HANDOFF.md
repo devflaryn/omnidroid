@@ -1,5 +1,51 @@
 # Handoff
 
+## THE OMNIDROID APP: A POOL OF WARM ANDROIDS, ANY APK, MANY INSTANCES (2026-10-10, macOS M1; branch `omnidroid-app`, **not merged, not pushed**)
+
+Goal (owner): a full CLI app instead of one-shot commands; it warms an Android on open, puts each
+launch where the rules say, runs the same APK many times on one Android, gives every instance a
+window titled "Omnidroid" of its own (independently resizable), closes idle Androids, and serves
+MCP (off by default) so coding agents drive it. Keep Windows/Linux/x86/ARM; no macOS- or
+ARM-specific code. Roblox not tested (the owner's WARP was off): TalkingTomCamp, Super Mechs, and a
+re-signed TalkingTom (same package and version, other bytes and key) as "build B".
+
+**What is there** (commits on the branch, oldest first: any-APK launcher, device displays, omni-pool,
+MCP HTTP, the app, pool fixes):
+- `omnidroid` opens a ratatui/crossterm TUI (`crates/omnidroid/src/app/`); `omnidroid serve` is it
+  without the screen. The one-shot commands stay (`omnidroid help commands`).
+- `crates/omni-pool`: placement by the APK's SHA-256 (`plan.rs`, unit tests for every rule incl. 3xA +
+  5xB = 2 Androids), idle close (`idle_close_minutes` 5, `keep_warm` 1 counted over all Androids),
+  settings in `<app-data>/../app.conf`, adoption of the app's Androids after a crash (`<dir>.pool`).
+- Device (`omni-linux`): `OMNI_MULTI_DISPLAY=1` gives each composer display a port and an EDID,
+  which lifts SurfaceFlinger's two-display ceiling (4+ displays seen); the control channel's
+  `#host display add|remove|bind|list` (`displays.rs`) adds displays at runtime, each a window
+  ("Omnidroid") opened on its first frame, resized on its own, its pointer injected to its own
+  Android display; `OMNI_PRIMARY_WINDOW=0` hides display 0's window.
+- An instance = an added display + an Android user of its own started visible on it
+  (`fw.visible_bg_users=1`, `am start-user --display`), never user 0 (Android counts user 0 visible
+  on display 0 only and moved Super Mechs' sign-in Activity there). Android 15 keeps a new external
+  display disabled: `cmd display enable-display <id>`.
+- MCP: `omni-mcp` HTTP transport (127.0.0.1, `POST /mcp`, foreign Origins refused), `omni-mcp
+  --connect <url>` (stdio bridge), `Server::with_live` (the app's pool tools beside the lab's).
+  `mcp on` in the app serves and registers (Claude Code `--transport http`, pi's omni-agent.json).
+
+**Fixed on the way:** `madvise(len 0)` answered EINVAL and AppSearch aborted system_server when a
+user stopped (Linux returns 0); pool devices boot with `OMNI_HW_TIMEOUT_MULTIPLIER=5` (app starts
+were ANR-killed while a second Android booted) and `OMNI_APP_SPARE=0` (a startup broadcast reaching
+the spare process before bindApplication crashed Super Mechs -- **the spare's race itself is not
+fixed**, `zygote.rs` holds the owner's uncommitted edits).
+
+**Measured (M1, n=1 each):** warm Android ready in 60-110 s from the saved base (first `-md` base
+~2.5 min); TalkingTom x3 + Super Mechs on one Android (users 10-13, displays 2-5), all running;
+build B on its own second Android; a window's close marker closed its instance and removed the
+display; with `idle_close_minutes=1` the idle second Android closed and the first stayed.
+
+**Not done / open:** Windows and Linux not run (omni-pool `cargo check`s for both; the rest needs
+dynarmic's C++ cross build); per-display input was wired (injected pointer per window, shared
+keyboard) but not exercised by hand -- MCP `input` (`input -d`) was; plugins' session hooks
+(cookie, link) do not apply to pool launches; Roblox untested on the pool.
+
+
 ## PS99 AT 60 FPS, HALF THE CPU, LIGHTER (2026-10-08/09, ~20 h, Windows; branch `perf/ps99-60fps`, **merged into `main` and pushed** 2026-10-09 at 28b6eee)
 
 Goal (owner): PS99 fully loaded toward 60 fps, CPU and RAM well below, no feature removed. Morning

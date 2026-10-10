@@ -8,6 +8,36 @@ inputs, and dump a decrypted/unpacked `.so` out of guest memory. Because the gue
 regardless of the host CPU, every debug tool behaves identically on Windows, Linux and macOS, needs
 no `ptrace`, and is invisible to the target.
 
+## In the omnidroid app (the way agents use it now)
+
+The omnidroid app (`omnidroid`, `README.md`) serves this server itself, **over HTTP on
+127.0.0.1** -- off by default; `mcp on` in the app turns it on (from then on at every start), and
+registers it:
+
+```
+claude mcp add --transport http --scope user omnidroid http://127.0.0.1:7457/mcp   # what `mcp register` runs
+omni-mcp --connect http://127.0.0.1:7457/mcp     # the stdio bridge, for an agent that starts MCP servers as programs
+```
+
+Every agent then drives the same pool of warm Androids. The app's own tools (`crates/omnidroid/src/app/live.rs`):
+
+| tool | does |
+|---|---|
+| `start_instance {apk, count?}` | launch any APK (a host path) as `count` instances; answers their ids at once |
+| `wait_instance {instance_id, timeout?}` | until it runs (its Activity displayed) or ends |
+| `list_instances` | id, package, Android, user, display, state, screenshot path |
+| `stop_instance {instance_id}` | close it (app stopped, window gone) |
+| `screenshot {instance_id}` | its display's PNG (written every second): path, width, height |
+| `input {instance_id, action, ...}` | `tap x y`, `swipe x y x2 y2 ms`, `text`, `key` on its display |
+| `shell {command, device?, uid?}` | a shell command on an Android |
+| `list_devices` / `warm_device` / `stop_device {device}` | the Androids |
+| `settings {key?, value?}` / `pool_log {lines?}` | the app's settings and log |
+
+The lab's tools below (`lab_load`, `call_function`, `intercept`, `dump_module`, ...) are served
+beside them. HTTP is the specification's Streamable HTTP without events: `POST /mcp`, a
+notification answered `202`, a request from a page of another site refused. The rest of this file
+is the standalone stdio server, which still works on its own.
+
 ## Build
 
 ```
