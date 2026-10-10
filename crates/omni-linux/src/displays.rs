@@ -11,6 +11,7 @@
 //! | `display add <w>x<h>` | the composer's id of the new display |
 //! | `display remove <id>` | -- (its window closes) |
 //! | `display bind <id> <android id>` | -- (the window's pointer goes to that Android display) |
+//! | `display size <id> <w>x<h>` | its size now, as a window resized to it would make it |
 //! | `display list` | a line `<id> <w>x<h> <android id>` per display beyond display 0 |
 //!
 //! Android gives the display an id of its own; a host finds it by the display's name
@@ -177,8 +178,13 @@ impl Displays {
                 (Ok(id), Ok(android)) => self.bind(id, android).map(|()| String::new()),
                 _ => Err(format!("not ids: {id} {android}")),
             },
+            ["display", "size", id, wh] => match (id.parse::<i64>(), size(wh)) {
+                (Ok(id), Some((w, h))) if self.extra.lock().contains_key(&id) => self.composer.set_display_size_of(id, w, h).map(|(w, h)| format!("{w}x{h}\n")),
+                (Ok(id), Some(_)) => Err(format!("no display {id} was added")),
+                _ => Err(format!("not <id> <w>x<h>: {id} {wh}")),
+            },
             ["display", "list"] => Ok(self.list()),
-            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | list)")),
+            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | size <id> <w>x<h> | list)")),
         };
         match answer {
             Ok(out) => (0, out),

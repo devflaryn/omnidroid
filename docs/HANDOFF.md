@@ -35,6 +35,22 @@ were ANR-killed while a second Android booted) and `OMNI_APP_SPARE=0` (a startup
 the spare process before bindApplication crashed Super Mechs -- **the spare's race itself is not
 fixed**, `zygote.rs` holds the owner's uncommitted edits).
 
+**Two apps on one Android, both live (2026-10-11):** the owner saw only the window clicked last
+draw; the others froze until clicked. Android gives window focus to one display (the touched one)
+unless `config_perDisplayFocusEnabled`; games stop drawing without it (TalkingTom: 1 distinct frame
+in 5 s once another display took focus). The device overlay now sets it (`device/src/overlay`,
+`build.sh` runs on macOS/Linux too; `FRAMEWORK=<framework-res.apk>` links against the device's own).
+After: TalkingTom 8/8 frames with Super Mechs focused and the reverse. Boots from a base saved
+before still get it (the overlay is read at boot). Found next: **a display resize hung TalkingTom**
+(ANR, 0% CPU): SDL closed its audio on the Activity restart and joined an audio thread blocked in
+`AudioTrack` for ever -- audioserver had never written a frame, because libfmq's event flag
+(`FUTEX_WAIT_BITSET`, not private, shared memory) is woken by the audio HAL's process and futex
+queues are per process. A non-private futex wait now looks at its word again (0.25 ms doubling to
+20 ms; `sys.rs` `futex_wait`, `tests/futex.rs`): mixer 48 kHz, resizes 1280x720 <-> 1600x900 with
+TalkingTom answering taps, 0 ANRs. `#host display size <id> <w>x<h>` resizes a display as its window
+would. Open: a Retina window can report its size in pixels a while after opening (2560x1440 for a
+1280x720-point window) and so resize its display to 1600x900 once, unasked.
+
 **Measured (M1, n=1 each):** warm Android ready in 60-110 s from the saved base (first `-md` base
 ~2.5 min); TalkingTom x3 + Super Mechs on one Android (users 10-13, displays 2-5), all running;
 build B on its own second Android; a window's close marker closed its instance and removed the
