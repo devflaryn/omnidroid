@@ -332,3 +332,14 @@ and the JIT patches stay).
 old build's 9.9 s before system_server (s11: boot commands 7.6 s, class_start 2.3 s sequential), the
 rest went to class_start side by side (-2.2 s), `exec_start`s ~175 -> ~100 ms each (-0.8 s), and
 init's waits (apexd's activation is guest code: decompressing the APEXes), with the cheaper JIT.
+
+## Session s15 (06:55-07:30): the idle apps left out of the image, on four E-cores (`s15-idleout-e4.csv`)
+
+| arm (`F0000`) | fps | top ms | all ms | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|
+| default (disabled after boot) | 30.59 / 28.49 | 19.85 / 20.92 | 49.18 / 51.59 | 9.4 / 9.6 | 44.5 / 45.5 | 95.6 / 95.3 | 110.8 / 107.6 | 151.4 / 144.9 |
+| `OMNI_DEVICE_IDLE_APPS=out` | 30.18 / 29.06 | 20.61 / 21.01 | 50.23 / 50.25 | 9.5 / 10.7 | 48.1 / 45.5 | 96.4 / 95.7 | 112.7 / 109.9 | 148.2 / 151.3 |
+
+**No gain even on four cores** (the three apps it removes of the ~14 that start are small next to
+the rest); the default stays. On this build four E-cores reach the world at **145-151 s** (s8's
+older build: 179-181 s) and play at 28.5-30.6 fps.
