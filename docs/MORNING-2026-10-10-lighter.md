@@ -39,11 +39,6 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    new guest-visible differential (every register after every block, ~385k block runs over five
    libraries including libroblox: identical on and off; it caught a wrong first version of 0081).
    In-world A/B queued (s11).
-5. **Measurement**: the harness simulates weaker PCs (`-Affinity`), refuses to run without the
-   network bypass (a run without WARP looked exactly like Delta's 20 s crash), times boot milestones
-   from the log's own clock, and records available memory and the compressed store;
-   `OMNI_JIT_TIME`, `[boot-ms]`, `[init] exec_start ... in N ms`.
-
 5. **RAM: most of what omnidroid held resident was cold** -- two minutes after a working-set trim
    the system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of
    ~150. Now every host process trims its working set every 120 s, and an idle one after 30 s:
@@ -52,6 +47,11 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    pacing unchanged (s10). `OMNI_WS_TRIM=0` / `OMNI_WS_TRIM_IDLE=0` turn them off.
 6. **Boot: init's services started side by side** (2.37 -> 0.42 s): system_server -1.1..-1.9 s,
    boot_completed -1 s (s10). `OMNI_INIT_PARALLEL=0` is the old order.
+7. **Measurement**: the harness simulates weaker PCs (`-Affinity`), refuses to run without the
+   network bypass (a run without WARP looked exactly like Delta's 20 s crash), times boot milestones
+   from the log's own clock, and records available memory and the compressed store;
+   `OMNI_JIT_TIME`, `[boot-ms]`, `[init] exec_start ... in N ms`.
+
 
 ## Found, being measured
 
