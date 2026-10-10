@@ -428,3 +428,43 @@ where the game's time goes. **Stays opt-in.**
   `mm::tail_backing`, `OMNI_SHARED_TAIL=0` the old way). A new fixture (`sharedtail`) holds its writes
   across the growth, a fork, an in-page offset and a fixed address -- and with the old anonymous tail
   **a forked child's writes never reached the parent**, which the new one fixes. s27 measures it.
+
+## Session s26 (09:05-09:24): s17's crash again, with the crash report (`s26-crash-e4.csv`, s22's build)
+
+| arm | status | fps | CPU ms/frame | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|
+| fill (full CPU, `OMNI_JIT_SNAPSHOT_MAX_MB=512`) | ok | 59.38 | 38.84 | 4.0 | 20.9 | 46.6 | 58.6 | 73.6 |
+| e4snap (`F0000`) | **game's host died** | -- | | | | | | (measuring window) |
+| e4snap | ok | 34.44 | 47.91 | 6.2 | 32.8 | 75.3 | 86.3 | **115.4** |
+
+The first restore on four E-cores lost the game's host again: `[zygote] pid 307000 ended:
+ExitStatus(3221225477)` (0xC0000005), ~240 s into the game, **and no `[host-crash]` line** -- the
+top-level filter never ran (replaced by a library, or the process ended first). Three of the four
+snapshot runs on four E-cores have now crashed (s17 2/2, s26 1/2); none without snapshots (6/6). The
+next build reports the first access violations the vectored handler itself declines (a885e8c);
+s28 runs it twice more. The run that lived shows what is at stake on a weak PC: **the world in 115.4
+s against 140.4/140.7 without snapshots (s17), sign-in 75 against 94-96 s**, and 34.4 fps against
+30.5-31.3.
+
+## Session s27 (09:24-09:52): the pool's tail as a file -- confounded; the host's throttling found
+
+| arm | fps | CPU ms/frame | game commit GB | system_server | boot_completed | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| tail | 31.27 | 64.29 | 2.523 | 5.2 | 31.3 | 71.1 | 116.2 |
+| anon (`OMNI_SHARED_TAIL=0`) | 31.12 | 63.41 | 2.559 | 3.1 | 29.7 | 70.5 | 109.6 |
+
+Both arms ran at half speed, unlike every run before 09:25: zygote's preload 1.41 -> 2.35-2.50 s,
+the system host's JIT 4.9 + 12.1 -> 7.6 + 17.5 s for the same blocks. The host was not busy (5%
+load, turbo at 189-214%, High performance plan) -- **the load sat on the i7's eight E-cores (logical
+CPUs 16-23 at 38-62%) with its P-cores idle**: Windows took the hidden runs' processes, with no
+foreground window, for background work (from ~09:25, after a change on the host: the owner's
+Parsec/MuMu session, presumably). Opting the running game's processes out of execution-speed
+throttling (`SetProcessInformation(ProcessPowerThrottling)`, high QoS; a scratch script) moved the
+load to the P-cores and the game to **60 fps within a minute** (58.1, 59.9, 60.1).
+
+So every host process now opts out at start (`omni_platform::process::prefer_speed`, 85fd4f0;
+`OMNI_HIGH_QOS=0` leaves it to the host). This is not only the benchmark's: a session behind another
+window, a standby, a headless instance on a hybrid CPU were all exposed to it. s27's pair says only
+that the tail costs nothing measurable (31.3 vs 31.1 fps); the game's commit fell 36 MB, not the
+~570 MB hoped for -- so the pool is not mapped the way inferred (no `[mm] shared` line came: no one
+shared mapping ran 16 MiB past its file). s29 repeats the A/B on high QoS.

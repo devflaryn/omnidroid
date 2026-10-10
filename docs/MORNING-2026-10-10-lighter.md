@@ -25,6 +25,12 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 
 ## What changed (each measured; numbers in the ledger)
 
+0. **omnidroid no longer slows to half speed when its window is not in front** (85fd4f0). From
+   ~09:25 Windows put every hidden run's processes on the i7's E-cores, P-cores idle: 31 fps, 64 ms
+   of CPU a frame, boot_completed 21 -> 30 s, the world 72 -> 110-116 s (s27). Opting the running
+   game out of power throttling (high QoS) brought it to **60 fps within a minute**. Every host
+   process now does that at start; any hybrid CPU (Intel 12th gen on) behind another window, a
+   standby, a headless instance was exposed to it. `OMNI_HIGH_QOS=0` leaves it to Windows.
 1. **One sysroot per host process** (5f524ca). Every spawn, and every `setprop` and `wait_for_prop`
    init ran, opened the AOSP image again: hashed its 0.9 MB manifest and meta, looked at ~5,000
    files, built its maps (535 times a session; 62 copies of the maps kept in the system host).
