@@ -71,6 +71,7 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 15 | dynarmic **0084**: Xbyak writes a byte in place, grows out of line | `the_speed_of_emission`, now `OD_PROD=1` (the device's switches), byte-identical | emit **11.06 -> 10.51 us/block (-5%)**, 3/3 | yes |
 | 16 | dynarmic **0086**: `Inst::GetArg` inline; `SetArg`'s type check with `OMNI_JIT_VERIFY=1` | same | frontend **4.80 -> 4.62 (-4%)**, emit **10.54 -> 10.26 (-3%)**, 4/4 | yes |
 | 17 | dynarmic **0087**: opcode return types and the passes' predicates from tables | same | frontend **4.61 -> 4.28 (-7%)**, emit **10.26 -> 10.02 (-2%)**, 4/4 | yes |
+| 18 | dynarmic **0081-0083** together (get/set across a width change, spills to free callee-saved registers, zero-extension aliasing), on by default since s10's build | s11 `s11-codegen.csv`, ABBA at full CPU and on 8 E-cores (`FF0000`); `cg0` = `OMNI_JIT_GETSET_WIDTH=0 OMNI_JIT_SPILL_REGS=0 OMNI_JIT_ZEXT_TRUST=0` | **8 E-cores: all threads 59.07/60.00 -> 53.10/52.89 ms/frame (-11%, 2/2)**, top thread 23.16/22.75 -> 21.33/22.58, fps 28.60/29.70 vs 31.65/28.74 (mixed); full CPU: all 42.98/39.50 -> 41.52/39.49, fps 59.4 both | **yes, default** |
 | - | (0085) the allocator's per-block state kept per thread; (0088) `SelectARegister`'s partitions replayed over bitmasks (same choice) | same | 10.61 -> 10.52 (noise); 10.12 -> 10.47 (**+3.5%**, slower) | no, dropped |
 
 **Why the in-world worker got cheaper with faster translation:** the game keeps translating in the
