@@ -795,7 +795,18 @@ impl Process {
 
     /// The program as user `uid`, as init starts a daemon (`user system` is 1000).
     pub fn spawn_as(config: SpawnConfig, uid: u32) -> Result<Arc<Self>, String> {
+        // `OMNI_SPAWN_TIME=1`: each phase of a spawn, in milliseconds (`[spawn] <program>: ...`).
+        let timed = std::env::var("OMNI_SPAWN_TIME").as_deref() == Ok("1");
+        let mut lap_at = std::time::Instant::now();
+        let mut laps: Vec<(&str, u128)> = Vec::new();
+        let mut lap = |what: &'static str| {
+            if timed {
+                laps.push((what, lap_at.elapsed().as_micros()));
+                lap_at = std::time::Instant::now();
+            }
+        };
         let sysroot = Sysroot::open(&config.sysroot)?;
+        lap("sysroot");
         let exe = config.argv.first().ok_or("no program: argv is empty")?.clone();
         // The instance's writable state: what a device keeps on its data partition and tmpfs, and
         // `/linkerconfig`, which `linkerconfig` writes at boot for `linker64` to read (sub-project B).
@@ -809,7 +820,9 @@ impl Process {
             writable.push((format!("/{dir}").into_bytes(), host));
         }
         // What init.rc makes before any service runs: its `mkdir`s on the writable mounts.
+        lap("dirs");
         crate::boot::make_init_dirs(&sysroot, &config.instance_dir);
+        lap("init dirs");
         // Decided once, from the host-only profile and the app's package: a hidden (DenyList)
         // process gets no root layer (no su, no modules) and `omni_root` answers ENOSYS.
         let package = crate::root::package_of(&config.argv);
@@ -817,15 +830,27 @@ impl Process {
         // This host process's property service is built here, with the real view, before `assemble`
         // reads it: the first builder of the per-host-process singleton wins the OnceLock.
         crate::props::PropertyService::global_with_view(&sysroot, &view);
+        lap("root view, properties");
         let vfs = Vfs::new(sysroot, writable, exe.clone()).with_binds(crate::vfs::Binds::of(&config.instance_dir))
             .with_owners(crate::owners::Owners::of(&config.instance_dir))
             .with_root_layer(if view.hidden { None } else { crate::root::Layer::of(&config.instance_dir) });
+        lap("vfs, binds, owners");
         let snapshot_key = crate::jit_snapshot::dir().map(|_| crate::jit_snapshot::key(&exe, &config.argv));
         let space = Arc::new(reserve_space_for(snapshot_key.as_deref()).map_err(|e| format!("reserve the guest address space: {e}"))?);
+        lap("guest space");
         let backend = DynarmicBackend::new(Arc::clone(&space), Self::cpu_options()).map_err(|e| format!("the CPU backend: {e}"))?;
+        lap("cpu backend");
         let p = Self::assemble(space, vfs, config.argv.clone(), config.stdout, config.stderr, config.trace, Some(Arc::new(backend)), 0, uid, view);
+        lap("assemble");
         crate::jit_snapshot::attach(&p, &exe, &config.argv);
+        lap("snapshot");
         p.load(&exe, &config.argv, &config.envp)?;
+        lap("load");
+        if timed {
+            let total: u128 = laps.iter().map(|(_, us)| us).sum();
+            let parts: Vec<String> = laps.iter().map(|(w, us)| format!("{w} {:.1}", *us as f64 / 1000.0)).collect();
+            eprintln!("[spawn] {}: {:.1} ms ({})", String::from_utf8_lossy(&exe), total as f64 / 1000.0, parts.join(", "));
+        }
         Ok(p)
     }
 
