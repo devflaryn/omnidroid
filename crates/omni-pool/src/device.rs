@@ -3,10 +3,11 @@
 //! runs where.
 //!
 //! **An instance is a display and a user.** Its display is added for it (`#host display add`,
-//! `omni_linux::displays`: a window titled "Omnidroid" of its own) and enabled; its app runs as
-//! user 0 when no instance of the package runs as user 0 on that device, else as a user of its own
-//! -- a visible background user, started on that display (`fw.visible_bg_users`), the package
-//! installed for it (`pm install-existing`). Closing it stops that user and removes the display.
+//! `omni_linux::displays`: a window titled "Omnidroid" of its own) and enabled; its app runs as a
+//! user of its own -- a visible background user, started on that display (`fw.visible_bg_users`),
+//! the package installed for it (`pm install-existing`) -- never as user 0, whom Android counts
+//! visible on display 0 alone. Closing it stops that user and removes the display; the user is
+//! kept for the next instance.
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

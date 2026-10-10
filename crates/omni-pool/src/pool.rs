@@ -413,16 +413,15 @@ impl Pool {
                 Err(e) => return self.end(id, &format!("install: {e}")),
             }
         }
-        // Its user: 0 unless an instance of the package runs as 0 there, else a user of its own.
+        // Its user: one of its own, never user 0. With users visible on displays of their own,
+        // Android counts user 0 visible on display 0 alone, and refuses an Activity the app itself
+        // starts on another display ("Not allow to launch ... on display 3": Super Mechs' sign-in,
+        // 2026-10-10) -- moving the app to display 0, which has no window. A user started on the
+        // instance's display is visible there, and the app's own Activities stay with it.
         let user = {
             let s = self.state.lock();
-            let taken: Vec<u32> = s.live(device_id).filter(|(other, _)| **other != id).filter_map(|(_, i)| i.user.filter(|u| *u == 0 && i.apk.package == apk.package).or(i.user.filter(|u| *u != 0))).collect();
-            let users = s.devices.get(&device_id).map(|d| d.users.clone()).unwrap_or_default();
-            if !taken.contains(&0) {
-                Some(0)
-            } else {
-                users.into_iter().find(|u| !taken.contains(u))
-            }
+            let taken: Vec<u32> = s.live(device_id).filter(|(other, _)| **other != id).filter_map(|(_, i)| i.user).collect();
+            s.devices.get(&device_id).and_then(|d| d.users.iter().copied().find(|u| !taken.contains(u)))
         };
         let user = match user {
             Some(u) => u,
@@ -712,11 +711,46 @@ impl Pool {
             let pool = Arc::clone(self);
             let _ = std::thread::spawn(move || pool.kill(id));
         }
+        // A user made ahead on each ready device that has none free (~10-15 s off the next launch).
+        if n % 5 == 0 {
+            self.spare_users();
+        }
         if config.warm_on_start {
             for _ in 0..plan::to_warm(&views, config.keep_warm, config.max_devices) {
                 let id = self.warm();
                 self.say(format!("device D{id}: warming one, so the next launch starts at once"));
             }
+        }
+    }
+
+    /// One free user ahead on each ready device that has none, made off the launch path.
+    fn spare_users(self: &Arc<Self>) {
+        let wanted: Vec<(DeviceId, Device, Arc<Mutex<()>>)> = {
+            let s = self.state.lock();
+            s.devices
+                .iter()
+                .filter(|(_, d)| d.state == DeviceState::Ready)
+                .filter(|(id, d)| {
+                    let taken: Vec<u32> = s.live(**id).filter_map(|(_, i)| i.user).collect();
+                    !d.users.iter().any(|u| !taken.contains(u))
+                })
+                .map(|(id, d)| (*id, d.device(), Arc::clone(&d.busy)))
+                .collect()
+        };
+        for (id, dev, busy) in wanted {
+            let pool = Arc::clone(self);
+            let _ = std::thread::spawn(move || {
+                // Never beside a launch on the device: it waits its turn, and skips if one came.
+                let Some(_turn) = busy.try_lock() else { return };
+                if let Ok(u) = device::create_user(&dev) {
+                    if let Some(d) = pool.state.lock().devices.get_mut(&id) {
+                        if !d.users.contains(&u) {
+                            d.users.push(u);
+                        }
+                    }
+                    pool.say(format!("D{id}: user {u} made ahead for the next launch"));
+                }
+            });
         }
     }
 
