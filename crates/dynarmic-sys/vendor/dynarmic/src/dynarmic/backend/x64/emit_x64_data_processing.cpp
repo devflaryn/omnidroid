@@ -4,6 +4,7 @@
  */
 
 #include <cstddef>
+#include <cstdlib>
 #include <type_traits>
 
 #include <mcl/assert.hpp>
@@ -1488,8 +1489,47 @@ void EmitX64::EmitSignExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
     ctx.reg_alloc.DefineValue(inst, result);
 }
 
+namespace {
+/// Omnidroid patch 0083: `OMNI_JIT_ZEXT_TRUST=0` zero-extends every time, as before.
+bool TrustZeroExtension() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_ZEXT_TRUST");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
+/// Patch 0083: whether `value`'s instruction leaves its whole 64-bit host register zero above its
+/// low `bits`. A guest load of 8/16/32 bits does on every path (`movzx r32`/`mov r32` on the fast
+/// path; `ZeroExtendFrom` in the fallback thunks and after a callback), and so does a zero extension
+/// to a word (`movzx r32`, or this patch's alias of one of those). Anything else -- a U32 that is the
+/// low half of a 64-bit register (`LeastSignificantWord`), arithmetic -- is not trusted.
+bool ZeroAbove(const IR::Value& value, std::size_t bits) {
+    if (value.IsImmediate()) {
+        return false;
+    }
+    switch (value.GetInst()->GetOpcode()) {
+    case IR::Opcode::A64ReadMemory8:
+    case IR::Opcode::ZeroExtendByteToWord:
+        return bits >= 8;
+    case IR::Opcode::A64ReadMemory16:
+    case IR::Opcode::ZeroExtendHalfToWord:
+        return bits >= 16;
+    case IR::Opcode::A64ReadMemory32:
+        return bits >= 32;
+    default:
+        return false;
+    }
+}
+}  // namespace
+
 void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    // Patch 0083: already zero above its byte (a guest byte load): the same register, no code.
+    if (TrustZeroExtension() && args[0].IsInGpr() && ZeroAbove(inst->GetArg(0), 8)) {
+        ctx.reg_alloc.DefineValue(inst, args[0]);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
     code.movzx(result.cvt32(), result.cvt8());
     ctx.reg_alloc.DefineValue(inst, result);
@@ -1497,6 +1537,10 @@ void EmitX64::EmitZeroExtendByteToWord(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitZeroExtendHalfToWord(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    if (TrustZeroExtension() && args[0].IsInGpr() && ZeroAbove(inst->GetArg(0), 16)) {  // patch 0083
+        ctx.reg_alloc.DefineValue(inst, args[0]);
+        return;
+    }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);
     code.movzx(result.cvt32(), result.cvt16());
     ctx.reg_alloc.DefineValue(inst, result);
@@ -1522,6 +1566,10 @@ void EmitX64::EmitZeroExtendWordToLong(EmitContext& ctx, IR::Inst* inst) {
         const Xbyak::Xmm result = ctx.reg_alloc.ScratchXmm();
         code.insertps(result, source, 0b00'00'1110);
         ctx.reg_alloc.DefineValue(inst, result);
+        return;
+    }
+    if (TrustZeroExtension() && args[0].IsInGpr() && ZeroAbove(inst->GetArg(0), 32)) {  // patch 0083
+        ctx.reg_alloc.DefineValue(inst, args[0]);
         return;
     }
     const Xbyak::Reg64 result = ctx.reg_alloc.UseScratchGpr(args[0]);

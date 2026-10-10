@@ -69,6 +69,7 @@ dynarmic/
                and ../patches/0080-x64-a-value-s-host-location-found-without-a-search.patch
                and ../patches/0081-ir-get-set-forwarded-across-a-width-change.patch
                and ../patches/0082-x64-a-spilled-value-goes-to-a-free-callee-saved-register.patch
+               and ../patches/0083-x64-zero-extensions-of-zero-extended-loads-aliased.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

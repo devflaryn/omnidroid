@@ -860,3 +860,19 @@ MEASURED (i5-4460): code -1% (libc 391.5 -> 387.7 B/block, libart 467.7 -> 464.4
 emit 12.04 -> 12.24 us/block (within noise). Guest-visible differential (`tests/differential.rs`, five
 libraries with libroblox, ~385k block runs): identical hashes on and off. dynarmic-sys suite: as
 before.
+
+### 0083 — x64: a zero extension of a value already zero-extended is the same register (`OMNI_JIT_ZEXT_TRUST`, on unless `0`)
+
+x64. `ZeroExtendByteToWord`/`HalfToWord`/`WordToLong` (and `...ToLong` through them) always
+emitted `movzx`/`mov r32, r32`, because a U8/U16/U32 value in a host register may in general carry
+garbage above its width. A guest load does not: `A64ReadMemory8/16/32` leave the whole register
+zero above their width on every path (`movzx r32`/`mov r32` on the fast path, plain since 0029 for
+ordered loads too; `ZeroExtendFrom` in the fallback thunks, 0078's included, and after a callback),
+and so does a zero extension to a word. When the argument is such a value in a GPR, the result is
+defined in the same register, with no code. Every register move keeps the property (`mov r32`
+between GPRs and from a spill slot; a location holding the aliased 64-bit value moves 64 bits).
+
+With 0081, Luau's dispatch is now `movzx eax, byte [..]; ...; shl rax, 3; lea; mov rax, [..]`: the
+`movzx eax, al` and `mov eax, eax` after the load are gone from the chain (they were two of its
+cycles, next to the store-and-reload 0081 removed). Code -0.2..-0.3% (libc 387.7 -> 386.8
+B/block); first translation within noise. Guest-visible differential: identical on and off.
