@@ -148,3 +148,27 @@ fn an_interrupt_ends_a_wait_with_eintr() {
     p.futexes.interrupt_all();
     assert_eq!(w.join().unwrap(), -(EINTR.0 as i64));
 }
+
+/// A futex another process may wake (no `FUTEX_PRIVATE_FLAG`): that process's wake never reaches
+/// this one's queue, so a store to the word ends the wait as the wake would have (libfmq's event
+/// flag between audioserver and the audio HAL). A private one sleeps on until a wake here.
+#[test]
+fn a_shared_wait_ends_on_a_store_without_a_wake_and_a_private_one_does_not() {
+    let (p, s) = process();
+    p.mem.write_u32(s, 0).unwrap();
+    let shared = waiter(&p, 2001, [s, WAIT_BITSET, 0, 0, 0, u64::from(u32::MAX)]);
+    until("the shared waiter", || p.futexes.waiters(s) == 1);
+    let stored = Instant::now();
+    p.mem.write_u32(s, 1).unwrap();
+    assert_eq!(shared.join().unwrap(), 0, "as woken");
+    assert!(stored.elapsed() < Duration::from_millis(500), "seen at its next look: {:?}", stored.elapsed());
+
+    let t = s + 64;
+    p.mem.write_u64(t, 0).unwrap();
+    p.mem.write_u64(t + 8, 300_000_000).unwrap();
+    p.mem.write_u32(s, 0).unwrap();
+    let private = waiter(&p, 2002, [s, WAIT | PRIVATE, 0, t, 0, 0]);
+    until("the private waiter", || p.futexes.waiters(s) == 1);
+    p.mem.write_u32(s, 1).unwrap();
+    assert_eq!(private.join().unwrap(), ETIMEDOUT, "a store alone is no wake for a private futex");
+}

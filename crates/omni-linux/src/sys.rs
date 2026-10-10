@@ -844,6 +844,45 @@ fn sys_getrusage(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
+/// The longest a waiter on a shared futex sleeps before it looks at the word again.
+const SHARED_FUTEX_POLL_MAX: Duration = Duration::from_millis(20);
+
+/// **`FUTEX_WAIT`, and a wait on a futex another process may wake.** The queues are this
+/// process's ([`crate::futex`]), and every process is a host process of its own, so a wake from
+/// another process -- on a word in memory both map -- never reaches this one's queue. A futex
+/// without `FUTEX_PRIVATE_FLAG` is one Linux lets processes share (bionic flags every
+/// process-private one), so its wait looks at the word again every 0.25 ms, then less often up to
+/// [`SHARED_FUTEX_POLL_MAX`]: a store by the waker ends it as the wake would have (`0`; `EAGAIN`
+/// only when the word differed at the call), and a wait that outlives a wake anyway is one its
+/// caller already loops over, as a spurious one.
+///
+/// Without it audioserver's first write to the audio HAL waited for ever: libfmq's event flag
+/// (`FUTEX_WAIT_BITSET`, not private, in shared memory) was woken by the HAL's process, the mixer
+/// never wrote a frame, every app's `AudioTrack` filled and blocked, and an app that closed its
+/// audio -- SDL does on a restart, a display resize restarts the Activity -- hung joining that
+/// thread (Talking Tom Camp, 2026-10-11: an ANR after every resize).
+fn futex_wait(p: &Process, t: &mut Task, a: [u64; 6], bitset: u32, deadline: Option<Instant>) -> SysResult {
+    const PRIVATE: u64 = 128;
+    if a[1] & PRIVATE != 0 {
+        return p.futexes.wait(&p.mem, a[0], a[2] as u32, bitset, deadline, Some(signals(t)));
+    }
+    let (mut step, mut first) = (Duration::from_micros(250), true);
+    loop {
+        let look = Instant::now() + step;
+        let (until, last) = match deadline {
+            Some(d) if d <= look => (Some(d), true),
+            _ => (Some(look), false),
+        };
+        match p.futexes.wait(&p.mem, a[0], a[2] as u32, bitset, until, Some(signals(t))) {
+            Err(ETIMEDOUT) if !last => step = (step * 2).min(SHARED_FUTEX_POLL_MAX),
+            // The word changed while it slept: another process's store, and its wake.
+            Err(EAGAIN) if !first => return Ok(0),
+            other => return other,
+        }
+        first = false;
+    }
+}
+
 fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     const PRIVATE: u64 = 128;
     const CLOCK_REALTIME: u64 = 256;
@@ -852,7 +891,7 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         // FUTEX_WAIT: a relative timeout.
         0 => {
             let deadline = if a[3] == 0 { None } else { deadline_after(read_timespec(p, a[3])?) };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, all, deadline, Some(signals(t)))
+            futex_wait(p, t, a, all, deadline)
         }
         // FUTEX_WAIT_BITSET: an absolute timeout on CLOCK_MONOTONIC (or REALTIME with the flag).
         9 => {
@@ -863,7 +902,7 @@ fn sys_futex(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
                 let at = read_timespec(p, a[3])?;
                 deadline_after(at.saturating_sub(now(p, clock)?))
             };
-            p.futexes.wait(&p.mem, a[0], a[2] as u32, a[5] as u32, deadline, Some(signals(t)))
+            futex_wait(p, t, a, a[5] as u32, deadline)
         }
         1 => p.futexes.wake(a[0], a[2], all),
         10 => p.futexes.wake(a[0], a[2], a[5] as u32),
