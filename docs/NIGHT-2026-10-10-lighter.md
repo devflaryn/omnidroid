@@ -182,3 +182,17 @@ the app signed in at 122.1 s, its initialisation inside the injected worker's 20
 run had no network, so it never got that far either way). In-world fps on the E-cores moves with the
 live world as much as on the P-cores (29.9 on eight vs 32.9 on four, an hour apart): judging a lever
 there needs interleaved pairs, as everywhere.
+
+## Session s9 (03:3x-): snapshots with a 512 MiB live budget, one directory (`s9-snap512.csv`)
+
+Build d9fbf71 (+ the snapshot saved before a code trim). Every arm `OMNI_JIT_SHARED_CACHE_LIVE_MB=512`;
+`snap` adds snapshots (lazy, library zone, forget) in `C:\od-unified\jitsnap-s9-512`. What verifies now:
+
+| process | restored | verified | |
+|---|---|---|---|
+| the game | 1,340,969 | **435,302 (32%)** | was 16,628 of 682,955 (2.4%) at 256 MiB: the budget holds it now |
+| system_server | **495,587** | 65,817 (13%) | was 78,488: now saved before its trim; but most of it does not verify -- its code is mostly the framework's compiled `.odex`/`.oat`, which ART maps itself (not through `linker64`, so the library zone does not place it): next |
+| native daemons, helper apps | 18-166k each | ~99.9% | |
+
+First pair: `snap` boot_completed 27.5 s, DID_LOG_IN 53.2, onGameLoaded 81.6 vs `live` 29.6 / 57.9 / 85.9;
+private WS 3.163 vs 2.966 GB (+197 MB). Snapshots stay opt-in: -4..-10 s for +100..+200 MB.
