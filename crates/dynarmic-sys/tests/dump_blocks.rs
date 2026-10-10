@@ -44,6 +44,18 @@ fn dump_blocks() {
             ..VmOptions::default()
         },
     );
+    // `OD_PROD=1`: the live switches omni-linux sets by default (`process::scalar_fp_in_xmm_default`
+    // and omni-cpu's), so the code is what a device runs.
+    if std::env::var("OD_PROD").as_deref() == Ok("1") {
+        // SAFETY: process-wide switches, set before anything is translated.
+        unsafe {
+            od_set_fast_dispatch_inline(1);
+            od_set_scalar_fp_in_xmm(1);
+            od_set_compact_code(1);
+            od_set_tbi_unmasked(1);
+            od_set_precise_get_set(1);
+        }
+    }
     let mut sink = Box::new(Sink { out, n: 0 });
     let ctx: *mut Sink = &mut *sink;
     // SAFETY: the sink outlives the observer, removed below; one thread emits.
