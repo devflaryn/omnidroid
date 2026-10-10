@@ -63,13 +63,15 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   and a process re-saves only when 2% of its snapshot is new -- one fill run wrote 492 saves, 5.3 GB;
   both measured in s23). Small daemons verify 99.9%, apps 99.7%, the game 91%. One switch now:
   **`OMNI_JIT_SNAPSHOT=1`** (the temporary directory's `omni-jit-snapshot`, with lazy pages, the library
-  zone, forgetting and 512 MiB of live code by default). s17 measures them on 4 E-cores. **My recommendation: on by default** -- yours to weigh against the disk.
+  zone, forgetting and 512 MiB of live code by default). s17 measures them on 4 E-cores. **Not ready for a default: on four E-cores (s17) both snapshot runs crashed the game's host**
+  (an access violation while the cache retired regions; never without snapshots, 6 of 6; never at
+  full CPU). Being chased (s26, with the new `[host-crash]` report).
 - The idle apps left out of the image on 4 E-cores (s15), trimming once vs every 120 s (s18), the
   saved-device path you actually boot (s19), and who holds the system host's 13-16 MiB blocks (380
   MiB of its 1.03 GB commit; s20).
 
 ## For you to decide
 
-- Translation snapshots on by default (above).
+- Translation snapshots on by default -- once s17's crash on slow cores is fixed (above).
 - Saved devices by hard link instead of a ~780 MB copy per boot; ~3 GB of old `-gutted` saved
   devices in `%TEMP%\omni-golden` (yours to delete).

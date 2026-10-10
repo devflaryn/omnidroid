@@ -360,3 +360,21 @@ older build: 179-181 s) and play at 28.5-30.6 fps.
 cost" compared the restoring run with a filling one, both with snapshots and the 512 MiB live
 budget; against none, there is this cost (the live budget and the restored code read in by page
 until code aging trims it -- the game's commit fell 3.27 -> 2.71 GB in s12's restore once it did).
+
+## Session s17 (07:50-08:35): snapshots on four E-cores (`s17-snap-e4.csv`, the s13 build, s16's snapshots)
+
+| arm (`F0000`) | status | fps | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| e4snap | **crashed** | -- | | | 76.5 | 92.5 | **130.8**, then the game's host died at ~+265 s |
+| e4off | ok | 31.32 | | 45.7 | 94.2 | 109.5 | 140.4 |
+| e4off | ok | 30.53 | | 45.8 | 96.2 | 108.5 | 140.7 |
+| e4snap | **crashed** | -- | | | | | 134.1, then the game's host died seconds later |
+
+**Both snapshot runs on four E-cores ended in a crash of the game's host process** (exit
+`0xC0000005`, an access violation in host code; nothing logged), the first at the end of its
+code-aging pass, the second during the world's load -- each while the shared cache was retiring
+regions (66-79 retired). Runs without snapshots on four E-cores retire as many (88-92) and never
+crashed (6 of 6, s15 + s17); with snapshots at full CPU (s12, s16: 3 runs, 90-110 retired) none did.
+So: a snapshot-specific race that slow cores expose. **Snapshots are not to be made a default until
+it is found** (the recommendation in the morning report is withdrawn). The next build reports a
+host crash's instruction (`[host-crash]`, 2b34552); s26 reproduces it there.
