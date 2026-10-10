@@ -467,3 +467,27 @@ So every host process now opts out at start (`omni_platform::process::prefer_spe
 window, a standby, a headless instance on a hybrid CPU were all exposed to it. s27's pair says only
 that the tail costs nothing measurable (31.3 vs 31.1 fps); the game's commit fell 36 MB, not the
 ~570 MB hoped for: the 570 MiB is a mimalloc arena (above). Reverted.
+
+## Session s19 (09:52-10:18): the path the owner boots -- a saved device (`s19-saved.csv`, build 7c3be03 + high QoS)
+
+| arm | fps | CPU ms/frame | commit GB | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|
+| mk (found a device saved already: booted from it) | 59.20 | 38.27 | 3.786 | 3.0 | 17.5 | 32.5 | 36.5 | **48.9** |
+| saved | 59.54 | 39.71 | 3.748 | 3.0 | 17.5 | 34.1 | 38.2 | 52.8 |
+| saved | 59.36 | 41.05 | 3.723 | 3.1 | 17.8 | 33.1 | 37.2 | 52.5 |
+| saved | 59.32 | 39.34 | 3.787 | 3.1 | 17.7 | 33.2 | 37.2 | 49.5 |
+
+From a saved device the world is there in **49-53 s** (a new device: ~72 s), boot_completed 17.5 s
+(21). The copy of the 767 MiB device takes 0.88 s (four threads); apexd skips all 21 decompressions
+(the label kept by place, 43e0334). What a saved boot still did that it need not:
+
+- **installd relabelled every app's data, every boot**: `Detected label change from
+  u:object_r:unlabeled:s0 ... running recursive restorecon` for each app (Roblox's cache with it):
+  labels live in a host process's memory. AppDataPrepare 2.1 s of system_server's start. Now a
+  directory's label is kept in `<instance>/.omni-labels` (c871dae, `OMNI_KEEP_LABELS=0`); s31
+  measures it on a device saved anew.
+- **PackageManager parsed all 170 system packages again**: `Finished scanning system apps. Time:
+  1844 ms ... cached: 0`, though its parse cache was there (170 entries, rewritten each boot). `stat`
+  reported st_mtime 0 for every file, and PackageCacher keeps an entry only while the package is
+  older than it (0 < 0 is false). Image files now report 2009-01-01 and instance files the host's
+  time (f273e9e).
