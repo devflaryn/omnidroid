@@ -89,11 +89,11 @@ pub fn mounts(sysroot: &Sysroot) -> Vec<ApexMount> {
 /// the guest's own code, ~1.8 s of init's wait for `apexd.status` on the i7 (s13), more on a slower
 /// machine. What it writes is the capex's `original_apex` entry as it is; finding one already there
 /// that is that APEX (its key, version and root digest), it logs "Skipping decompression". Here each
-/// is taken out of its capex once into a host cache named by the capex's content (beside the
-/// temporary directory's `omni-apex-decompressed`), and linked -- or, where links are not possible,
-/// copied -- into the new instance, root's and read-only, as `apexd` leaves them. The cache's file
-/// is read-only too, so a link is never written through. One that `apexd` rejected would be
-/// decompressed by it as before.
+/// is taken out of its capex once into a host cache named by the capex's content (the temporary
+/// directory's `omni-apex-decompressed`) and copied into the new instance, root's -- a copy, not a
+/// link: an instance's files are its own to delete, and none can write the cache through it
+/// (~240 MB, a fraction of a second). One that `apexd` rejected would be decompressed by it as
+/// before.
 pub fn predecompress(sysroot: &Sysroot, instance: &std::path::Path, owners: &crate::owners::Owners) {
     if std::env::var("OMNI_APEX_PREDECOMPRESS").as_deref() == Ok("0") {
         return;
@@ -113,11 +113,6 @@ pub fn predecompress(sysroot: &Sysroot, instance: &std::path::Path, owners: &cra
                 let _ = std::fs::remove_file(&partial);
                 continue;
             }
-            if let Ok(meta) = std::fs::metadata(&partial) {
-                let mut perms = meta.permissions();
-                perms.set_readonly(true);
-                let _ = std::fs::set_permissions(&partial, perms);
-            }
             if std::fs::rename(&partial, &cached).is_err() {
                 let _ = std::fs::remove_file(&partial);  // another process made it first
             }
@@ -127,7 +122,8 @@ pub fn predecompress(sysroot: &Sysroot, instance: &std::path::Path, owners: &cra
             continue;
         }
         let _ = std::fs::create_dir_all(&dest_dir);
-        if std::fs::hard_link(&cached, &dest).is_err() && std::fs::copy(&cached, &dest).is_err() {
+        if std::fs::copy(&cached, &dest).is_err() {
+            let _ = std::fs::remove_file(&dest);
             continue;
         }
         owners.set(&dest, crate::owners::Owner { uid: 0, gid: 0, mode: 0o644 });
