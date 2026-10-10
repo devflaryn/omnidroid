@@ -320,6 +320,19 @@ impl Stat {
     }
 }
 
+/// **The modification time an image file or directory reports**: the one Android's build stamps on
+/// every file of a system image (2009-01-01 00:00 UTC), older than anything an instance writes. It
+/// was 0 for every file, the instance's too, and PackageManager's parse cache keeps an entry only
+/// while the package is older than it (`PackageCacher.isCacheUpToDate`: `st_mtime` of the package
+/// below the cache file's) -- 0 is not below 0, so every boot parsed all 170 system packages again
+/// (`Finished scanning system apps. Time: 1844 ms ... cached: 0`, a saved device, s19).
+pub const IMAGE_MTIME: i64 = 1_230_768_000;
+
+/// An instance file's modification time, in seconds, as the host keeps it.
+fn host_mtime(meta: &std::fs::Metadata) -> i64 {
+    meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(IMAGE_MTIME, |d| d.as_secs() as i64)
+}
+
 /// A writable-mount file's permission bits: the host keeps one permission for us, read-only, and
 /// `chmod` without write bits sets it (Android refuses to load a writable dex file).
 fn host_mode(meta: &std::fs::Metadata) -> u32 {
@@ -352,13 +365,17 @@ fn stat_resolved(vfs: &Vfs, r: &Resolved) -> Result<Stat, Errno> {
 
 fn stat_node(r: &Resolved) -> Result<Stat, Errno> {
     let ino = ino_of(&r.path);
-    let s = |mode: u32, size: i64| Stat { ino, mode, nlink: 1, size, blocks: (size + 511) / 512, ..Stat::default() };
+    let s = |mode: u32, size: i64| Stat { ino, mode, nlink: 1, size, blocks: (size + 511) / 512, mtime: IMAGE_MTIME, ..Stat::default() };
     Ok(match &r.node {
-        Node::Dir | Node::HostDir { .. } => Stat { nlink: 2, ..s(S_IFDIR | 0o755, 4096) },
+        Node::Dir => Stat { nlink: 2, ..s(S_IFDIR | 0o755, 4096) },
+        Node::HostDir { host } => {
+            let mtime = std::fs::metadata(host).map_or(IMAGE_MTIME, |m| host_mtime(&m));
+            Stat { nlink: 2, mtime, ..s(S_IFDIR | 0o755, 4096) }
+        }
         Node::SysFile { size, mode } => s(S_IFREG | mode, *size as i64),
         Node::HostFile { host } => {
             let meta = std::fs::metadata(host).map_err(|_| EIO)?;
-            s(S_IFREG | host_mode(&meta), meta.len() as i64)
+            Stat { mtime: host_mtime(&meta), ..s(S_IFREG | host_mode(&meta), meta.len() as i64) }
         }
         Node::Symlink { target } => s(S_IFLNK | 0o777, target.len() as i64),
         Node::Generated => s(S_IFREG | 0o444, 0),
@@ -378,7 +395,8 @@ pub fn stat_of(vfs: &Vfs, file: &OpenFile) -> Result<Stat, Errno> {
             let meta = file.metadata().map_err(|_| EIO)?;
             let len = meta.len() as i64;
             let mode = if *sysroot { 0o644 } else { host_mode(&meta) };
-            let st = Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, ..Stat::default() };
+            let mtime = if *sysroot { IMAGE_MTIME } else { host_mtime(&meta) };
+            let st = Stat { ino: ino_of(guest), mode: S_IFREG | mode, nlink: 1, size: len, blocks: (len + 511) / 512, mtime, ..Stat::default() };
             if *sysroot {
                 return Ok(match vfs.sysroot().image_meta(guest) {
                     Some(m) => Stat { mode: S_IFREG | m.mode, uid: m.uid, gid: m.gid, ..st },
