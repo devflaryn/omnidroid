@@ -21,6 +21,9 @@
 //! - What is saved: the blocks entered this run (restored ones that verified, and the new ones).
 //!   Restored blocks that never verified are left out, so a snapshot is one run's working set and
 //!   does not grow across boots.
+//! - `OMNI_JIT_SNAPSHOT_RESAVE_PCT=<n>` (default 2; 0: any): a process saves again only once `n`%
+//!   of what it would save is new since its last save or its restore -- a save rewrites the whole
+//!   file (s12: 337 saves, 4.4 GB written in one run, system_server's ~230 MB sixteen times).
 //! - `OMNI_JIT_SNAPSHOT_MAX_MB=<MiB>` (default 512): no snapshot past that much code.
 //! - `OMNI_JIT_SNAPSHOT_FORGET=1` (default off; dynarmic patch 0076): once a process has settled
 //!   (as for the settled save), forget the restored blocks it never entered, and their bookkeeping.
@@ -418,6 +421,18 @@ pub(crate) fn save(p: &Process, why: &str) {
         if stats.blocks_emitted == 0 {
             return;  // nothing translated at all (everything came from the snapshot, or nothing ran)
         }
+        // Not for a few new blocks: a save writes the whole snapshot again (system_server's ~230
+        // MB, sixteen times in one run of s12 -- 337 saves, 4.4 GB written). A process saves again
+        // once at least `OMNI_JIT_SNAPSHOT_RESAVE_PCT` percent (default 2; 0: any) of what it would
+        // save is new since its last save or its restore; what it translated meanwhile is
+        // translated again next time. Its first save, and the one before code aging drops its
+        // translations (`save_before_trim`), are not held back.
+        let new = stats.blocks_emitted - last.0.min(stats.blocks_emitted);
+        let total = stats.blocks_emitted + stats.snapshot_blocks_verified;
+        let first = last.0 == 0 && stats.snapshot_blocks_verified == 0;
+        if !first && why != "before its translations are dropped" && new * 100 < total * resave_pct() {
+            return;
+        }
     }
     let t0 = Instant::now();
     // What it entered this run: the restored blocks that verified and the ones it translated --
@@ -440,6 +455,13 @@ pub(crate) fn save(p: &Process, why: &str) {
         stats.snapshot_pages_read
     );
     *target.saved_emitted.lock() = (stats.blocks_emitted, Instant::now(), stats.blocks_emitted);
+}
+
+/// `OMNI_JIT_SNAPSHOT_RESAVE_PCT` (default 2): the share of a snapshot that must be new before a
+/// process saves it again ([`save`]).
+fn resave_pct() -> u64 {
+    static PCT: OnceLock<u64> = OnceLock::new();
+    *PCT.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_RESAVE_PCT").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
 }
 
 fn settle_seconds() -> u64 {
