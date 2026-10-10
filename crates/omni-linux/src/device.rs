@@ -48,6 +48,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
     ("/vendor/overlay/omni-device-overlay.apk", include_bytes!("../device/vendor/overlay/omni-device-overlay.apk")),
+    // No resources preloaded by an app's WrapperInit: a second static overlay, emptying the arrays
+    // `ZygoteInit.preloadResources` reads (`device/src/nopreload-overlay/`, its values file says
+    // why; `OMNI_APP_PRELOAD_RES=1` leaves it out).
+    ("/vendor/overlay/omni-nopreload-overlay.apk", include_bytes!("../device/vendor/overlay/omni-nopreload-overlay.apk")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
@@ -400,6 +404,11 @@ pub fn left_out() -> Vec<&'static str> {
     // Roblox's 2.1 and 3.7 s sooner (2 pairs). system_server keeps its preload.
     if std::env::var("OMNI_LINUX_APP").as_deref() == Ok("1") && std::env::var("OMNI_APP_PRELOAD").as_deref() != Ok("1") {
         out.push("/system/etc/preloaded-classes");
+    }
+    // The resources likewise, for every process (system_server's own preload of them is ~80 ms):
+    // `OMNI_APP_PRELOAD_RES=1` keeps the image's lists.
+    if std::env::var("OMNI_APP_PRELOAD_RES").as_deref() == Ok("1") {
+        out.push("/vendor/overlay/omni-nopreload-overlay.apk");
     }
     out
 }

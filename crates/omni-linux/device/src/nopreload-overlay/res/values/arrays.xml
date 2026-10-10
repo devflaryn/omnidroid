@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- No drawables or color state lists preloaded. A zygote preloads them once and every app it
+         forks shares them; here each app's host process starts alone, and its WrapperInit "mimics
+         system Zygote preloading" (`ZygoteInit.preloadResources`): 63 drawables and 41 color state
+         lists, with the classes they need: PreloadResources 550-620 ms a process, 15 processes
+         and 8.1 s in one saved-device run to the world (2026-10-10, s31). An app loads what it
+         draws on its own, as a lazily preloading zygote's apps do. -->
+    <array name="preloaded_drawables" />
+    <array name="preloaded_color_state_lists" />
+</resources>
