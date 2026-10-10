@@ -905,3 +905,23 @@ bytes (`compare_emit_dumps.py`, the same 11 blocks as between two runs of one bu
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0084): frontend **4.80/4.80/4.80/4.80 -> 4.58/4.64/4.68/4.60 us/block (-4%)**, emit
 **10.54/10.57/10.51/10.55 -> 10.17/10.27/10.34/10.26 (-3%)**.
+
+(0085, the register allocator's per-block state kept by the thread and reset where the last block
+wrote it, measured within noise -- 10.61 -> 10.52 us/block, no consistent direction over three
+pairs -- and was dropped.)
+
+### 0087 — IR: an opcode's return type and the passes' predicates from tables
+
+`GetTypeOf` read `opcode_info` (a `std::array` of name/type/`std::vector` args) through `at()` in
+another file; `Inst::GetType` was out of line too; and `Inst::MayHaveSideEffects`, `IsMemoryRead`
+and `IsMemoryReadOrWrite` -- asked of every instruction by dead-code elimination (twice a block)
+and the get/set elimination -- were chains of out-of-line switches over the opcode (fifteen of them
+for `MayHaveSideEffects`). The return type is now in 0077's inline table (`OpcodeArgs::ret`) and
+`GetTypeOf`/`GetType` are inline; the three predicates are bits of a per-opcode table made before
+`main` from the predicates themselves (each a function of the opcode alone), and inline. The same
+answers, so the same IR and the same bytes (`compare_emit_dumps.py`: the same 11 blocks as between
+two runs); `OMNI_JIT_VERIFY=1` passes on the corpus.
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0086): frontend **4.69/4.57/4.62/4.56 -> 4.25/4.32/4.28/4.28 us/block (-7%)**, emit
+**10.36/10.23/10.29/10.16 -> 9.92/10.10/9.99/10.07 (-2%)**.

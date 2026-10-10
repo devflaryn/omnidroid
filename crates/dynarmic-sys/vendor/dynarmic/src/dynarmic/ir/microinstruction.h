@@ -20,6 +20,18 @@ enum class Type;
 
 constexpr size_t max_arg_count = 4;
 
+namespace detail {
+/// Omnidroid patch 0087: what `Inst::MayHaveSideEffects`, `IsMemoryRead` and `IsMemoryReadOrWrite`
+/// say of each opcode -- each a chain of out-of-line switches over the opcode, asked of every
+/// instruction by dead-code elimination and the get/set elimination -- worked out once.
+enum InstFlag : std::uint8_t {
+    kMayHaveSideEffects = 1,
+    kIsMemoryRead = 2,
+    kIsMemoryReadOrWrite = 4,
+};
+extern const std::array<std::uint8_t, OpcodeCount> inst_flags;
+}  // namespace detail
+
 /**
  * A representation of a microinstruction. A single ARM/Thumb instruction may be
  * converted into zero or more microinstructions.
@@ -53,11 +65,11 @@ public:
     bool IsExclusiveMemoryWrite() const;
 
     /// Determines whether or not this instruction performs any kind of memory read.
-    bool IsMemoryRead() const;
+    bool IsMemoryRead() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kIsMemoryRead) != 0; }  // patch 0087
     /// Determines whether or not this instruction performs any kind of memory write.
     bool IsMemoryWrite() const;
     /// Determines whether or not this instruction performs any kind of memory access.
-    bool IsMemoryReadOrWrite() const;
+    bool IsMemoryReadOrWrite() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kIsMemoryReadOrWrite) != 0; }  // patch 0087
 
     /// Determines whether or not this instruction reads from the CPSR.
     bool ReadsFromCPSR() const;
@@ -107,7 +119,7 @@ public:
     bool IsSetCheckBitOperation() const;
 
     /// Determines whether or not this instruction may have side-effects.
-    bool MayHaveSideEffects() const;
+    bool MayHaveSideEffects() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kMayHaveSideEffects) != 0; }  // patch 0087
 
     /// Determines whether or not this instruction is a pseduo-instruction.
     /// Pseudo-instructions depend on their parent instructions for their semantics.
@@ -129,8 +141,12 @@ public:
 
     /// Get the microop this microinstruction represents.
     Opcode GetOpcode() const { return op; }
-    /// Get the type this instruction returns.
-    Type GetType() const;
+    /// Get the type this instruction returns. (Patch 0087: inline.)
+    Type GetType() const {
+        if (op == Opcode::Identity)
+            return args[0].GetType();
+        return GetTypeOf(op);
+    }
     /// Get the number of arguments this instruction has.
     size_t NumArgs() const { return GetNumArgsOf(op); }  // patch 0077: inline
 
@@ -161,6 +177,11 @@ public:
 
 private:
     [[noreturn]] void BadGetArg(size_t index) const;  // patch 0086
+    // Patch 0087: what the inline predicates above were, from which `detail::inst_flags` is made.
+    bool IsMemoryReadSlow() const;
+    bool IsMemoryReadOrWriteSlow() const;
+    bool MayHaveSideEffectsSlow() const;
+    friend struct InstFlagsMaker;
     void Use(const Value& value);
     void UndoUse(const Value& value);
 

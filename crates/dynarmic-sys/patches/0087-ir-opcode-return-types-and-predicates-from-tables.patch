@@ -1,0 +1,206 @@
+diff --git a/src/dynarmic/ir/microinstruction.cpp b/src/dynarmic/ir/microinstruction.cpp
+index c326ccb5..2c88c383 100644
+--- a/src/dynarmic/ir/microinstruction.cpp
++++ b/src/dynarmic/ir/microinstruction.cpp
+@@ -137,7 +137,7 @@ bool Inst::IsExclusiveMemoryWrite() const {
+     }
+ }
+ 
+-bool Inst::IsMemoryRead() const {
++bool Inst::IsMemoryReadSlow() const {
+     return IsSharedMemoryRead()
+         || IsExclusiveMemoryRead();
+ }
+@@ -147,8 +147,8 @@ bool Inst::IsMemoryWrite() const {
+         || IsExclusiveMemoryWrite();
+ }
+ 
+-bool Inst::IsMemoryReadOrWrite() const {
+-    return IsMemoryRead()
++bool Inst::IsMemoryReadOrWriteSlow() const {
++    return IsMemoryReadSlow()
+         || IsMemoryWrite();
+ }
+ 
+@@ -542,7 +542,7 @@ bool Inst::IsSetCheckBitOperation() const {
+         || op == Opcode::A64SetCheckBit;
+ }
+ 
+-bool Inst::MayHaveSideEffects() const {
++bool Inst::MayHaveSideEffectsSlow() const {
+     return op == Opcode::PushRSB
+         || op == Opcode::CallHostFunction
+         || op == Opcode::A64DataCacheOperationRaised
+@@ -622,11 +622,23 @@ Inst* Inst::GetAssociatedPseudoOperation(Opcode opcode) {
+     return nullptr;
+ }
+ 
+-Type Inst::GetType() const {
+-    if (op == Opcode::Identity)
+-        return args[0].GetType();
+-    return GetTypeOf(op);
+-}
++struct InstFlagsMaker {
++    static std::array<std::uint8_t, OpcodeCount> Make() {
++        std::array<std::uint8_t, OpcodeCount> flags{};
++        for (size_t i = 0; i < OpcodeCount; i++) {
++            const Inst inst{static_cast<Opcode>(i)};
++            flags[i] = static_cast<std::uint8_t>((inst.MayHaveSideEffectsSlow() ? detail::kMayHaveSideEffects : 0)
++                                                 | (inst.IsMemoryReadSlow() ? detail::kIsMemoryRead : 0)
++                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0));
++        }
++        return flags;
++    }
++};
++
++namespace detail {
++// Patch 0087: made before main, from the predicates themselves (each a function of the opcode alone).
++const std::array<std::uint8_t, OpcodeCount> inst_flags = InstFlagsMaker::Make();
++}  // namespace detail
+ 
+ void Inst::BadGetArg(size_t index) const {
+     // Omnidroid patch 0086: `GetArg`'s checks failed (it is inline now); these say how.
+diff --git a/src/dynarmic/ir/microinstruction.h b/src/dynarmic/ir/microinstruction.h
+index 21346761..ae6f05be 100644
+--- a/src/dynarmic/ir/microinstruction.h
++++ b/src/dynarmic/ir/microinstruction.h
+@@ -20,6 +20,18 @@ enum class Type;
+ 
+ constexpr size_t max_arg_count = 4;
+ 
++namespace detail {
++/// Omnidroid patch 0087: what `Inst::MayHaveSideEffects`, `IsMemoryRead` and `IsMemoryReadOrWrite`
++/// say of each opcode -- each a chain of out-of-line switches over the opcode, asked of every
++/// instruction by dead-code elimination and the get/set elimination -- worked out once.
++enum InstFlag : std::uint8_t {
++    kMayHaveSideEffects = 1,
++    kIsMemoryRead = 2,
++    kIsMemoryReadOrWrite = 4,
++};
++extern const std::array<std::uint8_t, OpcodeCount> inst_flags;
++}  // namespace detail
++
+ /**
+  * A representation of a microinstruction. A single ARM/Thumb instruction may be
+  * converted into zero or more microinstructions.
+@@ -53,11 +65,11 @@ public:
+     bool IsExclusiveMemoryWrite() const;
+ 
+     /// Determines whether or not this instruction performs any kind of memory read.
+-    bool IsMemoryRead() const;
++    bool IsMemoryRead() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kIsMemoryRead) != 0; }  // patch 0087
+     /// Determines whether or not this instruction performs any kind of memory write.
+     bool IsMemoryWrite() const;
+     /// Determines whether or not this instruction performs any kind of memory access.
+-    bool IsMemoryReadOrWrite() const;
++    bool IsMemoryReadOrWrite() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kIsMemoryReadOrWrite) != 0; }  // patch 0087
+ 
+     /// Determines whether or not this instruction reads from the CPSR.
+     bool ReadsFromCPSR() const;
+@@ -107,7 +119,7 @@ public:
+     bool IsSetCheckBitOperation() const;
+ 
+     /// Determines whether or not this instruction may have side-effects.
+-    bool MayHaveSideEffects() const;
++    bool MayHaveSideEffects() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kMayHaveSideEffects) != 0; }  // patch 0087
+ 
+     /// Determines whether or not this instruction is a pseduo-instruction.
+     /// Pseudo-instructions depend on their parent instructions for their semantics.
+@@ -129,8 +141,12 @@ public:
+ 
+     /// Get the microop this microinstruction represents.
+     Opcode GetOpcode() const { return op; }
+-    /// Get the type this instruction returns.
+-    Type GetType() const;
++    /// Get the type this instruction returns. (Patch 0087: inline.)
++    Type GetType() const {
++        if (op == Opcode::Identity)
++            return args[0].GetType();
++        return GetTypeOf(op);
++    }
+     /// Get the number of arguments this instruction has.
+     size_t NumArgs() const { return GetNumArgsOf(op); }  // patch 0077: inline
+ 
+@@ -161,6 +177,11 @@ public:
+ 
+ private:
+     [[noreturn]] void BadGetArg(size_t index) const;  // patch 0086
++    // Patch 0087: what the inline predicates above were, from which `detail::inst_flags` is made.
++    bool IsMemoryReadSlow() const;
++    bool IsMemoryReadOrWriteSlow() const;
++    bool MayHaveSideEffectsSlow() const;
++    friend struct InstFlagsMaker;
+     void Use(const Value& value);
+     void UndoUse(const Value& value);
+ 
+diff --git a/src/dynarmic/ir/opcodes.cpp b/src/dynarmic/ir/opcodes.cpp
+index 6c5b56d8..5ddee4f2 100644
+--- a/src/dynarmic/ir/opcodes.cpp
++++ b/src/dynarmic/ir/opcodes.cpp
+@@ -53,8 +53,8 @@ static const std::array opcode_info{
+ };
+ 
+ // A braced list, as `opcode_info`'s: some lines of `opcodes.inc` end their arguments with a comma.
+-constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
+-    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}};
++constexpr detail::OpcodeArgs MakeArgs(Type ret, std::initializer_list<Type> types) {
++    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}, ret};
+     size_t i = 0;
+     for (const Type t : types) {
+         a.types[i++] = t;
+@@ -65,9 +65,9 @@ constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
+ // Patch 0077: built at compile time from the same `opcodes.inc` as `opcode_info` (here, where the
+ // argument types' short names are these constants rather than IR's value classes).
+ constexpr std::array<detail::OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args_table{
+-#define OPCODE(name, type, ...) MakeArgs({__VA_ARGS__}),
+-#define A32OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
+-#define A64OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
++#define OPCODE(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
++#define A32OPC(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
++#define A64OPC(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
+ #include "./opcodes.inc"
+ #undef OPCODE
+ #undef A32OPC
+@@ -85,10 +85,6 @@ void ArgIndexOutOfRange(Opcode op, size_t arg_index) {
+ }
+ }  // namespace detail
+ 
+-Type GetTypeOf(Opcode op) {
+-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
+-}
+-
+ std::string GetNameOf(Opcode op) {
+     return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).name;
+ }
+diff --git a/src/dynarmic/ir/opcodes.h b/src/dynarmic/ir/opcodes.h
+index 31e2fd2c..d752a86b 100644
+--- a/src/dynarmic/ir/opcodes.h
++++ b/src/dynarmic/ir/opcodes.h
+@@ -32,9 +32,6 @@ enum class Opcode {
+ 
+ constexpr size_t OpcodeCount = static_cast<size_t>(Opcode::NUM_OPCODE);
+ 
+-/// Get return type of an opcode
+-Type GetTypeOf(Opcode op);
+-
+ namespace detail {
+ /// Omnidroid patch 0077: an opcode's arguments, in a table the inline accessors below read --
+ /// `GetNumArgsOf` and `GetArgTypeOf` were calls into another file reading a `std::vector` through
+@@ -43,11 +40,17 @@ namespace detail {
+ struct OpcodeArgs {
+     std::uint8_t count;
+     std::array<Type, 4> types;
++    Type ret;  // patch 0087: the opcode's return type, for the inline `GetTypeOf`
+ };
+ extern const std::array<OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args;
+ [[noreturn]] void ArgIndexOutOfRange(Opcode op, size_t arg_index);
+ }  // namespace detail
+ 
++/// Get return type of an opcode (patch 0087: inline, from the table)
++inline Type GetTypeOf(Opcode op) {
++    return detail::opcode_args[static_cast<size_t>(op)].ret;
++}
++
+ /// Get the number of arguments an opcode accepts
+ inline size_t GetNumArgsOf(Opcode op) {
+     return detail::opcode_args[static_cast<size_t>(op)].count;

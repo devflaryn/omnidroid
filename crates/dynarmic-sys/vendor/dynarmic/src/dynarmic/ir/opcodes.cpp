@@ -53,8 +53,8 @@ static const std::array opcode_info{
 };
 
 // A braced list, as `opcode_info`'s: some lines of `opcodes.inc` end their arguments with a comma.
-constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
-    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}};
+constexpr detail::OpcodeArgs MakeArgs(Type ret, std::initializer_list<Type> types) {
+    detail::OpcodeArgs a{static_cast<std::uint8_t>(types.size()), {}, ret};
     size_t i = 0;
     for (const Type t : types) {
         a.types[i++] = t;
@@ -65,9 +65,9 @@ constexpr detail::OpcodeArgs MakeArgs(std::initializer_list<Type> types) {
 // Patch 0077: built at compile time from the same `opcodes.inc` as `opcode_info` (here, where the
 // argument types' short names are these constants rather than IR's value classes).
 constexpr std::array<detail::OpcodeArgs, static_cast<size_t>(Opcode::NUM_OPCODE)> opcode_args_table{
-#define OPCODE(name, type, ...) MakeArgs({__VA_ARGS__}),
-#define A32OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
-#define A64OPC(name, type, ...) MakeArgs({__VA_ARGS__}),
+#define OPCODE(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
+#define A32OPC(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
+#define A64OPC(name, type, ...) MakeArgs(type, {__VA_ARGS__}),
 #include "./opcodes.inc"
 #undef OPCODE
 #undef A32OPC
@@ -84,10 +84,6 @@ void ArgIndexOutOfRange(Opcode op, size_t arg_index) {
     throw std::out_of_range(fmt::format("argument {} of {}", arg_index, GetNameOf(op)));
 }
 }  // namespace detail
-
-Type GetTypeOf(Opcode op) {
-    return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).type;
-}
 
 std::string GetNameOf(Opcode op) {
     return OpcodeInfo::opcode_info.at(static_cast<size_t>(op)).name;

@@ -137,7 +137,7 @@ bool Inst::IsExclusiveMemoryWrite() const {
     }
 }
 
-bool Inst::IsMemoryRead() const {
+bool Inst::IsMemoryReadSlow() const {
     return IsSharedMemoryRead()
         || IsExclusiveMemoryRead();
 }
@@ -147,8 +147,8 @@ bool Inst::IsMemoryWrite() const {
         || IsExclusiveMemoryWrite();
 }
 
-bool Inst::IsMemoryReadOrWrite() const {
-    return IsMemoryRead()
+bool Inst::IsMemoryReadOrWriteSlow() const {
+    return IsMemoryReadSlow()
         || IsMemoryWrite();
 }
 
@@ -542,7 +542,7 @@ bool Inst::IsSetCheckBitOperation() const {
         || op == Opcode::A64SetCheckBit;
 }
 
-bool Inst::MayHaveSideEffects() const {
+bool Inst::MayHaveSideEffectsSlow() const {
     return op == Opcode::PushRSB
         || op == Opcode::CallHostFunction
         || op == Opcode::A64DataCacheOperationRaised
@@ -622,11 +622,23 @@ Inst* Inst::GetAssociatedPseudoOperation(Opcode opcode) {
     return nullptr;
 }
 
-Type Inst::GetType() const {
-    if (op == Opcode::Identity)
-        return args[0].GetType();
-    return GetTypeOf(op);
-}
+struct InstFlagsMaker {
+    static std::array<std::uint8_t, OpcodeCount> Make() {
+        std::array<std::uint8_t, OpcodeCount> flags{};
+        for (size_t i = 0; i < OpcodeCount; i++) {
+            const Inst inst{static_cast<Opcode>(i)};
+            flags[i] = static_cast<std::uint8_t>((inst.MayHaveSideEffectsSlow() ? detail::kMayHaveSideEffects : 0)
+                                                 | (inst.IsMemoryReadSlow() ? detail::kIsMemoryRead : 0)
+                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0));
+        }
+        return flags;
+    }
+};
+
+namespace detail {
+// Patch 0087: made before main, from the predicates themselves (each a function of the opcode alone).
+const std::array<std::uint8_t, OpcodeCount> inst_flags = InstFlagsMaker::Make();
+}  // namespace detail
 
 void Inst::BadGetArg(size_t index) const {
     // Omnidroid patch 0086: `GetArg`'s checks failed (it is inline now); these say how.
