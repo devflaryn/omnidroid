@@ -32,7 +32,14 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    floor is now 6 MiB: **-90..-110 MB private WS**.
 3. **Boot: no fixed 1.5 s sleep before system_server** (it waits for servicemanager, which was ready
    "after 0 ms"): system_server -2 s, world -2.5 s. Sign-in polled every 0.2 s.
-4. **Measurement**: the harness simulates weaker PCs (`-Affinity`), refuses to run without the
+4. **The game's hottest loop, Luau's bytecode dispatch** (`ldrb w8,[x26,#4]!; ldr x8,[x21,x8,lsl #3];
+   br x8`, the engine worker's top function), translated without a store-and-reload of X8 (0081: a
+   register read forwarded across a W/X width change) and without stack spills while registers are
+   free (0082: a value moved out of the way goes to a free callee-saved register). Both checked with a
+   new guest-visible differential (every register after every block, ~385k block runs over five
+   libraries including libroblox: identical on and off; it caught a wrong first version of 0081).
+   In-world A/B queued (s11).
+5. **Measurement**: the harness simulates weaker PCs (`-Affinity`), refuses to run without the
    network bypass (a run without WARP looked exactly like Delta's 20 s crash), times boot milestones
    from the log's own clock, and records available memory and the compressed store;
    `OMNI_JIT_TIME`, `[boot-ms]`, `[init] exec_start ... in N ms`.
@@ -43,9 +50,11 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of ~150.
   `OMNI_WS_TRIM=<s>` (periodic) and `OMNI_WS_TRIM_IDLE=<s>` (idle processes only) -- s10 measures
   what really leaves RAM (the compressed store keeps part of it).
-- **Translation snapshots** (last night's WIP, now built and on this branch): -2..-3 s to
-  boot_completed, -6..-10 s to the world; the game's own snapshot is evicted before use (its 256 MiB
-  live budget is smaller than its start) -- s9 runs them with 512 MiB.
+- **Translation snapshots** (last night's WIP, now built and on this branch, opt-in): -2..-3 s to
+  boot_completed, -4..-10 s to the world, for +100..+200 MB. With a 512 MiB live budget the game's
+  own snapshot verifies 32% (was 2.4%); system_server's is now saved before its code trim (495k
+  blocks restored, was 78k) but only 13% verify -- libraries the zone could not place at their home
+  move between boots (s12 names them).
 - **init's class_start**: 47 services spawned one after another; `OMNI_INIT_PARALLEL=1` -- s10.
 
 ## For you to decide
