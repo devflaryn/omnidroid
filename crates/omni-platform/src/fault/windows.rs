@@ -445,6 +445,15 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
         FaultOutcome::NotOurs => {
             DECLINED.fetch_add(1, Ordering::Relaxed);
+            // The first few said where they were (with the crash report on): an access violation
+            // nothing here handles is a crash unless a handler further on takes it, and a crash
+            // can end the process before the top-level filter runs (s26: the game's host died
+            // 0xC0000005 with no `[host-crash]` line -- something replaced the filter, or ended
+            // the process first).
+            if CRASH_STDERR.load(Ordering::Relaxed) != 0 && DECLINED_SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+                // SAFETY: the OS's exception pointers, valid for this call.
+                unsafe { report(b"\n[host-fault] declined: exception ", info) };
+            }
             EXCEPTION_CONTINUE_SEARCH
         }
     }
@@ -835,7 +844,23 @@ fn put_hex(buf: &mut [u8], at: &mut usize, v: u64) {
     put(buf, at, &digits[..n]);
 }
 
+/// How many declined access violations [`veh`] has reported.
+static DECLINED_SAID: AtomicUsize = AtomicUsize::new(0);
+
 unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    // SAFETY: the OS's exception pointers, valid for this call.
+    unsafe { report(b"\n[host-crash] exception ", info) };
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// One line to the saved standard error: `prefix`, the exception, where (module and offset, or no
+/// module), the access, the thread's stack pointer, the word at it and r15 (dynarmic's JIT state in
+/// generated code), the thread. Allocates nothing.
+///
+/// # Safety
+///
+/// `info` is null or the exception pointers the OS handed a handler, for the handler's call.
+unsafe fn report(prefix: &[u8], info: *const EXCEPTION_POINTERS) {
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleFileNameA, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -844,7 +869,7 @@ unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     let mut buf = [0u8; 512];
     let mut at = 0;
-    put(&mut buf, &mut at, b"\n[host-crash] exception ");
+    put(&mut buf, &mut at, prefix);
     if !info.is_null() {
         // SAFETY: the OS hands the filter valid exception pointers for the call.
         let record = unsafe { (*info).ExceptionRecord };
@@ -884,6 +909,19 @@ unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
                 put_hex(&mut buf, &mut at, params[1] as u64);
             }
         }
+        // SAFETY: as above; the context is the faulting thread's.
+        let context = unsafe { (*info).ContextRecord };
+        if !context.is_null() {
+            // SAFETY: as above.
+            let (rsp, r15) = unsafe { ((*context).Rsp, (*context).R15) };
+            put(&mut buf, &mut at, b", rsp ");
+            put_hex(&mut buf, &mut at, rsp);
+            put(&mut buf, &mut at, b" [rsp] ");
+            // SAFETY: the faulting thread's stack pointer, 8-aligned and on its committed stack.
+            put_hex(&mut buf, &mut at, unsafe { core::ptr::read_volatile(rsp as *const u64) });
+            put(&mut buf, &mut at, b" r15 ");
+            put_hex(&mut buf, &mut at, r15);
+        }
     }
     put(&mut buf, &mut at, b", thread ");
     // SAFETY: no arguments.
@@ -895,5 +933,4 @@ unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
         // SAFETY: the saved standard error handle and a buffer of `at` bytes.
         unsafe { WriteFile(handle as windows_sys::Win32::Foundation::HANDLE, buf.as_ptr(), at as u32, &raw mut written, core::ptr::null_mut()) };
     }
-    EXCEPTION_CONTINUE_SEARCH
 }
