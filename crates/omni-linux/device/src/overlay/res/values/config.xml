@@ -5,4 +5,9 @@
          sys.boot_completed, until its 30 s BOOT_TIMEOUT: FallbackHome drawn at 80.7 s, "BOOT
          TIMEOUT: forcing display enabled" at 110.8 s (2026-10-01). -->
     <bool name="config_checkWallpaperAtBoot">false</bool>
+    <!-- Every display its own focused window. With this false (AOSP's default) only the display
+         touched last has one, and every other app loses its window focus: games stop drawing
+         when they lose it (Talking Tom Camp: one frame in 5 s once another display took the
+         focus, 2026-10-10), so of two instances on one Android only the one clicked last ran. -->
+    <bool name="config_perDisplayFocusEnabled">true</bool>
 </resources>
