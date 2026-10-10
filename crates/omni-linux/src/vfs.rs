@@ -74,7 +74,30 @@ pub struct Sysroot {
 }
 
 impl Sysroot {
+    /// The sysroot in `dir`: opened once per host process and shared by every guest process in it
+    /// (and so their `backing`s: one section per library in the host process). Opening it hashes
+    /// the manifest and meta, looks at each of its ~5,000 objects and builds its maps -- 62 of a
+    /// 66 ms spawn on the i5-4460, and ~2-3 MB of heap -- which every spawn, `setprop` and
+    /// `wait_for_prop` of init did again (2026-10-10). `OMNI_SYSROOT_SHARED=0`: one per open, as
+    /// before.
     pub fn open(dir: &Path) -> Result<Arc<Self>, String> {
+        static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*SHARED.get_or_init(|| std::env::var("OMNI_SYSROOT_SHARED").as_deref() != Ok("0")) {
+            return Self::open_uncached(dir);
+        }
+        // What else shapes it (the boot image switch, the GPU backend) is fixed for the process.
+        static OPENED: Mutex<Vec<(PathBuf, Arc<Sysroot>)>> = Mutex::new(Vec::new());
+        // Held while opening: services started side by side wait for the one open.
+        let mut opened = OPENED.lock();
+        if let Some((_, s)) = opened.iter().find(|(d, _)| d == dir) {
+            return Ok(Arc::clone(s));
+        }
+        let s = Self::open_uncached(dir)?;
+        opened.push((dir.to_path_buf(), Arc::clone(&s)));
+        Ok(s)
+    }
+
+    fn open_uncached(dir: &Path) -> Result<Arc<Self>, String> {
         let path = dir.join("sysroot.manifest");
         let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -86,14 +109,20 @@ impl Sysroot {
         }
         let text = String::from_utf8(bytes).map_err(|_| "sysroot.manifest is not UTF-8".to_string())?;
         let mut manifest = manifest::parse(&text)?;
-        for entry in manifest.entries.values() {
-            if let Entry::File { size, sha256, .. } = entry {
-                let host = object_path(&dir.join("objects"), sha256);
-                let found = std::fs::metadata(&host).map(|m| m.len()).ok();
-                if found != Some(*size) {
-                    return Err(format!("{}: size {found:?}, manifest says {size}", host.display()));
+        // Each object's size, looked at once per sysroot and manifest: a marker says it was (a look
+        // at each of ~5,000 files, in every host process, was 8 ms on Linux and more on Windows).
+        let checked = dir.join("objects").join(format!(".sizes-checked-{}", &digest[..16]));
+        if !checked.exists() {
+            for entry in manifest.entries.values() {
+                if let Entry::File { size, sha256, .. } = entry {
+                    let host = object_path(&dir.join("objects"), sha256);
+                    let found = std::fs::metadata(&host).map(|m| m.len()).ok();
+                    if found != Some(*size) {
+                        return Err(format!("{}: size {found:?}, manifest says {size}", host.display()));
+                    }
                 }
             }
+            let _ = std::fs::write(&checked, b"");
         }
         // omnidroid's device overlay, over the image: its files where the image has none, and the
         // device configuration it replaces (`device::REPLACES`).
