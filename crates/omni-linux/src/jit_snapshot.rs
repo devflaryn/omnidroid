@@ -318,6 +318,10 @@ pub fn key(exe: &[u8], argv: &[Vec<u8>]) -> String {
     }
     k.push_str(&format!("\nhle={}", omni_cpu::dynarmic::hle_enabled()));
     k.push_str(&format!("\nhost={}", host_build()));
+    // An app's host process and the system's set their caches up differently (its size, a thread's
+    // dispatch table), which shapes the code: a program both run (`idmap2`, exec'd from either) had
+    // one snapshot that each saved over the other's and neither could load (error -10, s12).
+    k.push_str(if std::env::var_os("OMNI_LINUX_APP").is_some() { "\nrole=app" } else { "\nrole=system" });
     k
 }
 
