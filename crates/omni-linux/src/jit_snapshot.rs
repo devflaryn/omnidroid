@@ -11,7 +11,11 @@
 //! translated as usual.
 //!
 //! - `OMNI_JIT_SNAPSHOT=<dir>`: on. Each process loads its snapshot when its address space is made
-//!   (`spawn`, `execve`), and saves one when it ends.
+//!   (`spawn`, `execve`), and saves one when it ends. `OMNI_JIT_SNAPSHOT=1` (or `auto`): on, in the
+//!   temporary directory's `omni-jit-snapshot`. With snapshots on, the measured configuration is the
+//!   default (s12/s16: the world 18 s sooner, no RAM cost): `_LAZY`, `_LIB_ZONE` and `_FORGET` on
+//!   (each `=0` turns it off) and the shared caches' live code 512 MiB (`OMNI_JIT_SHARED_CACHE_LIVE_MB`
+//!   sets another).
 //! - `OMNI_JIT_SNAPSHOT_QUIET=<seconds>` (default 20; `0` off): also save a live process's once it
 //!   has translated nothing new for that long (a service that never ends: system_server), or once
 //!   it has *settled* -- at least `OMNI_JIT_SNAPSHOT_SETTLE_S` (default 45) seconds old, and fewer
@@ -81,7 +85,7 @@ pub struct Target {
 /// by the library ([`linker_mmap`]).
 fn lib_zone() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_LIB_ZONE").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| on_unless_zero("OMNI_JIT_SNAPSHOT_LIB_ZONE"))
 }
 
 /// Snapshots on and `OMNI_JIT_SNAPSHOT_LIB_ZONE=1`: a layout that is the same each boot -- library
@@ -216,7 +220,12 @@ fn fnv(bytes: &[u8]) -> u64 {
 pub fn dir() -> Option<&'static PathBuf> {
     static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     DIR.get_or_init(|| {
-        let d = PathBuf::from(std::env::var_os("OMNI_JIT_SNAPSHOT").filter(|v| !v.is_empty())?);
+        let v = std::env::var_os("OMNI_JIT_SNAPSHOT").filter(|v| !v.is_empty())?;
+        let d = match v.to_str().map(str::trim) {
+            Some("0" | "off") => return None,
+            Some("1" | "on" | "auto") => std::env::temp_dir().join("omni-jit-snapshot"),
+            _ => PathBuf::from(v),
+        };
         std::fs::create_dir_all(&d).ok()?;
         // The snapshots compress to about a third (zstd -1 33%, gzip -1 34% on a 90 MB one; s12's
         // directory was 2.2 GB): on Windows the directory is made an NTFS-compressed one, which
@@ -235,14 +244,14 @@ fn max_bytes() -> u64 {
 
 fn lazy() -> bool {
     static LAZY: OnceLock<bool> = OnceLock::new();
-    *LAZY.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_LAZY").is_ok_and(|v| v.trim() == "1"))
+    *LAZY.get_or_init(|| on_unless_zero("OMNI_JIT_SNAPSHOT_LAZY"))
 }
 
 /// `OMNI_JIT_SNAPSHOT_FORGET=1` (default off; dynarmic patch 0076): once a process has settled,
 /// forget the restored blocks it has not entered ([`forget_unentered`]).
 fn forget_switch() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_FORGET").is_ok_and(|v| v.trim() == "1"))
+    *ON.get_or_init(|| on_unless_zero("OMNI_JIT_SNAPSHOT_FORGET"))
 }
 
 /// Forget `p`'s restored blocks never entered: a block restored and never verified costs its
@@ -294,6 +303,11 @@ fn where_unentered(p: &Process) {
 fn why() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("OMNI_JIT_SNAPSHOT_WHY").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// A companion switch of the snapshots: on (they are only read with snapshots on) unless `=0`.
+fn on_unless_zero(var: &str) -> bool {
+    std::env::var(var).map_or(true, |v| v.trim() != "0")
 }
 
 fn quiet_seconds() -> u64 {

@@ -904,6 +904,12 @@ impl Process {
         if let Some(mask) = std::env::var("OMNI_DYNARMIC_OPT").ok().and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
             options.optimizations_override = Some(mask);
         }
+        // With translation snapshots on, the shared caches keep 512 MiB of live code (the measured
+        // configuration, s9/s12: the game's snapshot survives its start); `OMNI_JIT_SHARED_CACHE_LIVE_MB`
+        // (read by the backend) sets another.
+        if crate::jit_snapshot::dir().is_some() && std::env::var_os("OMNI_JIT_SHARED_CACHE_LIVE_MB").is_none() {
+            options.shared_code_live_bytes = 512 << 20;
+        }
         // The live switch, set once from `OMNI_JIT_TBI` (the configuration keeps the mask's shape).
         let _ = tbi_direct_mask();
         scalar_fp_in_xmm_default();
