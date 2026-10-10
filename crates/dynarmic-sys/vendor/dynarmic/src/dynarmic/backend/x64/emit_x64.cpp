@@ -801,8 +801,12 @@ void EmitX64::CommitSharedFastmemSites() {
         pending_fastmem_sites.clear();
     };
     // Stable: of two records for one instruction the first stands, as `emplace` into the map did.
-    std::stable_sort(pending_fastmem_sites.begin(), pending_fastmem_sites.end(),
-                     [](const PendingFastmemSite& a, const PendingFastmemSite& b) { return a.site < b.site; });
+    // Omnidroid patch 0096: not when they are in order already -- a block's sites are recorded as
+    // its code is emitted, and a restored region's in the order its blocks were (0095).
+    const auto by_site = [](const PendingFastmemSite& a, const PendingFastmemSite& b) { return a.site < b.site; };
+    if (!std::is_sorted(pending_fastmem_sites.begin(), pending_fastmem_sites.end(), by_site)) {
+        std::stable_sort(pending_fastmem_sites.begin(), pending_fastmem_sites.end(), by_site);
+    }
     const u64 first = pending_fastmem_sites.front().site;
     const auto run = std::find_if(fastmem_site_runs.begin(), fastmem_site_runs.end(), [first](const FastmemSiteRun& r) {
         return reinterpret_cast<u64>(r.begin) <= first && first < reinterpret_cast<u64>(r.end);

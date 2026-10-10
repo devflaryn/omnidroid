@@ -80,6 +80,7 @@ dynarmic/
                and ../patches/0093-ir-what-a-value-asks-of-its-instruction-inline.patch
                and ../patches/0094-x64-a-block-s-perf-map-name-only-with-a-perf-map.patch
                and ../patches/0095-x64-a-snapshot-installs-faster.patch
+               and ../patches/0096-x64-fastmem-sites-in-order-not-sorted-again.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

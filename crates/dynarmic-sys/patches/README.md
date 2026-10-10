@@ -1033,3 +1033,17 @@ first differs in shape on Linux; not on Windows, where devices restore snapshots
 
 MEASURED (`the_speed_of_snapshot_install`, i5-4460, 40 loads each, 3 interleaved runs): **783/783/781
 -> 559/559/569 ns a block (-28%)**.
+
+### 0096 — x64: fastmem sites already in order are not sorted again
+
+`CommitSharedFastmemSites` `stable_sort`s the pending sites by address (with a merge buffer) before
+appending them to the region's run. They are in order already almost always: a block's sites are
+recorded as its code is emitted, top to bottom, and a restored region's in the order its blocks
+were saved (0095 commits a region at once). Now `std::is_sorted` first, and the sort only when not
+-- the same records. (The earlier 0096 idea, a lock-free filter before the TBI sites' mutex, made no
+difference uncontended -- 8.79 vs 8.79 us/block with a site noted -- and was dropped.)
+
+MEASURED (i5-4460, 3 interleaved runs against 0095): `the_speed_of_snapshot_install` **556/559/560
+-> 490/493/488 ns a block (-12%)**; `the_speed_of_emission` (`OD_PROD=1`) emit 9.10/8.86/9.00 ->
+8.91/8.74/8.85 us/block (-1.7%). The same bytes; the snapshot test passes lazily and not (Linux,
+first cache freed first).
