@@ -188,6 +188,14 @@ pub const SHARED_CODE_CACHE_BYTES: u64 = 1 << 30;
 /// A shared cache's region: the unit it fills, and retires oldest first (vendored patch 0028, D38
 /// amendment 3). Small, so that a retirement forgets little and is quick.
 pub const SHARED_CODE_REGION_BYTES: u64 = 16 << 20;
+
+/// Where `address` is in this process's shared code caches, one line into `out` (dynarmic patch
+/// 0100): for a crash report (`omni_platform::fault::set_crash_describer`) -- no lock, no
+/// allocation. 0 if no cache holds it.
+pub fn describe_code_address(address: u64, out: &mut [u8]) -> usize {
+    // SAFETY: `out` is valid for its length; the call writes at most that, NUL-terminated.
+    unsafe { dynarmic_sys::od_describe_code_address(address, out.as_mut_ptr().cast(), out.len() as u64) as usize }
+}
 /// The code a shared cache keeps live by default: past it, the oldest region is retired and its
 /// blocks translated again if they are still run. A game world emits ~245 MiB in its first minutes
 /// (w27-w30). D38 amendment 4, measured: at 128 MiB (amendment 3) PS99's settled world kept

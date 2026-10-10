@@ -847,6 +847,12 @@ private:
 
 // ------------------------------------------------------------------------------------------------
 
+namespace {
+/// Omnidroid patch 0100: the shared caches alive in this process, for `DescribeAddress`.
+constexpr size_t DESCRIBED_CACHES = 256;
+std::atomic<void*> described[DESCRIBED_CACHES];  // SharedCodeCache::Impl*
+}  // namespace
+
 SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes, size_t region_bytes, size_t live_bytes)
         : conf(SharedTemplate(template_conf, total_bytes))
         , block_of_code(GenSharedRunCodeCallbacks(conf.callbacks, conf), JitStateInfo{layout}, total_bytes, GenRCP(conf))
@@ -871,9 +877,21 @@ SharedCodeCache::Impl::Impl(const UserConfig& template_conf, size_t total_bytes,
     const size_t most = regions.size() - 1;
     live_limit = live_bytes == 0 ? most : std::clamp<size_t>(live_bytes / region_bytes, 1, most);
     StartRegion(0);
+    for (auto& slot : described) {  // patch 0100
+        void* empty = nullptr;
+        if (slot.compare_exchange_strong(empty, static_cast<void*>(this))) {
+            break;
+        }
+    }
 }
 
 SharedCodeCache::Impl::~Impl() {
+    for (auto& slot : described) {
+        void* self = this;
+        if (slot.compare_exchange_strong(self, nullptr)) {
+            break;
+        }
+    }
     if (lazy_file != nullptr) {
         std::fclose(lazy_file);
     }
@@ -2349,6 +2367,45 @@ void SharedCodeCache::ClearCache() {
 
 std::size_t SharedCodeCache::EvictTo(std::size_t keep_bytes) {
     return impl->EvictTo(keep_bytes);
+}
+
+std::size_t SharedCodeCache::DescribeAddress(std::uint64_t address, char* out, std::size_t cap) {
+    if (out == nullptr || cap == 0) {
+        return 0;
+    }
+    out[0] = 0;
+    const auto* at = reinterpret_cast<const u8*>(address);
+    for (size_t i = 0; i < DESCRIBED_CACHES; i++) {
+        const auto* const c = static_cast<const Impl*>(described[i].load(std::memory_order_acquire));
+        if (c == nullptr) {
+            continue;
+        }
+        const u8* const buffer = c->block_of_code.getCode();
+        if (at < buffer || at >= buffer + c->block_of_code.GetTotalCodeSize()) {
+            continue;
+        }
+        if (c->regions.empty() || at < c->regions.front().begin) {
+            const int n = std::snprintf(out, cap, "code cache %zu: its prelude +%#llx", i, static_cast<unsigned long long>(at - buffer));
+            return n < 0 ? 0 : std::min<size_t>(static_cast<size_t>(n), cap - 1);
+        }
+        const size_t size = static_cast<size_t>(c->regions.front().end - c->regions.front().begin);
+        const size_t r = static_cast<size_t>(at - c->regions.front().begin) / size;
+        if (r >= c->regions.size()) {
+            const int n = std::snprintf(out, cap, "code cache %zu: past its regions", i);
+            return n < 0 ? 0 : std::min<size_t>(static_cast<size_t>(n), cap - 1);
+        }
+        const Impl::Region& g = c->regions[r];
+        static const char* const states[] = {"free", "current", "full", "retired"};
+        const unsigned state = static_cast<unsigned>(g.state);
+        const int n = std::snprintf(out, cap, "code cache %zu region %zu (%s, sequence %llu, retired at epoch %llu; now epoch %llu, generation %llu) +%#llx, committed to +%#llx%s",
+                                    i, r, state < 4 ? states[state] : "?", static_cast<unsigned long long>(g.sequence),
+                                    static_cast<unsigned long long>(g.retired_epoch), static_cast<unsigned long long>(c->epoch.load(std::memory_order_relaxed)),
+                                    static_cast<unsigned long long>(c->generation.load(std::memory_order_relaxed)),
+                                    static_cast<unsigned long long>(at - g.begin), static_cast<unsigned long long>(g.code_committed_end - g.begin),
+                                    c->lazy_pages.Pending(at) ? ", a restored page not read in" : "");
+        return n < 0 ? 0 : std::min<size_t>(static_cast<size_t>(n), cap - 1);
+    }
+    return 0;
 }
 
 void SharedCodeCache::EnableSnapshots() {

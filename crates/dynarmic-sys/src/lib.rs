@@ -843,6 +843,15 @@ extern "C" {
     /// As [`od_code_cache_invalidate_range`].
     pub fn od_code_cache_evict_to(cache: *mut c_void, keep_bytes: u64) -> u64;
 
+    /// Patch 0100: where `address` is in this process's shared caches (a prelude, or a region, its
+    /// state and whether the page is a lazily restored one not read in), one line into `out` (`cap`
+    /// bytes, NUL-terminated); its length, 0 if no cache holds it. Takes no lock and allocates
+    /// nothing: callable from a crash report.
+    ///
+    /// # Safety
+    /// `out` is valid for `cap` bytes.
+    pub fn od_describe_code_address(address: u64, out: *mut core::ffi::c_char, cap: u64) -> u64;
+
     /// Where a jit's `JitState` keeps the two exclusive-monitor slot pointers that code in a shared
     /// cache loads (`mov r64, [r15 + offset]`) where a jit with its own cache has the slot
     /// addresses as immediates -- for a sampler that recognises monitor code by what it reads.

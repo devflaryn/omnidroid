@@ -735,6 +735,19 @@ void od_code_cache_clear(void* p) {
 #endif
 }
 
+uint64_t od_describe_code_address(uint64_t address, char* out, uint64_t cap) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    return static_cast<uint64_t>(Dynarmic::A64::SharedCodeCache::DescribeAddress(address, out, static_cast<std::size_t>(cap)));
+#else
+    (void)address;
+    if (out != nullptr && cap != 0) {
+        out[0] = 0;
+    }
+    (void)cap;
+    return 0;
+#endif
+}
+
 uint64_t od_code_cache_evict_to(void* p, uint64_t keep_bytes) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     if (p != nullptr) {

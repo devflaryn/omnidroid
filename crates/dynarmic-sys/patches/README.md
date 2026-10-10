@@ -1091,3 +1091,14 @@ entered). Now the regions are taken oldest first while they fit and the rest lef
 saved region that linked into one left out is restored unlinked, as any). omni-linux's cap is three
 quarters of the live budget by default (`OMNI_JIT_SNAPSHOT_MAX_MB`; 384 of 512 MiB), so a restored
 cache has room for what is new. The snapshot test passes lazily and not (Linux, first cache freed).
+
+### 0100 — x64: an address in a shared cache, described for a crash report
+
+`SharedCodeCache::DescribeAddress(address, out, cap)`: which live shared cache holds `address`, and
+where -- its prelude, or a region with its state (free, current, full, retired), sequence, retirement
+epoch against the cache's epoch and generation, how far it is committed, and whether the page is a
+lazily restored one never read in -- as one line. Every cache registers itself in a fixed table of
+256 when made and leaves it when freed; the description takes no lock and allocates nothing (what it
+reads may be changing), so a crash report can call it. For s17/s26's crash: the game's host died of
+an access violation in generated code while its cache retired regions, with snapshots on four
+E-cores, and nothing said where.

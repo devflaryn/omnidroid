@@ -232,6 +232,13 @@ public:
     /// and translated again if they run again. Same restriction. How many regions were retired.
     std::size_t EvictTo(std::size_t keep_bytes);
 
+    /// Omnidroid patch 0100: where `address` is in the shared caches alive in this process -- a
+    /// cache's prelude or a region of it, the region's state, its sequence and retirement epoch,
+    /// whether the page is a lazily restored one not read in -- as one line in `out` (at most `cap`
+    /// bytes, NUL-terminated); its length, 0 if no cache holds it. For a crash report: it takes no
+    /// lock and allocates nothing, and what it reads may be changing as it reads.
+    static std::size_t DescribeAddress(std::uint64_t address, char* out, std::size_t cap);
+
     /// Omnidroid patch 0070: translation snapshots. `EnableSnapshots` makes the cache remember, for
     /// every block it emits from now on, a hash of the guest code it was translated from (read
     /// back through the translating thread's `MemoryReadCode`). `SaveSnapshot` writes every live

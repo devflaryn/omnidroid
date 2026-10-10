@@ -1581,3 +1581,45 @@ fn restored_code_under_eviction(program: &[u32], count: u64) {
     println!("{passes} passes; {evicted} regions evicted, {forgotten} forgotten; {stats:?}");
     assert!(passes >= 2 && evicted >= 2, "{passes} {evicted}");
 }
+
+/// Patch 0100: an address in a live shared cache is described -- its prelude, a region and its
+/// state -- and one in no cache is not (a crash report's account of generated code). Found through
+/// `/proc/self/maps`: the cache's buffer is an executable anonymous mapping.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_address_in_a_shared_cache_is_described() {
+    let describe = |addr: u64| {
+        let mut buf = [0 as core::ffi::c_char; 256];
+        // SAFETY: `buf` holds 256 bytes.
+        let n = unsafe { od_describe_code_address(addr, buf.as_mut_ptr(), buf.len() as u64) } as usize;
+        // SAFETY: NUL-terminated within `buf`.
+        let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy().into_owned();
+        assert_eq!(n, text.len());
+        text
+    };
+    let space = Space::new(VmOptions::default(), 1, CACHE, REGION, &sum_loop(10));
+    for (x0, _, _) in run_all(&space, 1, true) {
+        assert_eq!(x0, 55);
+    }
+    assert_eq!(describe(0x1000), "", "no cache holds a low address");
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+    let mut seen = Vec::new();
+    for line in maps.lines() {
+        let mut f = line.split_whitespace();
+        let (range, perms) = (f.next().unwrap(), f.next().unwrap());
+        if !perms.contains('x') {
+            continue;
+        }
+        let (lo, hi) = range.split_once('-').unwrap();
+        let (lo, hi) = (u64::from_str_radix(lo, 16).unwrap(), u64::from_str_radix(hi, 16).unwrap());
+        let at = describe(lo);
+        if at.is_empty() {
+            continue;
+        }
+        seen.push(at.clone());
+        assert!(at.contains("prelude"), "{at}");
+        let deeper = describe(lo + (hi - lo) / 2);
+        assert!(deeper.contains("region") && (deeper.contains("free") || deeper.contains("current") || deeper.contains("full")), "{deeper}");
+    }
+    assert!(!seen.is_empty(), "the cache's buffer was found");
+}

@@ -901,6 +901,25 @@ fn write_stderr(bytes: &[u8]) {
     }
 }
 
+/// See [`super::set_crash_describer`]: a `fn(u64, &mut [u8]) -> usize`, or 0.
+pub(super) static CRASH_DESCRIBER: AtomicUsize = AtomicUsize::new(0);
+
+/// `what` and the describer's line for `address`, if it has one.
+fn put_described(buf: &mut [u8], at: &mut usize, what: &[u8], address: u64) {
+    let f = CRASH_DESCRIBER.load(Ordering::Relaxed);
+    if f == 0 {
+        return;
+    }
+    // SAFETY: only `set_crash_describer` stores here, a `fn(u64, &mut [u8]) -> usize`.
+    let describe: fn(u64, &mut [u8]) -> usize = unsafe { core::mem::transmute::<usize, fn(u64, &mut [u8]) -> usize>(f) };
+    let mut line = [0u8; 320];
+    let n = describe(address, &mut line).min(line.len());
+    if n > 0 {
+        put(buf, at, what);
+        put(buf, at, &line[..n]);
+    }
+}
+
 /// How many declined access violations [`veh`] has reported.
 static DECLINED_SAID: AtomicUsize = AtomicUsize::new(0);
 
@@ -919,12 +938,13 @@ unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
 /// `info` is null or the exception pointers the OS handed a handler, for the handler's call.
 unsafe fn report(prefix: &[u8], info: *const EXCEPTION_POINTERS) {
     use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    let mut described = (0u64, 0u64);
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleFileNameA, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
     };
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-    let mut buf = [0u8; 512];
+    let mut buf = [0u8; 1280];
     let mut at = 0;
     put(&mut buf, &mut at, prefix);
     if !info.is_null() {
@@ -964,7 +984,9 @@ unsafe fn report(prefix: &[u8], info: *const EXCEPTION_POINTERS) {
                     _ => b" accessing ".as_slice(),
                 });
                 put_hex(&mut buf, &mut at, params[1] as u64);
+                described.1 = params[1] as u64;
             }
+            described.0 = address as u64;
         }
         // SAFETY: as above; the context is the faulting thread's.
         let context = unsafe { (*info).ContextRecord };
@@ -983,6 +1005,11 @@ unsafe fn report(prefix: &[u8], info: *const EXCEPTION_POINTERS) {
     put(&mut buf, &mut at, b", thread ");
     // SAFETY: no arguments.
     put_hex(&mut buf, &mut at, u64::from(unsafe { GetCurrentThreadId() }));
+    // Generated code: which cache, region and state the instruction and the address are in.
+    put_described(&mut buf, &mut at, b"; the instruction: ", described.0);
+    if described.1 != 0 {
+        put_described(&mut buf, &mut at, b"; the address: ", described.1);
+    }
     put(&mut buf, &mut at, b"\n");
     let handle = CRASH_STDERR.load(Ordering::Relaxed);
     if handle != 0 {

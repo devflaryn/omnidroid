@@ -467,6 +467,9 @@ void od_code_cache_clear(void* cache);
 /* Patch 0050: retire the oldest full regions until at most `keep_bytes` of regions are live (at
  * least the one being filled stays); how many were retired. Same restriction as the clear. */
 uint64_t od_code_cache_evict_to(void* cache, uint64_t keep_bytes);
+/* Patch 0100: where `address` is in this process's shared caches, one line into `out` (`cap`
+ * bytes, NUL-terminated); its length, 0 if in none. No lock, no allocation: for a crash report. */
+uint64_t od_describe_code_address(uint64_t address, char* out, uint64_t cap);
 /* Patch 0070: translation snapshots (x64; a no-op returning -1 elsewhere). `enable` makes the
  * cache hash the guest code of every block it emits from then on. `save` writes every live block
  * that has a hash to `path` (UTF-8; written beside and renamed), tagged with `key`; the blocks

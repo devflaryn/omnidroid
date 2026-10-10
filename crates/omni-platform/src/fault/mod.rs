@@ -393,6 +393,21 @@ pub fn install_crash_report() {
     }
 }
 
+/// What the crash report says of an address in generated code: `describe(address, out)` writes one
+/// line into `out` and answers its length (0: nothing to say). Called from the crash report, so it
+/// must take no lock and allocate nothing -- the CPU backend's account of its code caches
+/// (`omni_cpu::dynarmic::describe_code_address`, dynarmic patch 0100).
+pub fn set_crash_describer(describe: fn(u64, &mut [u8]) -> usize) {
+    #[cfg(target_os = "windows")]
+    {
+        backend::CRASH_DESCRIBER.store(describe as usize, core::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = describe;
+    }
+}
+
 /// Dispatch counters. See [`FaultStats`].
 pub fn stats() -> FaultStats {
     backend::stats()
