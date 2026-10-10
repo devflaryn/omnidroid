@@ -582,3 +582,18 @@ The discards take **0.65-0.85 s of the game's busiest minute -- ~1% of one core*
 lock they hold cannot be what limits it. fps is noise (30.4 against 29.6 means), the world -7.5 s
 with the lock shared on two pairs -- under the bar. Stays opt-in. (Note: every fps under ~32 tonight
 is an E-core arm, the weak-PC stand-in -- full-CPU runs stay at 58-60.)
+
+## Session s34 (12:18-12:41): Roblox's mimalloc asked to purge after 1 s (`s34-purge.csv`, s32's build)
+
+`OMNI_APP_GUEST_ENV=MIMALLOC_PURGE_DELAY=1000` (5e8ea06: more of every app's environment), full CPU.
+
+| arm | fps | CPU ms/frame | commit GB | game commit GB | boot_completed | onGameLoaded | game's heaviest minute of discards |
+|---|---|---|---|---|---|---|---|
+| base | 59.45 | 41.09 | 3.837 | 2.508 | 18.3 | 64.5 | 30,455 calls, 7.9 GB |
+| purge1s | 59.35 | 38.12 | 3.826 | 2.511 | 20.1 | 69.5 | 28,117 calls, 7.9 GB |
+| purge1s | 59.23 | 42.03 | 3.875 | 2.533 | 20.1 | 69.0 | 29,769 calls, 8.1 GB |
+| base | 59.49 | 35.19 | 3.832 | 2.508 | 19.5 | 67.2 | 32,808 calls, 13.0 GB |
+
+**Not taken**: the discards are as many as without it, the commit the same. The variable reaches the
+app's host as `--env` (the harness splits only the first `=`); either Roblox's mimalloc sets its own
+options or these `MADV_DONTNEED`s are not its delayed purges. Dropped; the switch stays (harmless).
