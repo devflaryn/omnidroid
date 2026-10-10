@@ -62,7 +62,7 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    `OMNI_JIT_TIME`, `OMNI_SPAWN_TIME`, `[boot-ms]`, `[init] ... in N ms`; new benchmarks for
    snapshot installs and for threads translating side by side.
 
-## Found, being measured (queued sessions s14-s20)
+## Found, being measured
 
 - **Translation snapshots: the world ~10 s sooner (6-14 s; s16, tonight's build: 59.7/67.5 s
   against 74.1/73.2 s), sign-in 4-11 s sooner, the same fps; cost +190 MB private commit / -250 MB
@@ -70,12 +70,24 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   and a process re-saves only when 2% of its snapshot is new -- one fill run wrote 492 saves, 5.3 GB;
   both measured in s23). Small daemons verify 99.9%, apps 99.7%, the game 91%. One switch now:
   **`OMNI_JIT_SNAPSHOT=1`** (the temporary directory's `omni-jit-snapshot`, with lazy pages, the library
-  zone, forgetting and 512 MiB of live code by default). s17 measures them on 4 E-cores. **Not ready for a default: on four E-cores (s17) both snapshot runs crashed the game's host**
-  (an access violation while the cache retired regions; never without snapshots, 6 of 6; never at
-  full CPU). Being chased (s26, with the new `[host-crash]` report).
-- The idle apps left out of the image on 4 E-cores (s15: no gain), the
-  saved-device path you actually boot (s19), and who holds the system host's 13-16 MiB blocks (380
-  MiB of its 1.03 GB commit; s20).
+  zone, forgetting and 512 MiB of live code by default). **Not ready for a default: on four E-cores
+  the game's host died of an access violation in 3 of 4 runs (s17, s26)** -- never without snapshots
+  (6 of 6), never at full CPU; s28's two runs did not (no JIT change in between). On four E-cores they
+  are worth the most: **the world in 111-115 s against 140 s**. A crash now says where in generated
+  code it was (cache, region, state: dynarmic 0100) -- s32 runs four more. A new stress test (restored
+  code run by four jits while another evicts, forgets, invalidates and saves, on two cores) has not
+  faulted.
+- **The saved device you actually boot (s19): the world in 49-53 s** (a new device ~67-72 s),
+  boot_completed 17.5 s, the 767 MiB copy 0.9 s, apexd decompresses nothing. Two things it redid at
+  every boot, now fixed and being measured (s31): installd relabelling every app's data tree (labels
+  were in memory only; now kept per instance, c871dae) and PackageManager parsing all 170 system
+  packages (its cache never held: every file's mtime read 0; f273e9e). The cache fix helps devices
+  saved before at once (their cache files are there); the labels only once a device is made again.
+- Who holds the system host's ~1 GB: NT heap segments ~180 MiB (64 of it the JIT's tables), the
+  code caches 267, guest memory 214, the GPU driver's write-combined memory 93, large blocks ~220
+  (s20 traces the Rust ones). The game's 2.5 GB: Roblox's own mimalloc arenas ~1.55 GB of guest
+  memory, the driver's 336 MiB. The game frees memory with `MADV_DONTNEED` at 54k calls / 6.7 GB in
+  its first minute, each holding the address space's lock: being timed (s32).
 
 ## For you to decide
 
