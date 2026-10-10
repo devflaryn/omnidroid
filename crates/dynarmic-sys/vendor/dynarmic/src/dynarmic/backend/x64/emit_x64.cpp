@@ -743,7 +743,9 @@ size_t EmitX64::ForgetUnverifiedBlocks(const std::vector<u64>& locations, std::v
         dead_code.emplace_back(entry, entry + (stored.size & ~UNVERIFIED_BLOCK));
         Unpatch(location);
         ForgetOutgoingSlots(stored.first_link);
-        KeepHeadOf(it->first, stored);  // patch 0064
+        // Patch 0101: the head as it is now, not the copy's -- a loop links to itself, and
+        // forgetting its own links may have moved its head (a dead record would head the list).
+        KeepHeadOf(it->first, it->second);  // patch 0064
         block_descriptors.erase(it);
         forgotten++;
     }

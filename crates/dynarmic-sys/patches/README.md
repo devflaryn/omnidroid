@@ -1102,3 +1102,15 @@ lazily restored one never read in -- as one line. Every cache registers itself i
 reads may be changing), so a crash report can call it. For s17/s26's crash: the game's host died of
 an access violation in generated code while its cache retired regions, with snapshots on four
 E-cores, and nothing said where.
+
+### 0101 — x64: a forgotten loop's head, read after its links are forgotten
+
+`ForgetUnverifiedBlocks` handed the block's head of incoming links to `link_heads` from a copy taken
+before `ForgetOutgoingSlots` -- and a loop links to itself, so forgetting its own links can move its
+own head. A dead record then headed the location's list; the location translated again threaded its
+new links through it, the restored region's eviction trimmed it, and the next unlink of those links
+wrote `LinkAt(next).prev` 2^32 records past the vector (`ForgetOutgoingSlots`, emit_x64.cpp). The
+head is now read from the block map, as the eviction and invalidation paths read it. This was s17,
+s26 and s32's crash: the game's host died of an access violation minutes after "restored blocks never
+entered forgotten", with snapshots, mostly on four E-cores (more regions evicted). Test:
+`a_restored_loop_forgotten_unverified_leaves_no_dead_head` (SIGSEGV before, passes after).

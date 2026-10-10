@@ -85,6 +85,7 @@ dynarmic/
                and ../patches/0098-a64-ic-ivau-batched-until-isb.patch
                and ../patches/0099-x64-a-snapshot-past-its-cap-keeps-its-oldest-regions.patch
                and ../patches/0100-x64-describe-code-address.patch
+               and ../patches/0101-x64-a-forgotten-loop-s-head-read-after-its-links.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

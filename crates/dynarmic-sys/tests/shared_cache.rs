@@ -1582,6 +1582,81 @@ fn restored_code_under_eviction(program: &[u32], count: u64) {
     assert!(passes >= 2 && evicted >= 2, "{passes} {evicted}");
 }
 
+/// `n` loops in a row, each `X1 = 3` then `X0 += 1` three times (`B.NE` back to its own block); then
+/// `SVC #0`. X0 ends at `3 n`.
+fn loops(n: usize) -> Vec<u32> {
+    let mut code = Vec::with_capacity(n * 4 + 1);
+    for _ in 0..n {
+        code.push(a64::movz(1, 3, 0));
+        code.push(a64::add_imm(0, 0, 1)); // loop:
+        code.push(a64::subs_imm(1, 1, 1));
+        code.push(a64::b_cond(a64::cond::NE, -2));
+    }
+    code.push(a64::svc(0));
+    code
+}
+
+/// **A restored loop forgotten unverified leaves no dead record at the head of its links** (patch
+/// 0101; s32, 2026-10-10: the game's host died in `ForgetOutgoingSlots`, writing through a record
+/// already trimmed, minutes after "restored blocks never entered forgotten"). A loop's block links
+/// to itself, so forgetting its own links moves the head of the links to it; the head handed to
+/// `link_heads` was read before that, and a dead record headed the list. The location translated
+/// again threaded its new links through it, the restored region's eviction trimmed it, and the
+/// next unlink of those links wrote 2^32 records past the start. Here: the loops restored and
+/// forgotten, run (translated again), the restored regions evicted, then all of it invalidated --
+/// and run again.
+#[test]
+#[ignore = "loads a snapshot, run alone (other caches alive change the code shape: load -10): --ignored --exact"]
+fn a_restored_loop_forgotten_unverified_leaves_no_dead_head() {
+    use std::ffi::CString;
+    const N: usize = 60_000;
+    let program = loops(N);
+    let path = std::env::temp_dir().join(format!("od-loop-snapshot-{}", std::process::id()));
+    let p = CString::new(path.to_str().unwrap()).unwrap();
+    let key = CString::new("loops").unwrap();
+    let first = Space::with_live(VmOptions::default(), 1, 64 << 20, 8 << 20, 64 << 20, &program);
+    // SAFETY: a live cache, nothing emitted yet.
+    unsafe { od_code_cache_enable_snapshots(first.cache as *mut c_void) };
+    for (x0, _, _) in run_all(&first, 1, true) {
+        assert_eq!(x0, 3 * N as u64);
+    }
+    assert_eq!(first.stats().regions_evicted, 0, "all of it kept: {:?}", first.stats());
+    // SAFETY: live; no jit is running.
+    let saved = unsafe { od_code_cache_save_snapshot(first.cache as *mut c_void, p.as_ptr(), key.as_ptr(), u64::MAX, 0) };
+    assert!(saved > N as i64, "saved {saved}");
+    let arena = first.arena as *mut u64;
+    drop(first);
+
+    let space = Space::with_arena(VmOptions::default(), 1, 64 << 20, 8 << 20, 64 << 20, &program, arena);
+    // SAFETY: as above.
+    unsafe { od_code_cache_enable_snapshots(space.cache as *mut c_void) };
+    let loaded = unsafe { od_code_cache_load_snapshot(space.cache as *mut c_void, p.as_ptr(), key.as_ptr(), OD_SNAPSHOT_LOAD_LAZY) };
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(loaded, saved);
+    assert!(space.stats().regions_live >= 2, "the restored code spans regions: {:?}", space.stats());
+    // SAFETY: a live cache; no jit is running.
+    let forgotten = unsafe { od_code_cache_forget_unverified(space.cache as *mut c_void) };
+    assert_eq!(forgotten, loaded, "nothing was entered");
+
+    let vm = space.vm(0, true);
+    let run = || {
+        vm.start(u64::MAX >> 2);
+        vm.set_pc(CODE_BASE);
+        vm.set_reg(0, 0);
+        assert_eq!(vm.run_to_completion(1 << 20) & HALT_DONE, HALT_DONE);
+        assert_eq!(vm.reg(0), 3 * N as u64);
+    };
+    run();
+    // SAFETY: a live cache; this thread's jit is not running.
+    let evicted = unsafe { od_code_cache_evict_to(space.cache as *mut c_void, 0) };
+    assert!(evicted >= 1, "the restored regions were evicted: {:?}", space.stats());
+    // Every block unlinked from its targets' lists: through any dead record, a write far outside.
+    // SAFETY: as above.
+    unsafe { od_code_cache_invalidate_range(space.cache as *mut c_void, CODE_BASE, 4 * program.len() as u64) };
+    run();
+    println!("{saved} saved, {forgotten} forgotten, {evicted} evicted; {:?}", space.stats());
+}
+
 /// Patch 0100: an address in a live shared cache is described -- its prelude, a region and its
 /// state -- and one in no cache is not (a crash report's account of generated code). Found through
 /// `/proc/self/maps`: the cache's buffer is an executable anonymous mapping.
