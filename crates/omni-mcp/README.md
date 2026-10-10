@@ -32,11 +32,8 @@ claude mcp add omnidroid -- /ABSOLUTE/PATH/to/target/release/omni-mcp
     "omnidroid": {
       "command": "/ABSOLUTE/PATH/to/target/release/omni-mcp",
       "env": {
-        "OMNI_MCP_APK": "/ABSOLUTE/PATH/to/Roblox-2.740.931.apk",
-        "OMNI_MCP_COOKIE": "/ABSOLUTE/PATH/to/cookies/account.txt",
-        "OMNI_MCP_PLACE": "8737899170",
+        "OMNI_MCP_APK": "/ABSOLUTE/PATH/to/app.apk",
         "OMNI_MCP_GPU": "auto",
-        "OMNI_MCP_STANDBY": "1",
         "OMNIDROID_BIN": "/ABSOLUTE/PATH/to/target/release/omnidroid",
         "OMNI_MCP_REPO": "/ABSOLUTE/PATH/to/omnidroid"
       }
@@ -53,8 +50,8 @@ All of these are optional and overridable per tool call. On Windows use `omni-mc
 | Variable | Meaning |
 |---|---|
 | `OMNI_MCP_APK` | default APK to boot |
-| `OMNI_MCP_COOKIE` | cookie file path or saved account name |
-| `OMNI_MCP_PLACE` | place id to join (e.g. `8737899170`) |
+| `OMNI_MCP_ARGS` | launcher options for a session of its own, whitespace separated: an installed plugin's (e.g. a sign-in). Unset: an APK runs on the warm device |
+| `OMNI_MCP_LINK_ID` | the id a session's link opens (the link is a plugin's, `omni_linux::app_session`) |
 | `OMNI_MCP_GPU` | `vulkan` \| `gl` \| `auto` |
 | `OMNI_MCP_SIZE` | window size `WxH` |
 | `OMNI_MCP_DEVICE_RAM_MB` | device RAM (passed through as `OMNI_DEVICE_RAM_MB`) |
@@ -73,13 +70,13 @@ All of these are optional and overridable per tool call. On Windows use `omni-mc
 ## Any APK in seconds: the warm device
 
 An agent that builds APKs and tests them one after another should not boot Android per APK.
-Without an account (no `cookie`), `start_instance` and `install_apk` act on the host's **one warm
-device** -- Android booted and idle, no app of its own (`omnidroid aosp --warm`):
+With only an APK -- any APK, no `args` or `link_id` -- `start_instance` and `install_apk` act on the
+host's **one warm device** -- Android booted and idle, no app of its own (`omnidroid aosp --warm`):
 
 - **Found, not made, when it is there.** A warm device is `<temp>/omni-warm-<secs>`, alive while its
   control channel's heartbeat (`<dir>.ctl/alive`) is fresh. Every server on the host uses the one
   that is up; one is booted (under `<temp>/omni-warm.lock`) only when none is, and it outlives the
-  server that booted it. Another device on the host (a Roblox session or standby) stops a boot.
+  server that booted it. Another device on the host (a session of its own, or a standby) stops a boot.
 - **The control channel.** A shell command written as `<dir>.ctl/<id>.cmd` runs beside the device
   as the shell user (`#uid=<n>` first line: another uid), its output lands in `<id>.out` and its
   status in `<id>.rc` -- `adb shell` without adb (`tools/device_ctl.py` from a terminal).
@@ -95,32 +92,33 @@ device** -- Android booted and idle, no app of its own (`omnidroid aosp --warm`)
 
 Measured 2026-10-01 (i7-13700F, Windows; `docs/MORNING-2026-10-01-fast-boot.md`): from nothing to
 the probe app's first screen ~87 s (the device boots from its saved copy, ~56 s); on the warm
-device the same APK again ~4 s, a rebuilt APK of the same version ~15 s, another app ~18 s, Roblox
+device the same APK again ~4 s, a rebuilt APK of the same version ~15 s, another app ~18 s, a large game
 ~34 s -- where a new APK used to be a new device (~185-210 s).
 
 ## Fast starts: the saved device and the standby instance
 
-A device's first boot is slow (~8 min to PS99 on the 2026-09-30 Windows host): Android boots new,
-the APK is installed and compiled, the app starts, the cookie is planted, the app starts again.
-Two things take that off the agent's clock:
+A device's first boot is slow (minutes for a large app): Android boots new, the APK is installed
+and compiled, the app starts (and, with a plugin's sign-in, the cookie is planted). Two things take
+that off the agent's clock:
 
 - **The saved device** (`omnidroid aosp`, always; `--fresh-device` makes a new one). The first
-  session for an APK and account saves its device once signed in, under
+  session for an APK (and account) saves its device once the app is up, under
   `<temp>/omni-golden/<apk>-<size>-<account>-...`; every later one boots a copy of it and opens the
-  place's link at once -- no first boot, no install, no cookie planted. A new cookie file (another
-  modification time) or APK is another device. A saved device whose app never signs in (a cookie
-  Roblox has ended) is set aside after 10 minutes.
-- **The standby instance** (`OMNI_MCP_STANDBY=1`). When a client connects, the server boots one
-  instance from the saved device with the configured APK, account and place, and leaves it waiting
-  -- in the place. `start_instance` with the same APK and account takes it over: already in the
-  place (nothing to wait for), or the place asked for is joined (seconds to "Joining game", the
-  place's own load after that). It is started detached and outlives the server; when the server
-  exits, a standby it took over is given back still running, for the next session. A standby the
-  server disconnects (idle kick, a server shutdown) joins its place again. `stop_instance` on it
-  ends it, and a new standby boots. It holds ~4-5 GB of RAM and some CPU while it waits.
+  session's link at once -- no first boot, no install, no cookie planted. A new cookie file (another
+  modification time) or APK is another device. A saved signed-in device whose app never signs in
+  again (a cookie its server has ended) is set aside after 10 minutes.
+- **The standby instance** (`OMNI_MCP_STANDBY=1`, with `OMNI_MCP_ARGS`/`OMNI_MCP_LINK_ID`). When a
+  client connects, the server boots one instance from the saved device with the configured APK,
+  options and link id, and leaves it waiting -- with its link open. `start_instance` with the same
+  APK and options takes it over: already loaded (nothing to wait for), or the link opened with the
+  id asked for. It is started detached and outlives the server; when the server exits, a standby
+  it took over is given back still running, for the next session. A standby the app's server
+  disconnects opens its link again. `stop_instance` on it ends it, and a new standby boots.
 
 Its files are `<temp>/omni-linux-r-standby-<secs>/data/local/tmp/`: `standby` (waiting),
-`game-loaded` (the place it is in), `claimed`, `join-place` (write a place id to join it), `stop`.
+`game-loaded` (the id its link loaded), `claimed`, `join-place` (write an id to open it), `stop`.
+How far a session got is read from the log lines its plugin names (`omni_linux::app_session`:
+signed in, link taken, loaded); a session without them shows `booting` until it stops.
 
 ## Tools
 
@@ -128,16 +126,14 @@ Its files are `<temp>/omni-linux-r-standby-<secs>/data/local/tmp/`: `standby` (w
 
 | Tool | What it does |
 |---|---|
-| `start_instance` | without `cookie`: the APK on the warm device (installed by content, started; answers when on screen). With `cookie`: a signed-in Roblox session (returns at once; takes over the standby when one waits) |
+| `start_instance` | any APK. With only `apk`: on the warm device (installed by content, started; answers when on screen). With `args` (a plugin's launcher options) or `link_id`: a session of its own (returns at once; takes over the standby when one waits) |
 | `stop_instance` | an app on the warm device: force-stopped and cleared, the device stays warm (`device: true` shuts it down). A session: its device shuts down |
-| `list_instances` | each instance's `state`: `booting`, `signed_in`, `joining`, `in_game` (+ `in_place`), `stopped`; and its log |
+| `list_instances` | each instance's `state`: `app_running` (warm device); a session's `booting`, `signed_in`, `link_taken`, `loaded` (+ `loaded_id`), `stopped`; and its log |
 | `install_apk` | install on the warm device now (by content), and record it as the default APK |
 | `uninstall_apk` / `stop_app` | uninstall a package / force-stop and clear it, on the warm device |
 | `shell` | a shell command on the warm device (shell user, or `uid`) |
 | `device_status` / `stop_device` | the warm device's state and test apps / shut it down |
-| `launch_app` | boot the app (same as `start_instance` on the real-AOSP path) |
-| `login` | record a cookie for the next boot |
-| `join_place` | record a place id for the next boot |
+| `launch_app` | the same as `start_instance` |
 | `screenshot` | read the latest framebuffer PNG (returns path + dimensions) |
 
 ### Emulation-layer debugging & dumping (a lab session)

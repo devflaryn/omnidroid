@@ -16,7 +16,7 @@
       "value": "id",
       "min": 1,
       "commands": ["play", "aosp"],
-      "env": { "play": "OMNI_JOIN_PLACE", "aosp": "OMNI_R_PLACE" },
+      "env": { "play": "OMNI_JOIN_PLACE", "aosp": "OMNI_R_LINK_ID" },
       "help": "join this place once the sign-in reaches Home"
     },
     {

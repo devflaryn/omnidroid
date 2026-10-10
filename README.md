@@ -1,33 +1,35 @@
 # Omnidroid
 
-Omnidroid runs an Android app as a native desktop process so you can test and debug it: you
+Omnidroid runs any Android app as a native desktop process so you can test and debug it: you
 install an APK, start it in a window of its own, drive it, take screenshots, and inspect what the
 app is doing at the ARM64 level. Not an emulator and no virtualization: the APK's arm64 libraries
 are loaded by our own ELF loader, executed by dynarmic (ARM64 → x86-64 translation, or ARM64 on
 ARM64 hosts), and the Android surface the app uses (bionic, JNI without a JVM, the NDK,
 Vulkan/GLES, audio, input, networking) is implemented on the host.
 
-The APK is not in version control; put it in the repo root or pass `--apk <path>`. Only
-`lib/arm64-v8a` is used.
+The APK is not in version control; pass its path (or put it in the repo root). Only
+`lib/arm64-v8a` native code is used.
 
 ## Quick start
 
 ```text
 cargo build --release -p omnidroid
-target/release/omnidroid play --apk path/to/app.apk      (Windows: target\release\omnidroid play)
+target/release/omnidroid path/to/app.apk                 (Windows: target\release\omnidroid)
 ```
 
 `omnidroid help` lists every option. Close the window to end a session cleanly, or pass
 `--minutes <n>` to bound it.
 
-- `play` runs the APK on the emulation layer (fast, in-process).
-- `aosp` runs it on the real-AOSP path: a real Android userspace boots and the APK is installed
-  with `pm install` and started from its launcher. Use it when the app needs a genuine Android
-  environment.
+- `aosp` (the default; `omnidroid <app.apk>` is `omnidroid aosp --apk <app.apk>`) runs any APK on
+  the real-AOSP path: a real Android userspace boots (or the host's warm device is used) and the
+  APK is installed with `pm install` and started from the launcher Activity its manifest names.
+- `play` runs the APK's native code on the emulation layer (fast, in-process). It has no Java
+  runtime, so it serves only the apps whose Java side the engine answers itself.
 - `which` shows which APK would be chosen without running it.
 
-Per-app behaviour that is not part of the launcher (test accounts, default arguments, start-up
-hooks, extra commands) lives in a plugin; see `plugins/README.md`.
+The launcher knows no app. Per-app behaviour (a sign-in, a link opened once the app is up, the log
+lines that say how far it got, default arguments, extra commands) lives in a plugin; see
+`plugins/README.md` and `crates/omni-linux/src/app_session.rs`.
 
 ## Debugging
 

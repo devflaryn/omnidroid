@@ -17,7 +17,7 @@ fn main() {
                 eprintln!(
                     "omni-mcp: an MCP (stdio) server that drives omnidroid.\n\
                      Speaks JSON-RPC 2.0 on stdin/stdout (one message per line).\n\
-                     Config via env: OMNI_MCP_APK, OMNI_MCP_COOKIE, OMNI_MCP_PLACE, OMNI_MCP_GPU,\n\
+                     Config via env: OMNI_MCP_APK, OMNI_MCP_ARGS, OMNI_MCP_LINK_ID, OMNI_MCP_GPU,\n\
                      OMNI_MCP_SIZE, OMNI_MCP_DEVICE_RAM_MB, OMNI_MCP_MINUTES, OMNIDROID_BIN, OMNI_MCP_REPO.\n\
                      See crates/omni-mcp/README.md for a .mcp.json snippet."
                 );

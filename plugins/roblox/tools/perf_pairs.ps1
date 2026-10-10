@@ -1,7 +1,7 @@
 # Paired A/B statistics from a perf_live.ps1 CSV (pair,arm,...): per metric, the medians of A and B,
 # the median paired delta (B - A) with its min/max and in how many pairs B > A, and a noise band --
 # the spread of A-vs-A differences between consecutive pairs' A phases (what "no change" looks like).
-#   powershell -File tools\perf_pairs.ps1 -Csv C:\od-unified\perf\live\<run>.csv
+#   powershell -File plugins\roblox\tools\perf_pairs.ps1 -Csv C:\od-unified\perf\live\<run>.csv
 param([Parameter(Mandatory)][string]$Csv)
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 $rows = Import-Csv $Csv

@@ -2,7 +2,7 @@
 """Time a command from its start to Pet Simulator 99's own loading screen (the place's, after
 "Joining game" -- Roblox's join screens before it do not count).
 
-    python tools/join_timer.py [--label L] [--out DIR] [--after S] [--limit S] [--stop] -- <command...>
+    python plugins/roblox/tools/join_timer.py [--label L] [--out DIR] [--after S] [--limit S] [--stop] -- <command...>
 
 The session's display and log are found by themselves: the newest `<temp>/omni-linux-r-*.png` or
 `<temp>/omni-warm-*.png` written since the start, its log beside it (`.log`; only what is

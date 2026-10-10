@@ -1,6 +1,6 @@
 # Run a measurement script over a sequence of arms, e.g. an ABBA order so drift cancels:
-#   powershell -File tools\perf_ab_seq.ps1 -Csv C:\od-unified\perf\ab\phase0.csv -Seq "pw,main,main,pw" `
-#     -Arms "pw=C:\odw\pw\target\release\deps\r_roblox-X.exe;main=...\r_roblox-Y.exe"
+#   powershell -File plugins\roblox\tools\perf_ab_seq.ps1 -Csv C:\od-unified\perf\ab\phase0.csv -Seq "pw,main,main,pw" `
+#     -Arms "pw=C:\odw\pw\target\release\deps\r_app-X.exe;main=...\r_app-Y.exe"
 # An arm may carry its own environment after '|', comma-separated:
 #     -Arms "full=<exe>|OMNI_PROP_FULL_COPY=1;tail=<exe>" -Script perf_boot.ps1
 param(

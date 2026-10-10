@@ -1,4 +1,4 @@
-# A short boot for a RAM A/B of boot-time state (docs/NIGHT-2026-10-02.md): boot a prebuilt r_roblox
+# A short boot for a RAM A/B of boot-time state (docs/NIGHT-2026-10-02.md): boot a prebuilt r_app
 # test binary, wait for -Marker in its log (default: the app relaunched signed in), wait -AfterSec,
 # then census every guest host process and append one CSV row:
 #   sys_priv_mb      -- the system's host process (system_server's), private bytes
@@ -7,7 +7,7 @@
 #   app_priv_mb      -- the app's host process
 #   all_priv_mb      -- every guest host process
 #   all_noexec_mb    -- every guest host process, less executable private memory
-#   powershell -File tools\perf_boot.ps1 -Arm full -Exe <r_roblox-*.exe> -ExtraEnv "OMNI_PROP_FULL_COPY=1"
+#   powershell -File plugins\roblox\tools\perf_boot.ps1 -Arm full -Exe <r_app-*.exe> -ExtraEnv "OMNI_PROP_FULL_COPY=1"
 param(
   [Parameter(Mandatory)][string]$Arm,
   [Parameter(Mandatory)][string]$Exe,
@@ -25,11 +25,11 @@ $ErrorActionPreference = "Continue"
 $dir = Split-Path -Parent $Csv; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $tag = "$Arm-" + (Get-Date -Format "MMdd-HHmmss")
 $env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"; $env:OMNI_R_MINUTES = [string]($TimeoutMin + 2)
-$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; Remove-Item env:OMNI_R_PLACE -ErrorAction SilentlyContinue
+$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; . (Join-Path $PSScriptRoot "roblox_session.ps1"); Remove-Item env:OMNI_R_LINK_ID -ErrorAction SilentlyContinue
 $env:OMNI_SYSROOT = $Sysroot; Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
 foreach ($n in "OMNI_PROP_FULL_COPY", "OMNI_JIT_UNSAFE_FP", "OMNI_LEVER_FILE") { Remove-Item "env:$n" -ErrorAction SilentlyContinue }
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
-function Stop-Guests { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue }
+function Stop-Guests { Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_app*" } | Stop-Process -Force -ErrorAction SilentlyContinue }
 Stop-Guests; Start-Sleep 3
 # A boot needs ~13 GB of free commit; below that it would starve this host's other processes (the
 # owner's games) as well as itself. Wait for it (up to 30 min); never boot without it.

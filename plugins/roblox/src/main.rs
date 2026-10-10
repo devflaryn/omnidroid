@@ -13,8 +13,15 @@
 //! `omnidroid-plugin.json`); omnidroid runs it with `OMNI_COMMAND`, `OMNI_APP_DATA_DIR`,
 //! `OMNI_FRESH`, `OMNI_GIVEN_DATA_DIR` and the options as `OMNI_ARG_COOKIE`, `OMNI_ARG_PLACE`,
 //! `OMNI_ARG_JOIN_DELAY`. `--place` and `--join-delay` reach the session by the manifest alone
-//! (`OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY` for `play`; `OMNI_R_PLACE` for `aosp`); the hook answers
+//! (`OMNI_JOIN_PLACE`, `OMNI_JOIN_DELAY` for `play`; `OMNI_R_LINK_ID` for `aosp`); the hook answers
 //! for `--cookie` and says what the session will do.
+//!
+//! **On `aosp` the launcher knows no app**: for a Roblox APK (`com.roblox.client`) this hook names
+//! what its session is (`omni_linux::app_session`) -- the place link and the Activity that takes
+//! it, the log lines that say the app signed in (`DID_LOG_IN`), joined (`Joining game`), loaded the
+//! place (`onGameLoaded`) or was disconnected, and the device's language (tr-TR, the owner's
+//! accounts': the app applies the account's locale to itself, and the relaunch that change causes
+//! ended the game session the link had just started). Any other APK is left alone.
 //!
 //! * **`--place <id>` joins that place** once the app's own saved sign-in has reached Home
 //!   (`--join-delay` seconds in, default 20): the gate calls `nativeAppBridgeV2StartGameWithParam`
@@ -176,10 +183,40 @@ fn play() -> Result<Answer, String> {
     Ok(answer)
 }
 
-/// `aosp`: the session plants the cookie from a file (never printed) -- a file, or a name `login`
-/// saved.
+/// Roblox's package.
+const PACKAGE: &str = "com.roblox.client";
+
+/// What a Roblox session on the real-AOSP path is (`omni_linux::app_session`'s variables).
+fn session_env(locale_given: bool) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("OMNI_R_LINK", format!("-a android.intent.action.VIEW -d \"roblox://experiences/start?placeId={{id}}\" -n {PACKAGE}/{PACKAGE}.ActivityProtocolLaunch")),
+        // The main Activity started (the splash is done): the earliest moment a place link is
+        // taken; one sent before it is lost (2026-10-02).
+        ("OMNI_R_LINK_READY", format!("{PACKAGE}/.ActivityNativeMain}}")),
+        ("OMNI_R_SIGNED_IN", "DID_LOG_IN".to_string()),
+        ("OMNI_R_LINK_TAKEN", "Joining game".to_string()),
+        ("OMNI_R_LOADED", "onGameLoaded() SessionReporterState_GameLoaded placeId:".to_string()),
+        ("OMNI_R_DISCONNECTED", "Client has been disconnected".to_string()),
+    ];
+    if !locale_given {
+        env.push(("OMNI_R_LOCALE", "tr-TR".to_string()));
+    }
+    env
+}
+
+/// `aosp`: for a Roblox APK, what its session is (`session_env`); the session plants the cookie
+/// from a file (never printed) -- a file, or a name `login` saved.
 fn aosp() -> Result<Answer, String> {
     let mut answer = Answer::default();
+    if var("OMNI_APK_PACKAGE").as_deref() != Some(PACKAGE) {
+        if var("OMNI_ARG_COOKIE").is_some() || var("OMNI_ARG_PLACE").is_some() {
+            return Err(format!("--cookie and --place are for a Roblox APK ({PACKAGE}), not {}", var("OMNI_APK_PACKAGE").unwrap_or_else(|| "this one".into())));
+        }
+        return Ok(answer);
+    }
+    for (key, value) in session_env(var("OMNI_R_LOCALE").is_some()) {
+        answer.env(key, &value);
+    }
     if let Some(arg) = var("OMNI_ARG_COOKIE") {
         let saved = cookies_dir().map(|d| d.join(format!("{arg}.txt"))).filter(|p| p.is_file());
         let path = match (Path::new(&arg).is_file(), saved) {
@@ -449,6 +486,20 @@ mod tests {
     use super::*;
 
     const VALUE: &str = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you.|_ABC123";
+
+    #[test]
+    fn a_roblox_session_names_its_link_and_markers_and_keeps_a_given_locale() {
+        let env = session_env(false);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
+        assert_eq!(
+            get("OMNI_R_LINK"),
+            Some("-a android.intent.action.VIEW -d \"roblox://experiences/start?placeId={id}\" -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch")
+        );
+        assert_eq!(get("OMNI_R_LINK_READY"), Some("com.roblox.client/.ActivityNativeMain}"));
+        assert_eq!((get("OMNI_R_SIGNED_IN"), get("OMNI_R_LINK_TAKEN")), (Some("DID_LOG_IN"), Some("Joining game")));
+        assert_eq!(get("OMNI_R_LOCALE"), Some("tr-TR"));
+        assert!(session_env(true).iter().all(|(k, _)| *k != "OMNI_R_LOCALE"), "a locale given is kept");
+    }
 
     #[test]
     fn a_cookie_is_read_from_every_shape_it_is_kept_in() {

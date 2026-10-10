@@ -126,7 +126,7 @@ fn c2_an_apk_loads_in_an_app_process() {
     // Not `zstd-jni`: in 2.740.931 it is a packed library whose `JNI_OnLoad` calls into
     // `libroblox.so`, which asks the running app for its objects -- a bare `app_process` has no
     // `Application`, and CheckJNI aborts on the null it gets. It is laid out for the page, loaded
-    // and decrypted by then (`pagecompat`, the widened `mprotect`); the real launch (`r_roblox`)
+    // and decrypted by then (`pagecompat`, the widened `mprotect`); the real launch (`r_app`)
     // is where it runs.
     let native: Vec<&String> = libs.iter().filter(|l| !l.starts_with("zstd-jni")).collect();
     argv.extend(native.iter().map(|l| l.as_str()));

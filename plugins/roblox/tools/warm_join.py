@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """Time a Roblox session on the host's warm device: from nothing installed to in the place.
 
-    python tools/warm_join.py --apk <apk> --cookie <file> --place 8737899170 [--mode preplant|relaunch]
+    python plugins/roblox/tools/warm_join.py --apk <apk> --cookie <file> --place 8737899170 [--mode preplant|relaunch]
                               [--label L] [--after S] [--shots S]
 
 The warm device (`omnidroid aosp --warm`) is up and idle; the APK is uninstalled first (not
 timed). Then, timed from t0: the APK installed, the cookie put in the app's WebView cookie store,
 the app started from its launcher, the place's deep link sent once it signs in. `relaunch` is what
-`r_roblox` does on a new device (first start, stop, plant, start again); `preplant` writes the
+`r_app` does on a new device (first start, stop, plant, start again); `preplant` writes the
 cookie store before the first start. Every `--shots` seconds the display is copied to
 `<scratch>/<label>/<ms>.png`; the log's marks (DID_LOG_IN, Joining game, onGameLoaded...) are
 printed with their time since t0, and written to `<scratch>/<label>/marks.json`.
 
 The prototype of `omnidroid aosp` on a warm device (crates/omnidroid/src/warm.rs); time the real
-command with tools/join_timer.py (tools/warm_join_bench.ps1). Tried here and not kept
+command with plugins/roblox/tools/join_timer.py (plugins/roblox/tools/warm_join_bench.ps1). Tried here and not kept
 (2026-10-02): `--seed` (the app's caches from an earlier run -- OTA patches, settings, its
 content store, even one filled in PS99 -- copied in before the first start: no faster sign-in or
 join), `--link-in-start` (the place's link on the launcher's own intent: the app ignores it).

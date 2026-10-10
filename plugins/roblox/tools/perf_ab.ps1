@@ -1,4 +1,4 @@
-# One in-world measurement run of a prebuilt r_roblox test binary (an "arm"), for interleaved A/B
+# One in-world measurement run of a prebuilt r_app test binary (an "arm"), for interleaved A/B
 # across builds (docs/NIGHT-2026-10-02.md). Boots the APK, waits for "Joining game", lets the world
 # load, then measures a fixed window and appends one CSV row:
 #   fps         -- presented frames / second over the window (from the [display] lines, exact)
@@ -11,7 +11,7 @@
 #   app_priv_gb -- median private bytes of the app's host process
 # Thread CPU is read from Windows (Process.Threads), so nothing inside the guest host is perturbed.
 #
-#   powershell -ExecutionPolicy Bypass -File tools\perf_ab.ps1 -Arm main -Exe <path to r_roblox-*.exe>
+#   powershell -ExecutionPolicy Bypass -File plugins\roblox\tools\perf_ab.ps1 -Arm main -Exe <path to r_app-*.exe>
 param(
   [Parameter(Mandatory)][string]$Arm,
   [Parameter(Mandatory)][string]$Exe,
@@ -40,7 +40,7 @@ $out = Join-Path $dir "$tag.out.log"; $err = Join-Path $dir "$tag.err.log"
 
 $env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"
 $env:OMNI_R_MINUTES = [string]($JoinTimeoutMin + 6)
-$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; $env:OMNI_R_PLACE = $Place
+$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; . (Join-Path $PSScriptRoot "roblox_session.ps1"); $env:OMNI_R_LINK_ID = $Place
 $env:OMNI_SYSROOT = $Sysroot
 Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
@@ -63,7 +63,7 @@ function Stop-Guests {
     if (Test-Path (Split-Path -Parent $stop)) { Set-Content -Path $stop -Value "stop" -ErrorAction SilentlyContinue }
     for ($i = 0; $i -lt 40 -and -not $proc.HasExited; $i++) { Start-Sleep 1 }
   }
-  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_app*" } | Stop-Process -Force -ErrorAction SilentlyContinue
   if ($proc) {
     Start-Sleep 2
     foreach ($d in @(("omni-linux-r-{0}" -f $proc.Id), ("omni-linux-r-{0}-shots" -f $proc.Id))) {

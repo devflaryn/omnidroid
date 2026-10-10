@@ -21,7 +21,29 @@ Windows: `%LOCALAPPDATA%\Omnidroid\plugins`; Linux: `$XDG_DATA_HOME/omnidroid/pl
 
 ## Here
 
-This repository ships no plugins yet. `omnidroid plugins new <name>` makes a starting point.
+`plugins/roblox` (a sign-in cookie, a place link, `login`, and the Roblox benchmark scripts in its
+`tools/`) is the worked example. `omnidroid plugins new <name>` makes a starting point.
+
+## What a session does beyond install-and-start
+
+`omnidroid aosp` installs any APK and starts its launcher Activity, nothing more. A plugin's
+`env` (or its `session-start` hook's `env` lines, which can look at `OMNI_APK_PACKAGE` first) names
+the rest with these variables (`crates/omni-linux/src/app_session.rs`), on the warm device and on a
+device of the session's own alike:
+
+| variable | meaning |
+|---|---|
+| `OMNI_R_COOKIE` | a cookie file put into the app's WebView cookie store before its first start |
+| `OMNI_R_LINK` | the `am start` arguments of a link the app takes; `{id}` is replaced with the id |
+| `OMNI_R_LINK_ID` | the id to open (an option's `env`, e.g. `--place` → `OMNI_R_LINK_ID`) |
+| `OMNI_R_LINK_READY` | a log text: the earliest moment the link is taken |
+| `OMNI_R_SIGNED_IN` | a log text: the app has signed in |
+| `OMNI_R_LINK_TAKEN` | a log text: the app took the link (else it is sent once, unchecked) |
+| `OMNI_R_LOADED` | a log text followed by the loaded id's digits |
+| `OMNI_R_DISCONNECTED` | a log text: the app's server ended the session |
+| `OMNI_R_LOCALE` | the device's language (default `en-US`) |
+
+The MCP server's `list_instances` reports a session's state from the same markers.
 
 ## Writing one
 

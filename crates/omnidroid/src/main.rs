@@ -1,16 +1,21 @@
-//! `omnidroid`: run an APK in a real window for a person to use, on Windows, macOS or Linux.
+//! `omnidroid`: run any APK in a real window for a person to use, on Windows, macOS or Linux.
 //!
 //! ```text
-//! cargo run --release -p omnidroid -- play                      # the newest APK in the repository root
-//! cargo run --release -p omnidroid -- play --apk Roblox-2.738.1397.apk
-//! cargo run --release -p omnidroid -- play --minutes 90 --fresh --phone
+//! cargo run --release -p omnidroid -- path/to/app.apk           # any APK, on real Android (`aosp`)
+//! cargo run --release -p omnidroid -- aosp --apk app.apk --minutes 60
+//! cargo run --release -p omnidroid -- play --apk game.apk       # the fast path, for the apps it serves
 //! cargo run --release -p omnidroid -- which [--apk <path>]      # say which APK would run, and exit
-//! cargo run --release -p omnidroid -- plugins add --link plugins/roblox   # this user's plugins
+//! cargo run --release -p omnidroid -- plugins add --link plugins/<name>   # this user's plugins
 //! ```
 //!
-//! **The APK is chosen, not built in**: `--apk`, else `OMNI_APK`, else the newest APK (by
-//! `versionCode`) in the repository root (`omni_apk::choose_apk`). Its version is read from its own
-//! manifest and is what the engine is told, so a new APK needs no code change.
+//! **The APK is chosen, not built in**: `--apk` (or the path given bare), else `OMNI_APK`, else the
+//! newest APK (by `versionCode`) in the repository root (`omni_apk::choose_apk`). Its package,
+//! launcher Activity and version are read from its own manifest, so a new APK needs no code change.
+//!
+//! **`aosp` is the default**: real Android boots (or the host's warm device is used), the APK is
+//! installed with `pm install` and started from its launcher -- any APK. `play` is the fast,
+//! in-process path; it has no Java runtime, so it serves only the apps whose Java side the engine
+//! answers itself (`omni-android`'s `jni`).
 //!
 //! What `play` runs is the M5 gate's own run -- the embedding lives there today -- with a session as
 //! long as the window stays open, the host's GPU, and the app's storage kept between runs. That is
@@ -23,11 +28,11 @@
 //!   Ctrl+C, a crash -- is judged a crash by the engine at the next launch; after one, run once
 //!   with `--fresh`.
 //! * **Keyboard and mouse are this computer's** unless `--phone`, which makes the mouse a finger.
-//! * **What one game needs is a plugin, not the launcher's** (`plugin.rs`): options of its own,
+//! * **What one app needs is a plugin, not the launcher's** (`plugin.rs`): options of its own,
 //!   variables, default arguments, hooks around a session and commands, declared in a plugin's
-//!   `omnidroid-plugin.json` and installed per user (`omnidroid plugins`). Signing in to Roblox
-//!   with a cookie (`--cookie`), joining a place (`--place`, `--join-delay`) and `login` are the
-//!   `roblox` plugin's (`plugins/roblox`), for whoever installs it.
+//!   `omnidroid-plugin.json` and installed per user (`omnidroid plugins`). A sign-in cookie, a link
+//!   opened once the app is up and the log lines that say how far it got are a plugin's
+//!   (`omni_linux::app_session`), for whoever installs it.
 //! * **`--no-window`: no window at all** (`OMNI_NO_WINDOW=1`, and headless): for a host with no
 //!   display. The engine's surface is an off-screen pbuffer on an EGL display that needs no window
 //!   system (a GPU's EGL device, or Mesa's surfaceless platform -- `LIBGL_ALWAYS_SOFTWARE=1` for the
@@ -53,20 +58,26 @@ const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the
 const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 
 const USAGE: &str = "\
-usage: omnidroid [play] [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
-                       [--headless] [--no-window] [--control <file>]
-       omnidroid aosp [--apk <path>] [--minutes <n>]
+usage: omnidroid <app.apk> [aosp options]          (the same as `omnidroid aosp --apk <app.apk>`)
+       omnidroid [aosp] [--apk <path>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
                       [--fresh-device] [--standby] [--instance <dir>]
                       [--root] [--module <id,id,...>] [--su all|<pkg,pkg>] [--no-clipboard]
+       omnidroid play [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--data-dir <dir>]
+                      [--headless] [--no-window] [--control <file>]
        omnidroid modules [list | add <zip>]
        omnidroid aosp --warm [--instance <dir>] [--minutes <n>] [--size <w>x<h>] [--gpu vulkan|gl|auto]
        omnidroid which [--apk <path>]
        omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name>
                          | new <name> [<dir>]]
 
-  --apk <path>      the APK to run (else OMNI_APK, else the newest *.apk in the repository root)
-  --minutes <n>     end the session after n minutes (default: when the window is closed)
+  --apk <path>      the APK to run, any APK (else OMNI_APK, else the newest *.apk in the
+                    repository root); a bare path ending in .apk is the same
+  --minutes <n>     end the session after n minutes (aosp: default 30; play: when the window is closed)
+
+  play              the fast in-process path: the APK's native code on the emulation layer, with
+                    no Java runtime -- only for the apps whose Java side the engine answers itself.
+                    Its options:
   --fresh           a fresh install; the kept storage is left as it is
   --phone           a touch screen: the mouse is a finger, and there is no keyboard
   --data-dir <dir>  where the app's storage is kept (default: this host's app-data directory)
@@ -77,23 +88,23 @@ usage: omnidroid [play] [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--da
   --control <file>  read commands from this file as lines are appended to it (OMNI_CONTROL), as
                     well as from stdin: headless on|off, screenshot <path>, status
 
-  aosp              run the APK on the real-AOSP path instead: real Android boots, the APK is
-                    installed with `pm install` and started from its launcher, in a live window
-                    (`omni-linux`'s r_roblox session). --minutes bounds the session (default 30);
+  aosp              (the default) run the APK on real Android: it boots, the APK is installed with
+                    `pm install` and started from its launcher Activity, in a live window
+                    (`omni-linux`'s r_app session) -- any APK. --minutes bounds the session (default 30);
                     --size is the display's size at boot; --gpu is the device's GPU backend
                     (OMNI_GPU; auto: Vulkan on a host
                     with a Vulkan GPU, else the host's GLES); --with-systemui keeps SystemUI and
-                    the launcher (default: a single-app device). The first session for an APK and
-                    account saves its device once signed in (<session dir>/omni-golden); later
-                    sessions boot a copy of it and open the place at once -- no install, no
-                    first boot. --fresh-device makes a new device (the saved one is kept); --standby keeps the device waiting once launched (and in the
-                    place): a place id written to <instance>/data/local/tmp/join-place is joined,
-                    and <instance>/data/local/tmp/stop ends the session; --instance names the
-                    instance's directory. With a warm device up (below) the session runs on it
-                    instead -- no boot: the APK installed, a cookie a plugin names (OMNI_R_COOKIE)
-                    put in the app's store before its first start, a place it names (OMNI_R_PLACE)
-                    sent once the app's main Activity starts; the app is stopped when the
-                    session ends, the device stays warm
+                    the launcher (default: a single-app device). The first session for an APK (and
+                    account) saves its device once the app is up (<session dir>/omni-golden);
+                    later sessions boot a copy of it -- no install, no first boot. --fresh-device
+                    makes a new device (the saved one is kept); --standby keeps the device waiting
+                    once launched: an id written to <instance>/data/local/tmp/join-place is opened
+                    with the session's link (a plugin's), and <instance>/data/local/tmp/stop ends
+                    the session; --instance names the instance's directory. With a warm device up
+                    (below) the session runs on it instead -- no boot: the APK installed and
+                    started from its launcher (a plugin's cookie put in the app's WebView store
+                    before its first start, its link sent once the app is ready); the app is
+                    stopped when the session ends, the device stays warm
                     (not with --instance, --standby or --fresh-device; OMNI_AOSP_WARM=0: never).
                     What is copied in the device (text, an image) is on the host's clipboard too,
                     to paste in any host application: only as plain text or a fresh PNG of the
@@ -118,13 +129,12 @@ usage: omnidroid [play] [--apk <path>] [--minutes <n>] [--fresh] [--phone] [--da
                     once (<session dir>/omni-golden/base-...), booted from a copy after; ready when
                     <instance>/data/local/tmp/warm-ready is there. --minutes defaults to 720
 
-  plugins           this user's plugins (<app-data>/../plugins, or OMNI_PLUGINS): what one game
+  plugins           this user's plugins (<app-data>/../plugins, or OMNI_PLUGINS): what one app
                     needs -- options, variables, default arguments, hooks, commands -- declared
                     in a plugin's omnidroid-plugin.json. `add` copies a plugin's directory in,
                     `add --link` uses it where it is; `new` makes one to start from. The
-                    repository's plugins/ holds plugins to install (plugins/roblox: --cookie,
-                    --place, --join-delay, login); none is loaded until installed. The installed
-                    plugins' options and commands are listed below";
+                    repository's plugins/ holds plugins to install; none is loaded until
+                    installed. The installed plugins' options and commands are listed below";
 
 struct Options {
     apk: Option<PathBuf>,
@@ -137,15 +147,20 @@ struct Options {
     control: Option<PathBuf>,
 }
 
-/// The command and the arguments after it. Options with no command in front of them mean
-/// `play`: `omnidroid --apk <path> --minutes 30` is `omnidroid play --apk <path> --minutes 30`.
+/// Whether `arg` names an APK given bare (`omnidroid app.apk`).
+fn is_apk_path(arg: &str) -> bool {
+    !arg.starts_with('-') && Path::new(arg).extension().is_some_and(|e| e.eq_ignore_ascii_case("apk"))
+}
+
+/// The command and the arguments after it. Options with no command in front of them, or an APK's
+/// path, mean `aosp`: `omnidroid app.apk --minutes 30` is `omnidroid aosp --apk app.apk --minutes 30`.
 fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<String>) {
     let mut args: Vec<String> = args.collect();
     if args.is_empty() {
         return (None, args);
     }
-    if args[0].starts_with("--") && !matches!(args[0].as_str(), "--help") {
-        return (Some("play".to_string()), args);
+    if (args[0].starts_with("--") && !matches!(args[0].as_str(), "--help")) || is_apk_path(&args[0]) {
+        return (Some("aosp".to_string()), args);
     }
     let command = args.remove(0);
     (Some(command), args)
@@ -317,6 +332,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
                 options.headless = true;
             }
             "--control" => options.control = Some(PathBuf::from(value("--control")?)),
+            apk if is_apk_path(apk) && options.apk.is_none() => options.apk = Some(PathBuf::from(apk)),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -563,6 +579,7 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
                 options.su = Some(value("--su")?);
                 options.root = true;
             }
+            apk if is_apk_path(apk) && options.apk.is_none() => options.apk = Some(PathBuf::from(apk)),
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -573,16 +590,19 @@ fn parse_aosp(mut args: impl Iterator<Item = String>) -> Result<AospOptions, Str
     Ok(options)
 }
 
-/// The environment the real-AOSP session (`omni-linux`'s `r_roblox`) is given: what
-/// `tools/aosp_play.ps1` sets on Windows, from these options. A plugin adds its own on top
-/// (`OMNI_R_COOKIE`, `OMNI_R_PLACE`: the `roblox` plugin's).
-fn aosp_env(options: &AospOptions, apk: &Path) -> Vec<(&'static str, String)> {
+/// The environment the real-AOSP session (`omni-linux`'s `r_app`) is given: what
+/// `tools/aosp_play.ps1` sets on Windows, from these options, and the APK's package as its manifest
+/// names it. A plugin adds its own on top (`omni_linux::app_session`: a cookie, a link, markers).
+fn aosp_env(options: &AospOptions, apk: &Path, package: Option<&str>) -> Vec<(&'static str, String)> {
     let mut env = vec![
         ("OMNI_WINDOW", "1".to_string()),
         ("OMNI_R_MINUTES", options.minutes.to_string()),
         ("OMNI_TEST_APK", apk.display().to_string()),
         ("OMNI_R_KIOSK", if options.with_systemui { "0" } else { "1" }.to_string()),
     ];
+    if let Some(package) = package {
+        env.push(("OMNI_R_PACKAGE", package.to_string()));
+    }
     if let Some((w, h)) = options.size {
         env.push(("OMNI_WINDOW_SIZE", format!("{w}x{h}")));
     }
@@ -762,16 +782,16 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // The account's cookie file and the place to join, when a plugin names them: the warm session
-    // reads them as the cold one (`r_roblox`) does.
-    let cookie = session.var("OMNI_R_COOKIE").map(PathBuf::from);
-    let place = match session.var("OMNI_R_PLACE").map(str::parse::<u64>).transpose() {
-        Ok(place) => place,
-        Err(_) => {
-            eprintln!("omnidroid: OMNI_R_PLACE is not a place id");
-            return ExitCode::from(2);
+    // What the session does beyond the install and the start (`omni_linux::app_session`), as the
+    // plugins and the environment name it: the warm session reads it as the cold one (`r_app`) does.
+    for (key, value) in &session.env {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
         }
-    };
+    }
+    let cookie = std::env::var_os("OMNI_R_COOKIE").filter(|c| !c.is_empty()).map(PathBuf::from);
+    let app_session = omni_linux::app_session::AppSession::from_env();
     // A warm device is up: the session is an app on it -- no boot, no device of its own (a second
     // device beside it would only take the host's memory). Not for a session that names its own
     // device (--instance, --standby, --fresh-device), nor with OMNI_AOSP_WARM=0.
@@ -780,7 +800,7 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
             if options.size.is_some() || options.gpu.is_some() || options.with_systemui || options.no_clipboard {
                 println!("Omnidroid: --size, --gpu, --with-systemui and --no-clipboard are the warm device's own (set when it booted); not applied");
             }
-            let code = warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), place, options.minutes);
+            let code = warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), &app_session, options.minutes);
             plugin::end(plugged.plugins, &plugged.given, &info, &base, i32::from(code != ExitCode::SUCCESS));
             return code;
         }
@@ -790,8 +810,8 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
     omni_platform::process::hold_children();
     let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
     run.current_dir(repo_root())
-        .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_roblox", "--", "--ignored", "--nocapture"]);
-    for (k, v) in aosp_env(options, &apk_path) {
+        .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_app", "--", "--ignored", "--nocapture"]);
+    for (k, v) in aosp_env(options, &apk_path, package.as_deref()) {
         run.env(k, v);
     }
     session.apply(&mut run);
@@ -808,7 +828,7 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
         }
         None => temp,
     };
-    // The saved devices (r_roblox's OMNI_R_GOLDEN), beside the sessions.
+    // The saved devices (r_app's OMNI_R_GOLDEN), beside the sessions.
     if !options.fresh_device {
         run.env("OMNI_R_GOLDEN", session_dir.join("omni-golden"));
     }
@@ -866,18 +886,18 @@ mod tests {
     #[test]
     fn root_options_reach_the_session_environment_and_unrooted_adds_none() {
         let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string())).unwrap();
-        let env = aosp_env(&parse(&["--module", "a,b", "--su", "all"]), Path::new("x.apk"));
+        let env = aosp_env(&parse(&["--module", "a,b", "--su", "all"]), Path::new("x.apk"), None);
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
         assert_eq!((get("OMNI_R_ROOT"), get("OMNI_R_MODULES"), get("OMNI_R_SU")), (Some("1"), Some("a,b"), Some("all")));
-        let plain = aosp_env(&parse(&[]), Path::new("x.apk"));
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
         assert!(plain.iter().all(|(n, _)| !n.starts_with("OMNI_R_ROOT") && *n != "OMNI_R_MODULES" && *n != "OMNI_R_SU"));
     }
 
     #[test]
     fn builtin_modules_and_denylist_parse() {
         let parse = |a: &[&str]| parse_aosp(a.iter().map(|s| (*s).to_string())).unwrap();
-        let o = parse(&["--module", "emu-hide,shamiko", "--denylist", "com.roblox.client"]);
-        assert!(o.root && o.modules == vec!["emu-hide", "shamiko"] && o.denylist == vec!["com.roblox.client"]);
+        let o = parse(&["--module", "emu-hide,shamiko", "--denylist", "com.example.app"]);
+        assert!(o.root && o.modules == vec!["emu-hide", "shamiko"] && o.denylist == vec!["com.example.app"]);
         let o = parse(&["--denylist", "a.b, c.d"]);
         assert!(o.root, "--denylist implies --root");
         assert_eq!(o.denylist, vec!["a.b", "c.d"]);
@@ -885,18 +905,24 @@ mod tests {
         assert!(validate_modules(&["emu-hide".into(), "shamiko".into(), "zygisk-frida".into()], &empty).is_ok());
         let err = validate_modules(&["ghost".into()], &empty).unwrap_err();
         assert!(err.contains("ghost"), "{err}");
-        let env = aosp_env(&parse(&["--denylist", "a.b,c.d"]), Path::new("x.apk"));
+        let env = aosp_env(&parse(&["--denylist", "a.b,c.d"]), Path::new("x.apk"), None);
         assert!(env.iter().any(|(n, v)| *n == "OMNI_R_DENYLIST" && v == "a.b,c.d"));
-        let plain = aosp_env(&parse(&[]), Path::new("x.apk"));
+        let plain = aosp_env(&parse(&[]), Path::new("x.apk"), None);
         assert!(plain.iter().all(|(n, _)| *n != "OMNI_R_DENYLIST"));
     }
 
     #[test]
-    fn options_without_a_command_mean_play() {
+    fn options_without_a_command_or_an_apk_s_path_mean_aosp() {
         let split = |a: &[&str]| command_and_rest(a.iter().map(|s| (*s).to_string()));
-        let (command, rest) = split(&["--cookie", "c.txt", "--place", "1"]);
-        assert_eq!(command.as_deref(), Some("play"));
-        assert_eq!(rest, ["--cookie", "c.txt", "--place", "1"]);
+        let (command, rest) = split(&["--apk", "a.apk", "--minutes", "1"]);
+        assert_eq!(command.as_deref(), Some("aosp"));
+        assert_eq!(rest, ["--apk", "a.apk", "--minutes", "1"]);
+        let (command, rest) = split(&["/x/Some App.APK", "--minutes", "5"]);
+        assert_eq!((command.as_deref(), rest.as_slice()), (Some("aosp"), &["/x/Some App.APK".to_string(), "--minutes".into(), "5".into()][..]));
+        let o = parse_aosp(rest.into_iter()).expect("a bare APK path is --apk");
+        assert_eq!((o.apk.as_deref(), o.minutes), (Some(Path::new("/x/Some App.APK")), 5));
+        assert_eq!(parse(["game.apk".to_string()].into_iter()).expect("play too").apk.as_deref(), Some(Path::new("game.apk")));
+        assert!(parse_aosp(["a.apk".to_string(), "b.apk".to_string()].into_iter()).is_err(), "one APK");
         let (command, rest) = split(&["login", "name"]);
         assert_eq!((command.as_deref(), rest.as_slice()), (Some("login"), &["name".to_string()][..]));
         assert_eq!(split(&[]).0, None);
@@ -905,20 +931,8 @@ mod tests {
     #[test]
     fn an_option_of_a_plugin_not_installed_names_the_plugin() {
         let said = with_hint("unknown argument `--cookie`".to_string());
-        assert!(said.contains("`roblox` plugin") && said.contains("plugins add --link"), "{said}");
+        assert!(said.contains("plugin") && said.contains("plugins add --link"), "{said}");
         assert_eq!(with_hint("unknown argument `--nothing`".to_string()), "unknown argument `--nothing`");
-        assert!(with_hint("unknown command `login`".to_string()).contains("roblox"));
-    }
-
-    #[test]
-    fn the_repository_roblox_plugin_loads_and_takes_cookie_and_place() {
-        let roblox = plugin::Plugin::load(&repo_root().join("plugins/roblox")).expect("plugins/roblox loads");
-        let args = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-        let (rest, given) = plugin::take_args(&[&roblox], "aosp", args(&["--cookie", "c.txt", "--place", "8737899170", "--gpu", "gl"])).unwrap();
-        assert_eq!(rest, ["--gpu", "gl"]);
-        assert_eq!(given.iter().map(|g| g.flag.as_str()).collect::<Vec<_>>(), ["--cookie", "--place"]);
-        assert!(plugin::take_args(&[&roblox], "play", args(&["--place", "0"])).is_err());
-        assert!(plugin::take_args(&[&roblox], "aosp", args(&["--join-delay", "3"])).unwrap().1.is_empty(), "play's only");
     }
 
     #[test]
@@ -940,7 +954,7 @@ mod tests {
         let o = args(&["--apk", "r.apk"]).expect("parsed");
         assert_eq!(o.apk.as_deref(), Some(Path::new("r.apk")));
         assert_eq!(o.minutes, 30);
-        assert!(args(&["--cookie", "c.txt"]).is_err() && args(&["--place", "1"]).is_err(), "the roblox plugin's, not the launcher's");
+        assert!(args(&["--cookie", "c.txt"]).is_err() && args(&["--place", "1"]).is_err(), "a plugin's, not the launcher's");
         let o = args(&["--minutes", "12", "--size", "1280x720", "--gpu", "gl", "--with-systemui"]).expect("parsed");
         assert_eq!((o.minutes, o.size, o.gpu.as_deref(), o.with_systemui), (12, Some((1280, 720)), Some("gl"), true));
         assert!(args(&["--gpu", "metal"]).is_err());
@@ -949,14 +963,14 @@ mod tests {
         assert!(args(&["--fresh"]).is_err(), "play's options are not aosp's");
         let o = args(&["--fresh-device", "--standby", "--instance", "d"]).expect("parsed");
         assert_eq!((o.fresh_device, o.standby, o.instance.as_deref()), (true, true, Some(Path::new("d"))));
-        let env = aosp_env(&o, Path::new("r.apk"));
+        let env = aosp_env(&o, Path::new("r.apk"), None);
         assert!(env.contains(&("OMNI_R_STANDBY", "1".to_string())) && env.contains(&("OMNI_R_INSTANCE", "d".to_string())));
     }
 
     #[test]
     fn aosp_gives_the_session_what_aosp_play_ps1_gave_it() {
         let o = parse_aosp(["--gpu", "gl", "--size", "960x540"].iter().map(|s| (*s).to_string())).expect("parsed");
-        let env = aosp_env(&o, Path::new("/a/r.apk"));
+        let env = aosp_env(&o, Path::new("/a/r.apk"), Some("com.example.app"));
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_str());
         assert_eq!(get("OMNI_WINDOW"), Some("1"));
         assert_eq!(get("OMNI_R_MINUTES"), Some("30"));
@@ -964,13 +978,14 @@ mod tests {
         assert_eq!(get("OMNI_R_KIOSK"), Some("1"), "a single-app device unless --with-systemui");
         assert_eq!(get("OMNI_WINDOW_SIZE"), Some("960x540"));
         assert_eq!(get("OMNI_GPU"), Some("gl"));
-        let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"));
-        assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_PLACE" | "OMNI_GPU" | "OMNI_R_STANDBY" | "OMNI_R_INSTANCE")));
+        assert_eq!(get("OMNI_R_PACKAGE"), Some("com.example.app"), "the manifest's package");
+        let bare = aosp_env(&parse_aosp(std::iter::empty()).expect("parsed"), Path::new("r.apk"), None);
+        assert!(bare.iter().all(|(k, _)| !matches!(*k, "OMNI_R_COOKIE" | "OMNI_R_LINK" | "OMNI_R_LINK_ID" | "OMNI_R_PACKAGE" | "OMNI_GPU" | "OMNI_R_STANDBY" | "OMNI_R_INSTANCE")));
     }
 
     #[test]
     fn the_clipboard_is_shared_unless_no_clipboard() {
-        let env = |a: &[&str]| aosp_env(&parse_aosp(a.iter().map(|s| (*s).to_string())).expect("parsed"), Path::new("r.apk"));
+        let env = |a: &[&str]| aosp_env(&parse_aosp(a.iter().map(|s| (*s).to_string())).expect("parsed"), Path::new("r.apk"), None);
         assert!(env(&[]).iter().all(|(k, _)| *k != "OMNI_CLIPBOARD"), "shared by default");
         assert!(env(&["--no-clipboard"]).contains(&("OMNI_CLIPBOARD", "0".to_string())));
     }

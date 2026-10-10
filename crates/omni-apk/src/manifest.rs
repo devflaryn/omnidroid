@@ -168,7 +168,16 @@ pub struct LaunchInfo {
     /// The launcher Activity's class, whole (`com.example.app.MainActivity`), for
     /// `am start -n <package>/<class>`; `None` for an APK with no launcher icon.
     pub launcher: Option<String>,
+    /// The native library a `NativeActivity` or `GameActivity` loads (`android.app.lib_name`
+    /// meta-data: the launcher Activity's, else the application's, else the first Activity's that
+    /// names one -- a launcher alias or splash often starts the native one), as given -- `main` for
+    /// `libmain.so`. `None` when the manifest names none (or names it through a resource).
+    pub native_lib: Option<String>,
 }
+
+/// `<meta-data android:name>` that names a native activity's library.
+const LIB_NAME_META: &str = "android.app.lib_name";
+const ATTR_VALUE: u32 = 0x0101_0024;
 
 impl LaunchInfo {
     /// Walk every element of a binary `AndroidManifest.xml`.
@@ -187,6 +196,11 @@ impl LaunchInfo {
         let mut resource_ids: &[u8] = &[];
         let mut at = usize::from(header);
         let (mut package, mut version_code, mut launcher) = (None::<String>, None, None);
+        // `android.app.lib_name`: the launcher component's, and the application's.
+        let (mut launcher_lib, mut app_lib, mut component_lib, mut is_launcher) = (None::<String>, None::<String>, None::<String>, false);
+        // Inside a service, receiver or provider: its meta-data is not the application's.
+        let mut other_component = false;
+        let mut first_lib = None::<String>;
         // The component being read (its name, enabled), and the intent filter's MAIN and LAUNCHER.
         let mut component: Option<(String, bool)> = None;
         let (mut main, mut category) = (false, false);
@@ -212,7 +226,20 @@ impl LaunchInfo {
                             let name = element.string("name", Some(ATTR_NAME))?.unwrap_or_default();
                             let enabled = element.boolean("enabled", ATTR_ENABLED)?.unwrap_or(true);
                             component = Some((name, enabled));
+                            (component_lib, is_launcher) = (None, false);
                         }
+                        "meta-data" if element.string("name", Some(ATTR_NAME))?.as_deref() == Some(LIB_NAME_META) => {
+                            let value = element.string("value", Some(ATTR_VALUE))?.filter(|v| !v.is_empty());
+                            if component.is_some() {
+                                if first_lib.is_none() {
+                                    first_lib.clone_from(&value);
+                                }
+                                component_lib = value;
+                            } else if app_lib.is_none() && !other_component {
+                                app_lib = value;
+                            }
+                        }
+                        "service" | "receiver" | "provider" => other_component = true,
                         "intent-filter" => (main, category) = (false, false),
                         "action" => main |= element.string("name", Some(ATTR_NAME))?.as_deref() == Some("android.intent.action.MAIN"),
                         "category" => category |= element.string("name", Some(ATTR_NAME))?.as_deref() == Some("android.intent.category.LAUNCHER"),
@@ -227,9 +254,16 @@ impl LaunchInfo {
                         "intent-filter" if main && category && launcher.is_none() => {
                             if let Some((class, true)) = &component {
                                 launcher = Some(class.clone());
+                                is_launcher = true;
                             }
                         }
-                        "activity" | "activity-alias" => component = None,
+                        "service" | "receiver" | "provider" => other_component = false,
+                        "activity" | "activity-alias" => {
+                            if is_launcher {
+                                launcher_lib = component_lib.take();
+                            }
+                            (component, is_launcher) = (None, false);
+                        }
                         _ => {}
                     }
                 }
@@ -248,7 +282,7 @@ impl LaunchInfo {
                 c
             }
         });
-        Ok(LaunchInfo { package, version_code, launcher })
+        Ok(LaunchInfo { package, version_code, launcher, native_lib: launcher_lib.or(app_lib).or(first_lib) })
     }
 }
 

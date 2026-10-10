@@ -1,4 +1,4 @@
-//! Pieces of `r_roblox`'s guest scripts that decide how long a new device takes to reach the game,
+//! Pieces of `r_app`'s guest scripts that decide how long a new device takes to reach the game,
 //! each behind a switch, kept here so a test that boots nothing can check them
 //! (`tests/r_scripts.rs`). **The fast forms are the defaults** since the fresh-boot A/B of
 //! 2026-10-09 (PS99, `startup2-1009.csv`, ABBA: "Joining game" at 115/115 s against 185/180 s, the

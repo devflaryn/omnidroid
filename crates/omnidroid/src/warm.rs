@@ -1,13 +1,13 @@
 //! `omnidroid aosp` on the host's warm device: when one is up (`omnidroid aosp --warm`, or the MCP
-//! server's), a session needs no boot of its own. The APK is installed on it (reused when the device
-//! holds the same bytes, its data cleared), the account's cookie put in the app's WebView cookie
-//! store before its first start, the app started from its launcher, and the place's link sent as
-//! soon as the app's main Activity starts -- the app signs in and joins in one start.
+//! server's), a session needs no boot of its own. Any APK is installed on it (reused when the device
+//! holds the same bytes, its data cleared) and started from its launcher. What a session does beyond
+//! that is its starter's (`omni_linux::app_session`, set by a plugin): a cookie put in the app's
+//! WebView cookie store before its first start, and a link sent as soon as the app is ready for it
+//! -- the app signs in and opens the link in one start.
 //!
-//! Measured 2026-10-02 (i7-13700F, Windows, Roblox 2.740.931, PS99): from the command to PS99's own
-//! loading screen ~60-75 s with nothing of the app on the device, against ~107 s with the link sent
-//! after the sign-in (the app then loads its Home beside the join), and minutes for a session that
-//! boots a device of its own.
+//! Measured 2026-10-02 (i7-13700F, Windows, a large game with a cookie and a link): from the command
+//! to the game's own loading screen ~60-75 s with nothing of the app on the device, against ~107 s
+//! with the link sent after the sign-in, and minutes for a session that boots a device of its own.
 //!
 //! The session ends after `--minutes`, or with this process: the app is stopped and the device
 //! stays warm. A helper (`omnidroid warm-release`) stops the app when this process is ended
@@ -16,16 +16,11 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use omni_linux::app_session::{says, AppSession};
 use omni_warm as device;
 
-/// The Activity that takes Roblox's place links (`roblox://experiences/start?placeId=`).
-const LINK_ACTIVITY: &str = "com.roblox.client.ActivityProtocolLaunch";
-/// ActivityTaskManager's line when Roblox's main Activity starts (the splash is done): the
-/// earliest moment a place link is taken. One sent before it is lost (2026-10-02: sent when the
-/// launcher Activity was displayed, ~1 s earlier, the app never joined until it was sent again).
-const MAIN_STARTED: &str = "/.ActivityNativeMain}";
-/// A link not answered by "Joining game" in this long is sent again (the app sometimes answers a
-/// link by settling on its Home, 2026-09-29), at most `LINK_TRIES` times.
+/// A link not answered by the session's `OMNI_R_LINK_TAKEN` in this long is sent again (an app can
+/// answer a link by settling on its home screen, 2026-09-29), at most `LINK_TRIES` times.
 const LINK_RETRY: Duration = Duration::from_secs(60);
 const LINK_TRIES: u32 = 4;
 
@@ -47,11 +42,6 @@ pub fn usable(root_hash: Option<&str>) -> Option<device::Device> {
         return None;
     }
     Some(dev)
-}
-
-/// The place's link, as a link opened on a device.
-fn link(package: &str, place: u64) -> String {
-    format!("am start -a android.intent.action.VIEW -d \"roblox://experiences/start?placeId={place}\" -n {package}/{LINK_ACTIVITY}")
 }
 
 /// The guest shell that puts a cookie store (handed over as `store`) into `package`'s WebView data,
@@ -90,9 +80,10 @@ fn store_made(child: std::process::Child) -> Result<(), String> {
     }
 }
 
-/// The session on `dev`: install, plant, start, join; then until `minutes` have passed, the app
-/// is stopped or the device is gone.
-pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Path>, place: Option<u64>, minutes: u64) -> ExitCode {
+/// The session on `dev`: install, plant, start, open the link; then until `minutes` have passed,
+/// the app is stopped or the device is gone.
+pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Path>, app_session: &AppSession, minutes: u64) -> ExitCode {
+    let link_id = app_session.link_id.as_deref().filter(|_| app_session.link.is_some());
     let t = Instant::now();
     let say = |what: &str| println!("[warm] +{:.1}s {what}", t.elapsed().as_secs_f64());
     println!("Omnidroid: on the warm device {} (its log: {})", dev.dir.display(), dev.log().display());
@@ -170,48 +161,49 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
         }
     }
     let deadline = t + Duration::from_secs(minutes * 60);
-    let (mut sent_at, mut tries, mut joined, mut signed_in, mut main_started, mut loaded) = (None::<Instant>, 0u32, false, false, false, false);
+    // With no marker that says when the app takes its link, the link goes once the launcher
+    // Activity is displayed (the start above waited for it).
+    let ready_at_start = app_session.link_ready.is_none() && app_session.signed_in.is_none();
+    let (mut sent_at, mut tries, mut joined, mut signed_in, mut ready, mut loaded) = (None::<Instant>, 0u32, false, false, ready_at_start, false);
     let died = format!("Process {package} (pid ");
     let mut code = ExitCode::SUCCESS;
     while Instant::now() < deadline {
         for line in log.lines() {
-            if line.contains(&format!("{package}{MAIN_STARTED}")) && !main_started {
-                main_started = true;
+            if says(&line, app_session.link_ready.as_deref()) && !ready {
+                ready = true;
             }
-            if line.contains("DID_LOG_IN") && !signed_in {
+            if says(&line, app_session.signed_in.as_deref()) && !signed_in {
                 signed_in = true;
-                say("signed in (DID_LOG_IN)");
+                say("signed in");
             }
-            if line.contains("! Joining game") && !joined {
+            if says(&line, app_session.link_taken.as_deref()) && !joined {
                 (joined, loaded) = (true, false);
-                say("joining the place (Joining game)");
+                say("the link was taken");
             }
-            // Logged by several of the app's parts at once: said once a join.
-            if line.contains("onGameLoaded") && !loaded {
+            // Logged by several of the app's parts at once: said once a link.
+            if app_session.loaded_id(&line).is_some() && !loaded {
                 loaded = true;
-                say("the place is loaded (onGameLoaded)");
-            }
-            if line.contains("Upgrade required") {
-                eprintln!("omnidroid: the app says \"Upgrade required\": {} is too old for Roblox's servers", apk.display());
+                say("what the link opened is loaded");
             }
             if line.contains(&died) && line.contains("has died") {
                 say("the app died: started again");
                 let _ = device::launch(dev, &app, "");
-                (sent_at, main_started) = (None, false);
+                (sent_at, ready) = (None, ready_at_start);
             }
         }
-        // The place's link: once the main Activity has started (or the app has signed in), again
-        // when unanswered.
-        if let (Some(place), false) = (place, joined) {
+        // The session's link: once the app is ready for it (or has signed in), again when
+        // unanswered -- sent once when nothing says it was taken.
+        if let (Some(id), false) = (link_id, joined) {
             let due = match sent_at {
-                None => main_started || signed_in,
-                Some(at) => at.elapsed() > LINK_RETRY && tries < LINK_TRIES,
+                None => ready || signed_in,
+                Some(at) => app_session.link_taken.is_some() && at.elapsed() > LINK_RETRY && tries < LINK_TRIES,
             };
             if due {
                 tries += 1;
-                match dev.shell(&link(&package, place), Duration::from_secs(60)) {
-                    Ok(_) => say(&format!("place {place}'s link sent{}", if tries > 1 { format!(" (try {tries})") } else { String::new() })),
-                    Err(e) => eprintln!("omnidroid: the place's link: {e}"),
+                let open = app_session.link_command(id).expect("a link");
+                match dev.shell(&open, Duration::from_secs(60)) {
+                    Ok(_) => say(&format!("link {id} sent{}", if tries > 1 { format!(" (try {tries})") } else { String::new() })),
+                    Err(e) => eprintln!("omnidroid: the link: {e}"),
                 }
                 sent_at = Some(Instant::now());
             }
@@ -225,9 +217,11 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
     }
     let _ = dev.shell(&format!("am force-stop {package}"), Duration::from_secs(60));
     say(&format!("{package} stopped; the device stays warm"));
-    if place.is_some() && !joined {
-        eprintln!("omnidroid: the place was never joined (no \"Joining game\" in {})", dev.log().display());
-        code = ExitCode::FAILURE;
+    if let (Some(_), Some(marker)) = (link_id, &app_session.link_taken) {
+        if !joined {
+            eprintln!("omnidroid: the link was never taken (no {marker:?} in {})", dev.log().display());
+            code = ExitCode::FAILURE;
+        }
     }
     code
 }
@@ -273,13 +267,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_link_and_the_plant_name_the_app_and_the_place() {
-        assert_eq!(
-            link("com.roblox.client", 8737899170),
-            "am start -a android.intent.action.VIEW -d \"roblox://experiences/start?placeId=8737899170\" -n com.roblox.client/com.roblox.client.ActivityProtocolLaunch"
-        );
-        let p = plant("com.roblox.client", "/data/local/tmp/omni-apk/x.Cookies");
-        assert!(p.contains("a=/data/data/com.roblox.client;") && p.contains("cp /data/local/tmp/omni-apk/x.Cookies $d/Cookies"));
+    fn the_plant_names_the_app() {
+        let p = plant("com.example.app", "/data/local/tmp/omni-apk/x.Cookies");
+        assert!(p.contains("a=/data/data/com.example.app;") && p.contains("cp /data/local/tmp/omni-apk/x.Cookies $d/Cookies"));
         assert!(p.ends_with("rm -f /data/local/tmp/omni-apk/x.Cookies; "), "the store handed over is removed, planted or not");
     }
 }

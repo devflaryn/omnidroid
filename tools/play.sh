@@ -1,13 +1,11 @@
 #!/bin/sh
-# Run an APK in a real window for a person to use, on macOS or Linux. The shell spelling of the
-# launcher, which is now the `omnidroid` binary (crates/omnidroid) -- the same run, and the same
-# switches, on Windows, macOS and Linux.
+# Run an APK on the fast in-process path (`omnidroid play`: no Java runtime, so only the apps whose
+# Java side the engine answers itself; any APK runs with tools/aosp_play.sh), on macOS or Linux.
+# The shell spelling of the launcher, which is now the `omnidroid` binary (crates/omnidroid) -- the
+# same run, and the same switches (a plugin's options too), on Windows, macOS and Linux.
 #
 #   tools/play.sh                          # the newest APK in the repository root
-#   tools/play.sh --apk ~/apks/Roblox-2.740.1.apk
-#   tools/play.sh --place 8737899170       # join that place once the saved sign-in is at Home
-#   tools/play.sh --cookie farm4.txt --place 8737899170   # sign in as that account, then join
-#                                          # (--cookie, --place: `omnidroid plugins add --link plugins/roblox`)
+#   tools/play.sh --apk ~/apks/game.apk
 #   tools/play.sh --minutes 90
 #   tools/play.sh --fresh                  # a fresh install
 #   tools/play.sh --phone                  # a touch screen instead: the mouse is a finger, no keyboard

@@ -1,13 +1,13 @@
 # Interleaved A/B inside ONE live in-world session (docs/NIGHT-2026-10-02.md): boot a prebuilt
-# r_roblox test binary with OMNI_LEVER_FILE, join PS99, settle, then alternate a lever (see
+# r_app test binary with OMNI_LEVER_FILE, join PS99, settle, then alternate a lever (see
 # crates/omni-linux/src/lever.rs) between value A and value B for -Pairs pairs in ABBA order,
 # each phase: write the lever, wait -WarmSec (translations redone, the switch settles), measure
 # -MeasureSec. Per phase one CSV row; at the end the paired deltas (B - A) with their spread.
 # Several levers, one after another in the same session: -Levers "name:A:B[:bg=v,bg2=v];name2:A:B",
 # the optional fourth field being lines written beside the lever for that whole A/B.
 #
-#   powershell -File tools\perf_live.ps1 -Exe <r_roblox-*.exe> -Lever jit_fp -A 0 -B f0000 -Tag fp-all
-#   powershell -File tools\perf_live.ps1 -Exe <exe> -Levers "compose_fast:0:1;fence_poll:0:250:compose_fast=1" -Tag c4c5
+#   powershell -File plugins\roblox\tools\perf_live.ps1 -Exe <r_app-*.exe> -Lever jit_fp -A 0 -B f0000 -Tag fp-all
+#   powershell -File plugins\roblox\tools\perf_live.ps1 -Exe <exe> -Levers "compose_fast:0:1;fence_poll:0:250:compose_fast=1" -Tag c4c5
 param(
   [Parameter(Mandatory)][string]$Exe,
   [string]$Lever = "",
@@ -54,7 +54,7 @@ Write-Lever $plan[0][3] $plan[0][0] $plan[0][1]
 
 $env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"
 $env:OMNI_R_MINUTES = [string]($JoinTimeoutMin + 2 + [math]::Ceiling(($SettleSec + $plan.Count * 2 * $Pairs * ($WarmSec + $MeasureSec)) / 60) + 2)
-$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; $env:OMNI_R_PLACE = $Place
+$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; . (Join-Path $PSScriptRoot "roblox_session.ps1"); $env:OMNI_R_LINK_ID = $Place
 $env:OMNI_SYSROOT = $Sysroot; $env:OMNI_LEVER_FILE = $leverFile
 Remove-Item env:OMNI_SCREENSHOT -ErrorAction SilentlyContinue
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p = $kv.Split("=", 2); Set-Item -Path ("env:" + $p[0]) -Value $p[1] } } }
@@ -77,7 +77,7 @@ function Stop-Guests {
     if (Test-Path (Split-Path -Parent $stop)) { Set-Content -Path $stop -Value "stop" -ErrorAction SilentlyContinue }
     for ($i = 0; $i -lt 40 -and -not $proc.HasExited; $i++) { Start-Sleep 1 }
   }
-  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_app*" } | Stop-Process -Force -ErrorAction SilentlyContinue
   if ($proc) {
     Start-Sleep 2
     foreach ($d in @(("omni-linux-r-{0}" -f $proc.Id), ("omni-linux-r-{0}-shots" -f $proc.Id))) {

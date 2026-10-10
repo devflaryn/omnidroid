@@ -22,10 +22,12 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 pub struct Config {
     /// The APK to boot. `OMNI_MCP_APK` / `--apk`.
     pub apk: Option<PathBuf>,
-    /// The cookie file (or saved account name). `OMNI_MCP_COOKIE`.
-    pub cookie: Option<String>,
-    /// The place id to join. `OMNI_MCP_PLACE`; defaults to PS99.
-    pub place: Option<String>,
+    /// The launcher's options for a session of its own (a plugin's, e.g. a sign-in), whitespace
+    /// separated. `OMNI_MCP_ARGS`. With none (and no `link_id`), an APK runs on the warm device.
+    pub args: Vec<String>,
+    /// The id the session's link opens (`omni_linux::app_session`'s `OMNI_R_LINK_ID`; the link is a
+    /// plugin's). `OMNI_MCP_LINK_ID`.
+    pub link_id: Option<String>,
     /// GPU backend: `vulkan`, `gl` or `auto`. `OMNI_MCP_GPU`.
     pub gpu: String,
     /// Window size `WxH`, or none for the default. `OMNI_MCP_SIZE`.
@@ -40,8 +42,8 @@ pub struct Config {
     /// `OMNI_MCP_REPO`, else derived from the executable's path.
     pub repo_dir: Option<PathBuf>,
     /// Keep a standby instance: booted (from the saved device), signed in and -- with a configured
-    /// place -- in that place, waiting for the next `start_instance`, which takes it over instead of
-    /// booting. It outlives this server, so the next session finds it waiting. `OMNI_MCP_STANDBY=1`.
+    /// link id -- with its link open, waiting for the next `start_instance`, which takes it over
+    /// instead of booting. It outlives this server, so the next session finds it waiting. `OMNI_MCP_STANDBY=1`.
     pub standby: bool,
     /// How long a standby instance lives, in minutes. `OMNI_MCP_STANDBY_MINUTES` (default 720).
     pub standby_minutes: u64,
@@ -76,8 +78,8 @@ impl Config {
         });
         Self {
             apk: std::env::var_os("OMNI_MCP_APK").map(PathBuf::from),
-            cookie: std::env::var("OMNI_MCP_COOKIE").ok(),
-            place: std::env::var("OMNI_MCP_PLACE").ok(),
+            args: std::env::var("OMNI_MCP_ARGS").map(|a| a.split_whitespace().map(str::to_string).collect()).unwrap_or_default(),
+            link_id: std::env::var("OMNI_MCP_LINK_ID").ok().filter(|v| !v.is_empty()),
             gpu: std::env::var("OMNI_MCP_GPU").unwrap_or_else(|_| "auto".into()),
             size: std::env::var("OMNI_MCP_SIZE").ok(),
             device_ram_mb: std::env::var("OMNI_MCP_DEVICE_RAM_MB").ok().and_then(|v| v.parse().ok()),
@@ -104,7 +106,7 @@ struct Instance {
     standby: bool,
     screenshot: PathBuf,
     apk: Option<PathBuf>,
-    place: Option<String>,
+    link_id: Option<String>,
     started: std::time::Instant,
     /// On the warm device: the app's package (its device is `dir`, which outlives the instance).
     package: Option<String>,
@@ -134,7 +136,7 @@ const STANDBY_PREFIX: &str = "omni-linux-r-standby-";
 /// The lab session every single-session debug tool operates on when no `session` is named.
 const DEFAULT_LAB: &str = "default";
 
-/// A file in the instance's `/data/local/tmp`: its state, as `r_roblox` keeps it.
+/// A file in the instance's `/data/local/tmp`: its state, as `r_app` keeps it.
 fn state_file(dir: &Path, name: &str) -> PathBuf {
     dir.join("data/local/tmp").join(name)
 }
@@ -182,17 +184,18 @@ fn waiting_standby() -> Option<PathBuf> {
     found.pop()
 }
 
-/// What an instance has reached, from the files its session keeps: `booting`, `signed_in`,
-/// `joining`, `in_game` (with the place), `stopped`.
+/// What an instance has reached, from the files its session keeps (by the markers its plugin
+/// names, `omni_linux::app_session`): `booting`, `signed_in`, `link_taken`, `loaded` (with the id
+/// its link opened), `stopped`.
 fn instance_state(dir: &Path) -> (&'static str, Option<String>) {
     if !alive(dir) {
         return ("stopped", None);
     }
-    if let Ok(place) = std::fs::read_to_string(state_file(dir, "game-loaded")) {
-        return ("in_game", Some(place.trim().to_string()));
+    if let Ok(id) = std::fs::read_to_string(state_file(dir, "game-loaded")) {
+        return ("loaded", Some(id.trim().to_string()));
     }
     if state_file(dir, "joining").exists() {
-        ("joining", None)
+        ("link_taken", None)
     } else if state_file(dir, "signed-in").exists() {
         ("signed_in", None)
     } else {
@@ -215,25 +218,23 @@ impl Server {
         }
     }
 
-    /// The launcher's command for a session in `dir`: the APK, the account, the place and the
-    /// display as given.
+    /// The launcher's command for a session in `dir`: the APK, the launcher options (a plugin's),
+    /// the link's id and the display as given.
     #[allow(clippy::too_many_arguments)]
-    fn launcher(&self, dir: &Path, apk: &Path, cookie: Option<&str>, place: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>) -> std::process::Command {
-        self.launcher_rooted(dir, apk, cookie, place, gpu, size, minutes, &RootRequest::default())
+    fn launcher(&self, dir: &Path, apk: &Path, extra: &[String], link_id: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>) -> std::process::Command {
+        self.launcher_rooted(dir, apk, extra, link_id, gpu, size, minutes, &RootRequest::default())
     }
 
     /// `launcher`, with the root the session is asked for (`--root`, `--module a,b`).
     #[allow(clippy::too_many_arguments)]
-    fn launcher_rooted(&self, dir: &Path, apk: &Path, cookie: Option<&str>, place: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>, root: &RootRequest) -> std::process::Command {
+    fn launcher_rooted(&self, dir: &Path, apk: &Path, extra: &[String], link_id: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>, root: &RootRequest) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
         cmd.arg("aosp").arg("--apk").arg(apk).arg("--gpu").arg(gpu).arg("--instance").arg(dir);
-        // --cookie and --place are the `roblox` plugin's (plugins/roblox): the launcher refuses
-        // them, and says how to install it, where that plugin is not installed.
-        if let Some(c) = cookie {
-            cmd.arg("--cookie").arg(c);
-        }
-        if let Some(p) = place {
-            cmd.arg("--place").arg(p);
+        // A plugin's options: the launcher refuses one no installed plugin adds, and says which of
+        // the repository's plugins does.
+        cmd.args(extra);
+        if let Some(id) = link_id {
+            cmd.env("OMNI_R_LINK_ID", id);
         }
         if let Some(sz) = size {
             cmd.arg("--size").arg(sz);
@@ -242,7 +243,7 @@ impl Server {
             cmd.arg("--minutes").arg(m.to_string());
         }
         root.add_to(&mut cmd);
-        // The screenshot path we can read (r_roblox honours a preset OMNI_SCREENSHOT).
+        // The screenshot path we can read (r_app honours a preset OMNI_SCREENSHOT).
         cmd.env("OMNI_SCREENSHOT", dir.with_extension("png"));
         if let Some(ram) = self.config.device_ram_mb {
             cmd.env("OMNI_DEVICE_RAM_MB", ram.to_string());
@@ -277,8 +278,8 @@ impl Server {
         let mut cmd = self.launcher(
             &dir,
             &apk,
-            self.config.cookie.as_deref(),
-            self.config.place.as_deref(),
+            &self.config.args,
+            self.config.link_id.as_deref(),
             &self.config.gpu,
             self.config.size.as_deref(),
             Some(self.config.standby_minutes),
@@ -289,9 +290,9 @@ impl Server {
         }
     }
 
-    /// Take over a waiting standby instance (or this server's, still booting) for `place`: the
-    /// place is joined unless it is the one the standby is in or is on its way into.
-    fn claim_standby(&mut self, place: Option<&str>) -> Option<(String, PathBuf, &'static str)> {
+    /// Take over a waiting standby instance (or this server's, still booting) for `link_id`: the
+    /// link is opened with it unless it is the one the standby has loaded or is on its way into.
+    fn claim_standby(&mut self, link_id: Option<&str>) -> Option<(String, PathBuf, &'static str)> {
         let dir = match self.standby_child.take() {
             // This server's own: from now on an instance like the others (its launcher left running).
             Some((_child, dir)) if !state_file(&dir, "claimed").exists() => dir,
@@ -300,15 +301,15 @@ impl Server {
         let _ = std::fs::create_dir_all(state_file(&dir, ""));
         let _ = std::fs::write(state_file(&dir, "claimed"), "1");
         let loaded = std::fs::read_to_string(state_file(&dir, "game-loaded")).ok().map(|p| p.trim().to_string());
-        let note = match place {
-            Some(p) if loaded.as_deref() == Some(p) => "standby taken over: already in the place",
-            Some(p) if loaded.is_none() && self.config.place.as_deref() == Some(p) => "standby taken over: on its way into the place",
+        let note = match link_id {
+            Some(p) if loaded.as_deref() == Some(p) => "standby taken over: already loaded",
+            Some(p) if loaded.is_none() && self.config.link_id.as_deref() == Some(p) => "standby taken over: on its way",
             Some(p) => {
-                // Not in the place asked for until it has loaded that one.
+                // Not loaded with the id asked for until it has loaded that one.
                 let _ = std::fs::remove_file(state_file(&dir, "game-loaded"));
                 let _ = std::fs::remove_file(state_file(&dir, "joining"));
                 let _ = std::fs::write(state_file(&dir, "join-place"), p);
-                "standby taken over: joining the place"
+                "standby taken over: opening the link"
             }
             None => "standby taken over",
         };
@@ -449,7 +450,7 @@ impl Server {
                     standby: false,
                     screenshot: dev.screenshot(),
                     apk: Some(apk),
-                    place: None,
+                    link_id: None,
                     started: std::time::Instant::now(),
                     package: Some(app.package.clone()),
                     display,
@@ -622,8 +623,6 @@ impl Server {
             "list_instances" => Ok(self.list_instances()),
             "install_apk" => self.install_apk(args),
             "launch_app" => self.start_instance(args), // launch == boot on this path
-            "login" => self.login(args),
-            "join_place" => self.join_place(args),
             "screenshot" => self.screenshot(args),
             // the warm device
             "shell" => self.shell(args),
@@ -672,28 +671,33 @@ impl Server {
         if !apk.is_file() {
             return Err(RpcError::params(format!("APK not found: {}", apk.display())));
         }
-        let cookie = args.get("cookie").and_then(Json::as_str).map(str::to_string).or_else(|| self.config.cookie.clone());
-        let place = args.get("place").and_then(Json::as_str).map(str::to_string).or_else(|| self.config.place.clone());
+        let extra: Vec<String> = match args.get("args") {
+            Some(Json::Array(items)) => items.iter().map(|a| a.as_str().map(str::to_string).ok_or_else(|| RpcError::params("`args` holds strings"))).collect::<Result<_, _>>()?,
+            Some(_) => return Err(RpcError::params("`args` is an array of strings")),
+            None => self.config.args.clone(),
+        };
+        let link_id = args.get("link_id").and_then(|v| v.as_str().map(str::to_string).or_else(|| v.as_u64().map(|n| n.to_string()))).or_else(|| self.config.link_id.clone());
         let gpu = args.get("gpu").and_then(Json::as_str).map(str::to_string).unwrap_or_else(|| self.config.gpu.clone());
         let size = args.get("size").and_then(Json::as_str).map(str::to_string).or_else(|| self.config.size.clone());
         let minutes = args.get("minutes").and_then(Json::as_u64).or(self.config.minutes);
         let root = RootRequest::from_args(args);
 
-        // No account: the APK on the host's warm device, installed by content and started.
-        if cookie.is_none() {
+        // Nothing beyond the app itself: the APK on the host's warm device, installed by content
+        // and started -- any APK.
+        if extra.is_empty() && link_id.is_none() {
             return self.start_on_warm(apk, true, &root);
         }
 
-        // A standby instance of the same APK and account is taken over: no boot at all.
+        // A standby instance of the same APK and options is taken over: no boot at all.
         let same_setup = Some(apk.as_path()) == self.config.apk.as_deref()
             && !root.is_rooted()
-            && cookie == self.config.cookie
+            && extra == self.config.args
             && args.get("gpu").is_none()
             && args.get("size").is_none();
         if self.config.standby && same_setup {
-            if let Some((id, dir, note)) = self.claim_standby(place.as_deref()) {
+            if let Some((id, dir, note)) = self.claim_standby(link_id.as_deref()) {
                 let screenshot = dir.with_extension("png");
-                let (state, in_place) = instance_state(&dir);
+                let (state, loaded_id) = instance_state(&dir);
                 self.instances.insert(
                     id.clone(),
                     Instance {
@@ -703,7 +707,7 @@ impl Server {
                         standby: true,
                         screenshot: screenshot.clone(),
                         apk: Some(apk),
-                        place,
+                        link_id,
                         started: std::time::Instant::now(),
                         package: None,
                         display: None,
@@ -712,9 +716,9 @@ impl Server {
                 return Ok(json::obj([
                     ("instance_id", json::s(id)),
                     ("state", json::s(state)),
-                    ("in_place", in_place.map_or(Json::Null, json::s)),
+                    ("loaded_id", loaded_id.map_or(Json::Null, json::s)),
                     ("screenshot_path", json::s(screenshot.to_string_lossy().into_owned())),
-                    ("note", json::s(format!("{note}; `list_instances` shows its state (in_game once the place has loaded)"))),
+                    ("note", json::s(format!("{note}; `list_instances` shows its state (loaded once what its link opened has loaded)"))),
                 ]));
             }
         }
@@ -724,7 +728,7 @@ impl Server {
         let dir = std::env::temp_dir().join(format!("omni-linux-r-mcp-{}-{id}", std::process::id()));
         let screenshot = dir.with_extension("png");
         let _ = std::fs::remove_file(&screenshot);
-        let mut cmd = self.launcher_rooted(&dir, &apk, cookie.as_deref(), place.as_deref(), &gpu, size.as_deref(), minutes, &root);
+        let mut cmd = self.launcher_rooted(&dir, &apk, &extra, link_id.as_deref(), &gpu, size.as_deref(), minutes, &root);
         let child = cmd.spawn().map_err(|e| {
             RpcError::server(format!("could not start {}: {e}", self.config.omnidroid_bin.display()))
         })?;
@@ -736,7 +740,7 @@ impl Server {
             standby: false,
             screenshot: screenshot.clone(),
             apk: Some(apk),
-            place: place.clone(),
+            link_id: link_id.clone(),
             started: std::time::Instant::now(),
             package: None,
             display: None,
@@ -748,7 +752,7 @@ impl Server {
             ("pid", Json::Num(pid as f64)),
             ("screenshot_path", json::s(screenshot.to_string_lossy().into_owned())),
             ("state", json::s("booting")),
-            ("note", json::s("booting; `list_instances` shows its state (in_game once the place has loaded)")),
+            ("note", json::s("booting; `list_instances` shows its state (app_on_screen, signed_in, link_taken, loaded -- as far as the session's plugin names them) and its log")),
         ]))
     }
 
@@ -775,7 +779,7 @@ impl Server {
     fn list_instances(&mut self) -> Json {
         let mut out = Vec::new();
         for inst in self.instances.values_mut() {
-            let (state, in_place) = if inst.package.is_some() {
+            let (state, loaded_id) = if inst.package.is_some() {
                 (if (device::Device { dir: inst.dir.clone() }).alive() { "app_running" } else { "stopped" }, None)
             } else {
                 instance_state(&inst.dir)
@@ -788,11 +792,11 @@ impl Server {
                 ("pid", inst.child.as_ref().map_or(Json::Null, |c| Json::Num(c.id() as f64))),
                 ("running", Json::Bool(state != "stopped")),
                 ("state", json::s(state)),
-                ("in_place", in_place.map_or(Json::Null, json::s)),
+                ("loaded_id", loaded_id.map_or(Json::Null, json::s)),
                 ("log", json::s(inst.dir.with_extension("log").to_string_lossy().into_owned())),
                 ("uptime_s", Json::Num(inst.started.elapsed().as_secs() as f64)),
                 ("apk", inst.apk.as_ref().map(|a| json::s(a.to_string_lossy().into_owned())).unwrap_or(Json::Null)),
-                ("place", inst.place.as_ref().map(|p| json::s(p.clone())).unwrap_or(Json::Null)),
+                ("link_id", inst.link_id.as_ref().map(|p| json::s(p.clone())).unwrap_or(Json::Null)),
                 ("screenshot_path", json::s(inst.screenshot.to_string_lossy().into_owned())),
                 ("root", root_json(&device::Device { dir: inst.dir.clone() })),
             ]));
@@ -809,18 +813,6 @@ impl Server {
         // is up) -- or kept as it is when the device holds the same bytes.
         self.config.apk = Some(apk.clone());
         self.start_on_warm(apk, false, &RootRequest::default())
-    }
-
-    fn login(&mut self, args: &Json) -> Result<Json, RpcError> {
-        let cookie = args.get("cookie").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `cookie` (a file path or a saved account name)"))?;
-        self.config.cookie = Some(cookie.to_string());
-        Ok(json::obj([("cookie", json::s(cookie)), ("note", json::s("recorded; applied at the next start_instance/launch_app"))]))
-    }
-
-    fn join_place(&mut self, args: &Json) -> Result<Json, RpcError> {
-        let place = args.get("place").and_then(Json::as_str).or_else(|| args.get("id").and_then(Json::as_str)).ok_or_else(|| RpcError::params("need `place`"))?;
-        self.config.place = Some(place.to_string());
-        Ok(json::obj([("place", json::s(place)), ("note", json::s("recorded; applied at the next start_instance/launch_app"))]))
     }
 
     fn screenshot(&mut self, args: &Json) -> Result<Json, RpcError> {
@@ -1354,7 +1346,7 @@ impl Dispatch for Server {
 impl Drop for Server {
     fn drop(&mut self) {
         // Do not leave booted instances running when the server exits -- but a standby taken over
-        // is given back, still running (and in its place), for the next session to take.
+        // is given back, still running (and with its link open), for the next session to take.
         for inst in self.instances.values_mut() {
             // An app on the warm device is stopped; the device stays up for the next session.
             if let Some(package) = &inst.package {
@@ -1567,10 +1559,10 @@ fn root_summary(device: &device::Device) -> String {
 }
 
 static TOOLS: &[Tool] = &[
-    Tool { name: "start_instance", desc: "Start an APK. Without `cookie` (any APK): on the host's warm device -- one Android kept booted and idle -- the APK is installed unless the device already holds the same bytes (decided by SHA-256, not version; another test app is uninstalled first) and its launcher Activity started; answers once the Activity is displayed (state app_on_screen), with seconds per step. The first call on a host with no warm device boots one (minutes) and it stays up for the next APKs. With `cookie` (a Roblox account): a signed-in session that joins `place`, answered at once (a standby instance is taken over when configured); `list_instances` shows booting, signed_in, joining, in_game.", params: &[
-        p!("apk","string",false,"APK path (else the configured default)"),
-        p!("cookie","string",false,"cookie file path or saved account name"),
-        p!("place","string",false,"place id to join (e.g. 8737899170)"),
+    Tool { name: "start_instance", desc: "Start any APK. With only `apk`: on the host's warm device -- one Android kept booted and idle -- the APK is installed unless the device already holds the same bytes (decided by SHA-256, not version; another test app is uninstalled first) and its launcher Activity started; answers once the Activity is displayed (state app_on_screen), with seconds per step. The first call on a host with no warm device boots one (minutes) and it stays up for the next APKs. With `args` (launcher options an installed plugin adds, e.g. a sign-in) or `link_id`: a session of its own (`omnidroid aosp`), answered at once (a standby instance is taken over when configured); `list_instances` shows booting, signed_in, link_taken, loaded -- as far as the plugin names them.", params: &[
+        p!("apk","string",false,"host path of the APK (else the configured default)"),
+        p!("args","array",false,"launcher options for a session of its own: a plugin's (see `omnidroid help`), e.g. [\"--cookie\",\"acct\"]"),
+        p!("link_id","string",false,"the id the session's link opens, once the app is ready (the link is a plugin's)"),
         p!("gpu","string",false,"vulkan | gl | auto"),
         p!("size","string",false,"window size WxH"),
         p!("minutes","number",false,"minutes to run"),
@@ -1578,16 +1570,14 @@ static TOOLS: &[Tool] = &[
         p!("modules","array",false,"root module ids to install (implies root); see `omnidroid modules`"),
     ]},
     Tool { name: "stop_instance", desc: "Stop an instance. An app on the warm device is force-stopped and its data cleared; the device stays warm for the next APK (`device: true` shuts it down too). A session instance's device shuts down.", params: &[p!("instance_id","string",true,"the id from start_instance"),p!("device","boolean",false,"also shut the warm device down")] },
-    Tool { name: "list_instances", desc: "List this server's instances: each one's state (booting, signed_in, joining, in_game with the place, stopped) and log.", params: &[] },
+    Tool { name: "list_instances", desc: "List this server's instances: each one's state (app_running for an app on the warm device; a session's booting, signed_in, link_taken, loaded with its loaded_id, stopped) and log.", params: &[] },
     Tool { name: "install_apk", desc: "Install an APK on the warm device now, without starting it (booting the device if none is up): kept as it is when the device holds the same bytes, reinstalled when the bytes differ (even at the same version), another test app uninstalled first. Also the default APK for the next start_instance.", params: &[p!("apk","string",true,"APK path")] },
     Tool { name: "uninstall_apk", desc: "Uninstall a package from the warm device.", params: &[p!("package","string",true,"package name, e.g. com.example.app")] },
     Tool { name: "stop_app", desc: "Force-stop a package on the warm device and clear its data; the device stays warm.", params: &[p!("package","string",true,"package name")] },
     Tool { name: "shell", desc: "Run a shell command on the warm device (as adb shell would: the shell user, or `uid`): its exit status and output. E.g. `pm list packages -3`, `am start ...`, `logcat -d -t 50`, `dumpsys activity top`.", params: &[p!("command","string",true,"a /system/bin/sh command line"),p!("uid","number",false,"run as this uid (0 root, 1000 system; default 2000 shell)"),p!("timeout","number",false,"seconds (default 120)")] },
     Tool { name: "device_status", desc: "The warm device: none, booting or ready; its directory, log, screenshot path and the test apps installed on it. state=none is NORMAL (no device booted yet, not a connection error) and carries a note -- call start_instance to boot one.", params: &[] },
     Tool { name: "stop_device", desc: "Shut the warm device down (the next start_instance boots one again).", params: &[] },
-    Tool { name: "launch_app", desc: "Boot the app (same as start_instance on the real-AOSP path).", params: &[p!("apk","string",false,"APK path"),p!("cookie","string",false,"cookie"),p!("place","string",false,"place id")] },
-    Tool { name: "login", desc: "Record a cookie (file path or saved account name) for the next boot.", params: &[p!("cookie","string",true,"cookie file path or saved account name")] },
-    Tool { name: "join_place", desc: "Record a place id to join on the next boot.", params: &[p!("place","string",true,"place id")] },
+    Tool { name: "launch_app", desc: "The same as start_instance.", params: &[p!("apk","string",false,"APK path"),p!("args","array",false,"launcher options (a plugin's)"),p!("link_id","string",false,"the id the session's link opens")] },
     Tool { name: "screenshot", desc: "Read the latest framebuffer PNG of an instance; returns the path and dimensions.", params: &[p!("instance_id","string",false,"instance (else the most recent)"),p!("path","string",false,"an explicit PNG path")] },
     Tool { name: "lab_load", desc: "Load a guest arm64 library (.so) into an emulation-layer lab session for debugging and dumping.", params: &[p!("path","string",true,"path to the .so"),p!("name","string",false,"a name for the module")] },
     Tool { name: "resolve_symbol", desc: "Resolve an exported symbol to a guest address in the lab.", params: &[p!("name","string",true,"symbol name")] },

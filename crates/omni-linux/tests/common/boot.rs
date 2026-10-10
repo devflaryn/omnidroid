@@ -55,8 +55,15 @@ pub struct Boot {
     marked: Duration,
 }
 
-/// Lines a boot's time is read from: each is logged again as `[t] +<secs>s <line>`.
-const MILESTONES: &[&str] = &["[r] ", "[zygote] launching", "DID_LOG_IN", "Joining game", "onGameLoaded", "Upgrade required", "GUEST THREAD DIED"];
+/// Lines a boot's time is read from: each is logged again as `[t] +<secs>s <line>`. The session's
+/// own markers (`omni_linux::app_session`: signed in, link taken, loaded) are too.
+const MILESTONES: &[&str] = &["[r] ", "[zygote] launching", "GUEST THREAD DIED"];
+
+/// `MILESTONES` and the session's markers.
+fn milestones() -> Vec<String> {
+    let s = omni_linux::app_session::AppSession::from_env();
+    MILESTONES.iter().map(|m| (*m).to_string()).chain([s.signed_in, s.link_taken, s.loaded, s.disconnected].into_iter().flatten()).collect()
+}
 
 impl Boot {
     /// Boot `instance` (made fresh) with system_server, `extra` runner arguments and the `then`
@@ -106,6 +113,7 @@ impl Boot {
     pub fn watch(&mut self, limit: Duration, mut seen: impl FnMut(&str) -> bool) {
         let deadline = Instant::now() + limit;
         let mut done = false;
+        let milestones = milestones();
         while Instant::now() < deadline && !done {
             let Ok(line) = self.lines.recv_timeout(Duration::from_secs(5)) else {
                 if self.child.try_wait().ok().flatten().is_some() {
@@ -121,7 +129,7 @@ impl Boot {
                     self.marked = self.started.elapsed();
                     let _ = writeln!(f, "[t] +{:.1}s", self.marked.as_secs_f64());
                 }
-                if MILESTONES.iter().any(|m| line.contains(m)) {
+                if milestones.iter().any(|m| line.contains(m.as_str())) {
                     let at = format!("[t] +{:.1}s {}", self.started.elapsed().as_secs_f64(), line.chars().take(120).collect::<String>());
                     let _ = writeln!(f, "{at}");
                     eprintln!("{at}");

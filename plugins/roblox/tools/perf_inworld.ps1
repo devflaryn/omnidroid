@@ -2,9 +2,9 @@
 # guest-host processes' private bytes / working set and the on-screen present rate, and print a
 # steady-state summary. Built for Phase C perf work (docs/NIGHT-2026-10-01.md).
 #
-#   powershell -ExecutionPolicy Bypass -File tools\perf_inworld.ps1 -Tag baseline
-#   powershell -ExecutionPolicy Bypass -File tools\perf_inworld.ps1 -Tag try1 -ExtraEnv "OMNI_JIT_SHARED_CACHE_LIVE_MB=192"
-#   powershell -ExecutionPolicy Bypass -File tools\perf_inworld.ps1 -Tag census -ExtraEnv "OMNI_GPU_MEM=15;OMNI_MEM_TRACE=30"
+#   powershell -ExecutionPolicy Bypass -File plugins\roblox\tools\perf_inworld.ps1 -Tag baseline
+#   powershell -ExecutionPolicy Bypass -File plugins\roblox\tools\perf_inworld.ps1 -Tag try1 -ExtraEnv "OMNI_JIT_SHARED_CACHE_LIVE_MB=192"
+#   powershell -ExecutionPolicy Bypass -File plugins\roblox\tools\perf_inworld.ps1 -Tag census -ExtraEnv "OMNI_GPU_MEM=15;OMNI_MEM_TRACE=30"
 #
 # Output goes to C:\od-unified\perf\<Tag>.{result.txt,log,err.log,png}. The [display]/[window] fps
 # lines live in the omni-linux-run CHILD log (%TEMP%\omni-linux-r-<pid>.log), which this reads --
@@ -30,12 +30,12 @@ Remove-Item $log,$errlog,$res,$shot -ErrorAction SilentlyContinue
 $env:OMNIDROID_DYNARMIC_BUILD_DIR = "C:\od-unified"
 $env:OMNI_WINDOW = "1"; $env:OMNI_R_KIOSK = "1"; $env:OMNI_GPU = "auto"
 $env:OMNI_R_MINUTES = [string]$Minutes
-$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; $env:OMNI_R_PLACE = $Place
+$env:OMNI_TEST_APK = $Apk; $env:OMNI_R_COOKIE = $Cookie; . (Join-Path $PSScriptRoot "roblox_session.ps1"); $env:OMNI_R_LINK_ID = $Place
 $env:OMNI_SCREENSHOT = $shot
 if ($ExtraEnv) { foreach ($kv in $ExtraEnv.Split(";")) { if ($kv) { $p=$kv.Split("=",2); Set-Item -Path ("env:"+$p[0]) -Value $p[1]; Add-Content $res ("env "+$kv) } } }
 
 $proc = Start-Process -FilePath "cargo" `
-  -ArgumentList "test","--release","-q","-p","omni-linux","--test","r_roblox","--","--ignored","--nocapture" `
+  -ArgumentList "test","--release","-q","-p","omni-linux","--test","r_app","--","--ignored","--nocapture" `
   -WorkingDirectory $repo -RedirectStandardOutput $log -RedirectStandardError $errlog -PassThru -WindowStyle Hidden
 
 function Sample-Mem {
@@ -63,5 +63,5 @@ $privvals = @($steady | ForEach-Object { $_.priv }); $wsvals = @($steady | ForEa
 Add-Content $res "==== SUMMARY $Tag ===="
 Add-Content $res ("priv_median_GB={0:N3} priv_max_GB={1:N3} ws_median_GB={2:N3} fps_median={3:N2} fps_p10={4:N2}" -f ((Median $privvals)/1GB),(($privvals|Measure-Object -Max).Maximum/1GB),((Median $wsvals)/1GB),(Median $fpsvals),(P10 $fpsvals))
 try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
-Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_roblox*" -or $_.Name -eq "cargo" } | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "omni-linux-run*" -or $_.Name -like "r_app*" -or $_.Name -eq "cargo" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Add-Content $res "DONE $(Get-Date -Format o)"; Get-Content $res

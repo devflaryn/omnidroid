@@ -140,6 +140,9 @@ default; evidence and how to run its tests: `macos-hvf.md`.
 
 ## Open
 
+* **Update 2026-10-10: on the real-AOSP path this build (`Delta-2.740.931.apk`) now starts and
+  stays up** -- 30 minutes at its sign-in screen, no crash (`omnidroid aosp`, M1); a world is not
+  yet tried. The direct path still refuses the library, as below.
 * **Roblox 2.740.931 does not reach a world on this host (either path).** Its
   `libzstd-jni-1.5.7-6.so` is linked for 4 KiB pages and is a packed library, and the app's startup
   requires it. Measured on the M1 (2026-09-29):

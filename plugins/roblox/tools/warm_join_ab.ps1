@@ -1,9 +1,9 @@
-# Interleaved A/B of `omnidroid aosp --cookie --place` (tools/join_timer.py, to PS99's own loading
+# Interleaved A/B of `omnidroid aosp --cookie --place` (plugins/roblox/tools/join_timer.py, to PS99's own loading
 # screen): "saved" = no warm device up, the command boots its saved signed-in device (the path
 # before the warm-device session); "warm" = a warm device booted and idle, nothing of the app on it.
 # Pairs in ABBA order (saved,warm / warm,saved / ...), so a drift over the hour falls on both.
 #
-#   powershell -File tools/warm_join_ab.ps1 [-Pairs 4] [-Label ab] [-Kinds saved,warm] [-WarmEnv NAME=VALUE]
+#   powershell -File plugins/roblox/tools/warm_join_ab.ps1 [-Pairs 4] [-Label ab] [-Kinds saved,warm] [-WarmEnv NAME=VALUE]
 #
 # Kinds: saved, warm, warm-env (a warm device booted with -WarmEnv set: a device-wide lever A/B'd
 # against plain warm devices, `-Kinds warm,warm-env`).
@@ -31,7 +31,7 @@ function Stop-Warm {
         if (Test-Path $stop) { Set-Content -Path (Join-Path $stop "stop") -Value "1" }
     }
     $i = 0
-    while ((Get-Process omni-linux-run, r_roblox* -ErrorAction SilentlyContinue) -and $i -lt 120) { Start-Sleep 1; $i++ }
+    while ((Get-Process omni-linux-run, r_app* -ErrorAction SilentlyContinue) -and $i -lt 120) { Start-Sleep 1; $i++ }
 }
 
 function Start-Warm([bool]$WithEnv) {
@@ -50,7 +50,7 @@ function Start-Warm([bool]$WithEnv) {
 
 function Run-One([string]$kind, [string]$name) {
     if ($kind -like "warm*") { $null = Start-Warm ($kind -eq "warm-env") } else { Stop-Warm }
-    $lines = python tools/join_timer.py --label $name --stop --limit 480 -- $Exe aosp --apk $Apk --cookie $Cookie --place $Place 2>&1
+    $lines = python plugins/roblox/tools/join_timer.py --label $name --stop --limit 480 -- $Exe aosp --apk $Apk --cookie $Cookie --place $Place 2>&1
     $joining = $lines | Where-Object { "$_" -match "\+\s*([0-9.]+)s Joining game" } | Select-Object -First 1
     $j = if ("$joining" -match "\+\s*([0-9.]+)s Joining") { [double]$Matches[1] } else { [double]::NaN }
     $hit = $lines | Where-Object { "$_" -match "result: in-game loading screen at ([0-9.]+)" } | Select-Object -First 1

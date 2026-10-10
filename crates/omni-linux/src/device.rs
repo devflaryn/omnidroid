@@ -129,7 +129,7 @@ pub const LEAVES_OUT: &[&str] = &[
 
 /// **The image's idle apps that can be left out** (`OMNI_DEVICE_IDLE_APPS=out`; off by default:
 /// `disable`, the device's setup disables them once it is up, as before). Of the 18 apps
-/// `tests/r_roblox.rs`' setup disabled after the first boot (`IDLE_APPS`: `cmd package
+/// `tests/r_app.rs`' setup disabled after the first boot (`IDLE_APPS`: `cmd package
 /// disable-user`, ~7 s), until then scanned, started and sent the boot broadcast like any other:
 /// PackageManager never scans these.
 ///

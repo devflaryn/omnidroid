@@ -112,7 +112,17 @@ fn chosen_apk() -> &'static omni_apk::ChosenApk {
 /// machine's driver through `omni_gfx::GfxVulkanHost` -- the same two seams the Vulkan stage tests
 /// verified against a real GPU, now driven by the engine instead of by assembled test code.
 const GRAPHICS_GATE: &str = "OMNI_GFX_WINDOW_TESTS";
-const MAIN_LIB: &str = "libroblox.so";
+
+/// **The APK's main native library, as its manifest names it**: the `android.app.lib_name` its
+/// native Activity loads (`lib<name>.so`), else `libmain.so` -- a `NativeActivity`'s default. Not
+/// named here: the gate runs whichever APK it is given.
+fn main_lib() -> &'static str {
+    static NAME: OnceLock<String> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let info = omni_apk::launch_info_of(&apk_path()).unwrap_or_else(|e| panic!("the APK's manifest: {e}"));
+        format!("lib{}.so", info.native_lib.as_deref().unwrap_or("main"))
+    })
+}
 
 /// **The APK's second native library, named by its role and not by its version.**
 ///
@@ -616,9 +626,15 @@ fn cached_main_lib() -> &'static Path {
         let library = apk
             .native_libraries_for_abi("arm64-v8a")
             .into_iter()
-            .find(|l| l.file_name() == MAIN_LIB)
-            .expect("the APK must contain libroblox.so");
-        cache.extract(&apk, library.entry()).expect("extract libroblox.so").path().to_path_buf()
+            .find(|l| l.file_name() == main_lib())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the APK has no arm64-v8a {} -- the native library its manifest's native Activity \
+                     loads. `omnidroid play` runs only such apps; any APK runs with `omnidroid aosp`",
+                    main_lib()
+                )
+            });
+        cache.extract(&apk, library.entry()).expect("extract the main library").path().to_path_buf()
     })
 }
 
@@ -671,7 +687,7 @@ fn cached_compression_lib() -> &'static SecondLibrary {
         let bytes = std::fs::metadata(&path).expect("the cache entry's length").len();
         let entry_sha256 = payload::sections::hex(&payload::sections::sha256_of_file(&path));
         SecondLibrary {
-            guest_path: format!("{GUEST_LIB_DIR}/{file_name}"),
+            guest_path: format!("{}/{file_name}", guest_lib_dir()),
             path,
             file_name,
             bytes,
@@ -734,22 +750,37 @@ fn main_lib_bytes() -> &'static [u8] {
 
 // ====================================================================== the real APK's assets
 
-/// Where the package's own APK is, as the guest sees it: a device's `base.apk`.
-const GUEST_APK: &str = "/data/app/com.roblox.client/base.apk";
+/// A path the guest sees, made once and kept for the run.
+fn kept(cell: &'static OnceLock<String>, make: impl FnOnce() -> String) -> &'static str {
+    cell.get_or_init(make).as_str()
+}
+
+/// Where the package's own APK is, as the guest sees it: a device's `base.apk`, under the APK's
+/// own package.
+fn guest_apk() -> &'static str {
+    static AT: OnceLock<String> = OnceLock::new();
+    kept(&AT, || format!("/data/app/{}/base.apk", chosen_apk().manifest.package))
+}
 
 /// Where the package manager extracts the package's native libraries: beside `base.apk`.
 ///
-/// [`GUEST_LIB`] is this directory and `libroblox.so`; the second library's guest path
+/// [`guest_lib`] is this directory and the main library; the second library's guest path
 /// ([`SecondLibrary::guest_path`]) is this directory and whatever the APK calls it.
-const GUEST_LIB_DIR: &str = "/data/app/com.roblox.client/lib/arm64";
+fn guest_lib_dir() -> &'static str {
+    static AT: OnceLock<String> = OnceLock::new();
+    kept(&AT, || format!("/data/app/{}/lib/arm64", chosen_apk().manifest.package))
+}
 
-/// Where the package manager puts `libroblox.so` on a device: beside `base.apk`, in `lib/arm64/`.
+/// Where the package manager puts the main library on a device: beside `base.apk`, in `lib/arm64/`.
 ///
 /// The APK stores it **compressed** (deflate), so a device's installer extracts it there and the
 /// linker maps it from there -- which is the path `/proc/self/maps` and `dl_iterate_phdr` then
 /// name. The gate places the same bytes at the same guest path and maps the library from it, so
 /// the guest sees one consistent file where a device has it (and not a Windows cache path).
-const GUEST_LIB: &str = "/data/app/com.roblox.client/lib/arm64/libroblox.so";
+fn guest_lib() -> &'static str {
+    static AT: OnceLock<String> = OnceLock::new();
+    kept(&AT, || format!("{}/{}", guest_lib_dir(), main_lib()))
+}
 
 /// The engine's own assets, out of the real APK.
 ///
@@ -775,14 +806,14 @@ impl AssetSource for ApkAssets {
     }
 
     /// The entry's own compression method and place, out of the real APK's central directory.
-    /// A stored entry lives in the package at [`GUEST_APK`], where the gate links the real APK.
+    /// A stored entry lives in the package at [`guest_apk`], where the gate links the real APK.
     fn placement(&self, name: &[u8]) -> Option<omni_android::ndk::AssetPlacement> {
         let name = std::str::from_utf8(name).ok()?;
         let apk = self.apk.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = apk.asset_entry(name)?;
         Some(if entry.is_stored() {
             omni_android::ndk::AssetPlacement::StoredInPackage {
-                package: GUEST_APK.to_string(),
+                package: guest_apk().to_string(),
                 offset: entry.payload_offset(),
                 length: entry.uncompressed_size(),
             }
@@ -910,19 +941,19 @@ impl Guest {
         // `phys_footprint` (`MALLOC_LARGE`, one region) held through the whole session for a parse
         // done at startup. See [`LoadBytes`] for why these are pages of their own.
         let bytes = LoadBytes::read(path);
-        // The root first, so the library can be mapped from where a device keeps it (`GUEST_LIB`).
+        // The root first, so the library can be mapped from where a device keeps it (`guest_lib`).
         let root = Scratch::new("m5-gate");
-        let lib_at = root.0.join(GUEST_LIB.trim_start_matches('/'));
+        let lib_at = root.0.join(guest_lib().trim_start_matches('/'));
         std::fs::create_dir_all(lib_at.parent().expect("a directory")).expect("lib/arm64");
         // A kept root may hold another version's: replace it. A hard link costs nothing; a copy
         // is the fallback where the cache is on another volume.
         let _ = std::fs::remove_file(&lib_at);
         if std::fs::hard_link(path, &lib_at).is_err() {
-            std::fs::copy(path, &lib_at).expect("libroblox.so into the guest's lib/arm64");
+            std::fs::copy(path, &lib_at).expect("the main library into the guest's lib/arm64");
         }
-        let backing = Backing::open_named(&lib_at, MapExecutability::Executable, GUEST_LIB)
-            .expect("open libroblox.so where the guest sees it");
-        let elf = ElfImage::parse(bytes.bytes()).expect("parse libroblox.so");
+        let backing = Backing::open_named(&lib_at, MapExecutability::Executable, guest_lib())
+            .expect("open the main library where the guest sees it");
+        let elf = ElfImage::parse(bytes.bytes()).expect("parse the main library");
         // **And the APK's second native library, staged exactly the same way.** The package stores
         // it compressed, so a device's installer extracts it beside `base.apk` and the linker maps
         // it from there; the same file at the same guest path is what `/proc/self/maps` and
@@ -1295,7 +1326,7 @@ impl Guest {
         bionic.register_image(&object.dl_phdr_info()).expect("register the loaded image");
         // `OMNI_MEM_REPORT` names the engine's call sites inside it as link addresses, and prints
         // the engine's own count from where the app's storage keeps it.
-        omni_android::memreport::register_image(MAIN_LIB, object.base, object.span());
+        omni_android::memreport::register_image(main_lib(), object.base, object.span());
         omni_android::memreport::register_engine_profile_dir(
             root.0.join("data/data/com.roblox.client/files/appData/LocalStorage"),
         );
@@ -2321,7 +2352,7 @@ impl Scratch {
         // STORED in the APK, and a device answers with a descriptor on `base.apk` and the
         // entry's offset -- so the guest must be able to open the real bytes at that path. This
         // was an empty placeholder while only its existence was read.
-        let apk_at = at.join(GUEST_APK.trim_start_matches('/'));
+        let apk_at = at.join(guest_apk().trim_start_matches('/'));
         // A kept root already has one, possibly of an older APK: replace it.
         let _ = std::fs::remove_file(&apk_at);
         match std::fs::hard_link(apk_path(), &apk_at) {

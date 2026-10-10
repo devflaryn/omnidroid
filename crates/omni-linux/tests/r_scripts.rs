@@ -1,4 +1,4 @@
-//! `r_roblox`'s time-to-game switches (`common::r_scripts`), checked without booting anything: the
+//! `r_app`'s time-to-game switches (`common::r_scripts`), checked without booting anything: the
 //! defaults are the fast scripts (the old ones one variable away), and each switch's script says
 //! what the old one said, so the host
 //! side (which waits for those lines) and the run's reader see the same milestones.
