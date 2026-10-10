@@ -119,6 +119,22 @@ pub fn end_with_parent() -> bool {
     backend::end_with_parent()
 }
 
+/// **This process runs at full speed, unfocused too** (Windows: out of execution-speed power
+/// throttling -- `SetProcessInformation(ProcessPowerThrottling)`, the control bit set and the
+/// state bit clear, "high QoS"). Without it the scheduler may treat a process with no foreground
+/// window as background work and keep its threads on a hybrid CPU's efficiency cores: on
+/// 2026-10-10 from ~09:25 every hidden run's load sat on the i7's eight E-cores with its P-cores
+/// idle -- the game at 31 fps and 64 ms of CPU a frame, boot_completed 21 -> 30 s, the world 72 ->
+/// 110-116 s -- and the same running game, opted out while it ran, was at 60 fps within a minute.
+/// Nothing elsewhere (macOS's QoS classes and Linux have no such per-process throttle here).
+/// `OMNI_HIGH_QOS=0`: left as the host decides. Whether it took.
+pub fn prefer_speed() -> bool {
+    if std::env::var("OMNI_HIGH_QOS").as_deref() == Ok("0") {
+        return false;
+    }
+    backend::prefer_speed()
+}
+
 /// How many CPUs this process may run on, as `sysconf(_SC_NPROCESSORS_ONLN)` reports it.
 ///
 /// `available_parallelism` rather than a raw core count: it honours affinity masks and container

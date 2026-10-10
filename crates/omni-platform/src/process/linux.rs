@@ -653,3 +653,7 @@ pub(super) mod tests {
         eprintln!("cpu_time: {steps} steps in 10,000 readings, smallest {smallest:?}");
     }
 }
+
+pub(super) fn prefer_speed() -> bool {
+    false
+}

@@ -43,6 +43,9 @@ fn main() -> ExitCode {
     omni_linux::proccpu::start();
     // A crash of this host process itself (not the guest's) says where it was (Windows).
     omni_platform::fault::install_crash_report();
+    // Every host process -- the game's, the system's -- at full speed when no window of it is in
+    // front (the benchmark's hidden runs, a standby, a session behind another window).
+    omni_platform::process::prefer_speed();
     omni_linux::jit_time::start();
     omni_linux::ws_trim::start();
     omni_linux::zero_reclaim::start();

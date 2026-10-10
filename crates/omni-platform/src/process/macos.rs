@@ -320,3 +320,7 @@ mod tests {
         assert!(cpu_time().expect("cpu time") > before);
     }
 }
+
+pub(super) fn prefer_speed() -> bool {
+    false
+}
