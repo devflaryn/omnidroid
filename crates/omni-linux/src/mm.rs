@@ -50,6 +50,19 @@ pub struct Mm {
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
+/// The layout lock, held either way (see [`Mm::discard`]) -- for its drop.
+#[allow(dead_code)]
+enum Lock<'a> {
+    Shared(parking_lot::RwLockReadGuard<'a, ()>),
+    Exclusive(parking_lot::RwLockWriteGuard<'a, ()>),
+}
+
+/// `OMNI_DISCARD_SHARED=1`: a guest discard under the layout lock shared ([`Mm::discard`]).
+fn discard_shared() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_DISCARD_SHARED").as_deref() == Ok("1"))
+}
+
 /// `OMNI_STRICT_GAPS=<prefix>,...`: named ranges (`PR_SET_VMA_ANON_NAME`, or a file's path) whose
 /// unmapped 4 KiB must fault even inside a host page that holds other mappings (D42's escape
 /// hatch; by default such a gap is lenient). Empty by default.
@@ -279,7 +292,13 @@ impl Mm {
 
     /// `MADV_DONTNEED`: the range reads as zeros again.
     pub fn discard(&self, addr: u64, len: u64) -> Result<(), Errno> {
-        let _g = self.lock.write();
+        // `OMNI_DISCARD_SHARED=1`: under the layout lock shared, not exclusive. A discard changes no
+        // mapping -- its pages stay mapped, lazily committed -- so a copy that touches one it just
+        // decommitted is served by the demand pager (committed again, zeros), unlike a page
+        // `munmap` took away, which is what the exclusive lock is for. Exclusive, each of the
+        // game's MADV_DONTNEEDs (53,883 in its first minute, s30) waited for every copy in flight
+        // and held every other thread's copies and mappings off while it ran.
+        let _g = if discard_shared() { Lock::Shared(self.lock.read()) } else { Lock::Exclusive(self.lock.write()) };
         self.space.discard(addr as usize, len as usize).map(|_| ()).map_err(|_| EINVAL)
     }
 
