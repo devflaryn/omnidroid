@@ -432,6 +432,9 @@ impl Init {
     /// Read the services and become this host process's init.
     pub fn start(sysroot: PathBuf, instance: PathBuf, envp: Vec<Vec<u8>>) -> Result<Arc<Self>, String> {
         let root = Sysroot::open(&sysroot)?;
+        // Before apexd can start: a boot's, not every instance's (a test's runs no apexd, and the
+        // copy is ~240 MB).
+        crate::apex::predecompress(&root, &instance, &crate::owners::Owners::of(&instance));
         let (services, boot_commands) = parse(&root);
         // The boot phases' exports are unconditional: the environment has them from the start.
         let mut envp = envp;

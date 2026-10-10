@@ -398,3 +398,33 @@ Trimming once leaves the game's working set ~145 MB larger and ~180 MB less memo
 (2/2); its CPU is 39.7 against 41.4 ms a frame, a difference smaller than the one between the two
 pairs (44 vs 38 ms). s13's hint of a cost of the periodic trim is not borne out. **Periodic stays
 the default.**
+
+## Session s22 (08:40-09:05): IC IVAU batched until ISB (`s22-icbatch.csv`, build 744c852 + 0095-0099)
+
+| arm | fps | CPU ms/frame (all) | commit GB | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|
+| base | 59.62 | 35.39 | 3.816 | 47.8 | 60.9 | 71.9 |
+| ic (`OMNI_JIT_IC_BATCH=1`) | 59.61 | 34.02 | 3.812 | 47.3 | 60.3 | 72.3 |
+| ic | 59.20 | 40.28 | 3.846 | 46.8 | 59.2 | 71.8 |
+| base | 59.43 | 36.96 | 3.861 | 46.6 | 59.0 | 71.7 |
+
+The switch was on in every ic process (`JIT SWITCH ... on`, 20 lines). 37.2 against 36.2 ms a frame, the
+world at the same second: the guest's clear-cache loops (218 -> 15 ns a line in the benchmark) are not
+where the game's time goes. **Stays opt-in.**
+
+## Between s22 and s26 (09:00): two things found on the side
+
+- **The decompressed APEXes were copied into every instance**, not only a booting device's: the copy
+  sat in `make_init_dirs`, which every process's first spawn runs, so every fixture test made a 237
+  MB copy (`/tmp` on the Linux box filled with them; `shared_map`'s two tests 6.88 -> 0.32 s once it
+  moved). Now `Init::start` does it -- a boot's, before apexd can start.
+- **Roblox's asset pool is private commit here, file pages on a device.** The game maps
+  `cache/wob/wob-<n>` 1 GiB `MAP_SHARED` over a file it has just made and unlinked, and grows the file
+  with `ftruncate` as it fills (the directory is empty while the game runs; `[mem]` named the mapping
+  with 570 MiB committed, s3/s10 traces). A shared mapping's part past its file's end was anonymous
+  memory -- the whole 1 GiB if the file was empty when mapped (inferred; s27's `[mm] shared ...` line
+  says) -- and never became the file's.
+  Now that part is a view of a host file of its own (sparse, its name removed once mapped:
+  `mm::tail_backing`, `OMNI_SHARED_TAIL=0` the old way). A new fixture (`sharedtail`) holds its writes
+  across the growth, a fork, an in-page offset and a fixed address -- and with the old anonymous tail
+  **a forked child's writes never reached the parent**, which the new one fixes. s27 measures it.

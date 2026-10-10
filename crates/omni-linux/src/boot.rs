@@ -84,7 +84,6 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
             _ => {}
         }
     }
-    crate::apex::predecompress(sysroot, instance, &owners);
     let _ = std::fs::create_dir_all(instance.join("data"));
     let _ = std::fs::write(marker, b"");
 }
