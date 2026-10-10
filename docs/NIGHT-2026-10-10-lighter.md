@@ -194,5 +194,17 @@ Build d9fbf71 (+ the snapshot saved before a code trim). Every arm `OMNI_JIT_SHA
 | system_server | **495,587** | 65,817 (13%) | was 78,488: now saved before its trim; but most of it does not verify -- its code is mostly the framework's compiled `.odex`/`.oat`, which ART maps itself (not through `linker64`, so the library zone does not place it): next |
 | native daemons, helper apps | 18-166k each | ~99.9% | |
 
-First pair: `snap` boot_completed 27.5 s, DID_LOG_IN 53.2, onGameLoaded 81.6 vs `live` 29.6 / 57.9 / 85.9;
-private WS 3.163 vs 2.966 GB (+197 MB). Snapshots stay opt-in: -4..-10 s for +100..+200 MB.
+| arm | boot_completed | DID_LOG_IN | Joining | onGameLoaded | private WS |
+|---|---|---|---|---|---|
+| live (no snapshots) | 29.6 / 29.7 | 57.9 / 57.8 | 71.3 / 68.8 | 85.9 / 84.9 | 2.966 / 2.988 GB |
+| snap, 1st after the fill | 27.5 | 53.2 | 65.3 | 81.6 | 3.163 GB |
+| **snap, 2nd** | **27.4** | **44.6** | **54.7** | **68.6** | 3.133 GB |
+
+**The game's snapshot gets better each run:** its second run verified **907,313 of 1,300,594** restored
+blocks (70%; the first 32%), and the world was reached **~16 s sooner** (68.6 vs 84.9 s), sign-in 13 s
+sooner. Cost: +145 MB private WS, 2.2 GB of snapshot files (the game's 558 MB, system_server's 235
+MB), and every rebuild of the host binary starts them again. system_server still verifies 8% (45k of
+553k): its code trim at ~60 s clears its cache wholesale (the forget step found nothing left), and
+most of what it restored before then did not match -- s12 names where. Not a default yet: the RAM and
+disk are yours to weigh against 16 s; `OMNI_JIT_SNAPSHOT=<dir>` with `_LAZY=1 _LIB_ZONE=1 _FORGET=1`
+and `OMNI_JIT_SHARED_CACHE_LIVE_MB=512` is the measured set.
