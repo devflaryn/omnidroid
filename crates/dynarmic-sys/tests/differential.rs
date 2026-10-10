@@ -1,6 +1,6 @@
-//! **A differential of what the guest sees** (measurement, `#[ignore]`d): a differential of what the guest sees -- every register and
-//! the PC after every block run -- over real code, to compare two configurations of the translator
-//! run in separate processes (e.g. OMNI_JIT_GETSET_WIDTH=1 vs 0). Prints one hash per library.
+//! **What the guest sees, as a differential** (measurement, `#[ignore]`d): every register and
+//! the PC after every block run over real code, hashed, to compare two configurations of the
+//! translator run in separate processes (e.g. OMNI_JIT_GETSET_WIDTH=1 vs 0). One hash per library.
 //!   OMNI_SYSROOT=... OD_EXTRA_LIB=/tmp/libroblox.so OD_TEST_SHARED_CACHE=1 \
 //!   cargo test -p dynarmic-sys --release --test differential -- --ignored --nocapture
 mod harness;

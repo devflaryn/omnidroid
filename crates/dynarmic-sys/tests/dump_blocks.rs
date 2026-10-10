@@ -1,4 +1,4 @@
-//! **The x64 dynarmic emits** (measurement, `#[ignore]`d): the x64 dynarmic emits for chosen guest addresses of a
+//! **The x64 dynarmic emits** (measurement, `#[ignore]`d) for chosen guest addresses of a
 //! library, as omni-cpu configures the jit (shared cache, INTERRUPTIBLE optimisations).
 //! OD_LIB=<elf> OD_TEXT=<off>,<vaddr>,<len> (hex) OD_PCS=<hex,...> OD_OUT=<dir>
 //!   OD_TEST_SHARED_CACHE=1 cargo test -p dynarmic-sys --release --test dump_blocks -- --ignored --nocapture
