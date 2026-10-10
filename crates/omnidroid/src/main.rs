@@ -49,6 +49,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod app;
 mod plugin;
 mod warm;
 
@@ -57,8 +58,18 @@ const SESSION_TEST: &str = "initialize_native_code_returns_a_native_code_and_the
 /// "No limit": ten years, the gate's way of saying until the window is closed.
 const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 
+/// What `omnidroid help` says: the app. The one-shot commands below it are for scripts and the
+/// app's own use (`omnidroid help commands`).
+const APP_USAGE: &str = "\
+usage: omnidroid                    open the omnidroid app: warm Androids, any APK run on them
+       omnidroid <app.apk> [xN]     open it and launch N instances of that APK
+
+In the app: run <apk> [xN], close <#id>, warm, kill <D#>, shell, plugins, settings, mcp, help.
+Coding agents drive it through its MCP server (`mcp on` in the app, then `mcp status`).
+Its settings: <app-data>/../app.conf (OMNI_APP_CONFIG). The one-shot commands scripts use: `omnidroid help commands`.";
+
 const USAGE: &str = "\
-usage: omnidroid <app.apk> [aosp options]          (the same as `omnidroid aosp --apk <app.apk>`)
+usage: omnidroid <app.apk> [xN]                    (the app, launching that APK)
        omnidroid [aosp] [--apk <path>] [--minutes <n>]
                       [--size <w>x<h>] [--gpu vulkan|gl|auto] [--with-systemui]
                       [--fresh-device] [--standby] [--instance <dir>]
@@ -152,14 +163,15 @@ fn is_apk_path(arg: &str) -> bool {
     !arg.starts_with('-') && Path::new(arg).extension().is_some_and(|e| e.eq_ignore_ascii_case("apk"))
 }
 
-/// The command and the arguments after it. Options with no command in front of them, or an APK's
-/// path, mean `aosp`: `omnidroid app.apk --minutes 30` is `omnidroid aosp --apk app.apk --minutes 30`.
+/// The command and the arguments after it. Nothing, or an APK's path, means the app
+/// (`omnidroid app.apk x3` opens it and launches three); options with no command in front of them
+/// mean `aosp`: `omnidroid --apk app.apk --minutes 30` is `omnidroid aosp --apk app.apk --minutes 30`.
 fn command_and_rest(args: impl Iterator<Item = String>) -> (Option<String>, Vec<String>) {
     let mut args: Vec<String> = args.collect();
-    if args.is_empty() {
-        return (None, args);
+    if args.is_empty() || is_apk_path(&args[0]) {
+        return (Some("app".to_string()), args);
     }
-    if (args[0].starts_with("--") && !matches!(args[0].as_str(), "--help")) || is_apk_path(&args[0]) {
+    if args[0].starts_with("--") && !matches!(args[0].as_str(), "--help") {
         return (Some("aosp".to_string()), args);
     }
     let command = args.remove(0);
@@ -187,8 +199,30 @@ fn with_hint(message: String) -> String {
     }
 }
 
+/// The app's first launch from its arguments: `<apk> [xN | N]`.
+fn app_launch(rest: &[String]) -> Result<Option<(PathBuf, u32)>, String> {
+    match rest {
+        [] => Ok(None),
+        [apk] => Ok(Some((PathBuf::from(apk), 1))),
+        [apk, n] => {
+            let count = n.trim_start_matches(['x', 'X']).parse::<u32>().ok().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("not a count of 1 to 64: {n}"))?;
+            Ok(Some((PathBuf::from(apk), count)))
+        }
+        _ => Err("omnidroid [<app.apk> [xN]]".into()),
+    }
+}
+
 fn main() -> ExitCode {
     let (command, rest) = command_and_rest(std::env::args().skip(1));
+    if command.as_deref() == Some("app") {
+        return match app_launch(&rest) {
+            Ok(first) => app::run(first),
+            Err(e) => {
+                eprintln!("omnidroid: {e}\n\n{APP_USAGE}");
+                ExitCode::from(2)
+            }
+        };
+    }
     // The helper a warm-device session leaves behind to stop its app once the session is gone.
     if command.as_deref() == Some("warm-release") {
         return warm::release(&rest);
@@ -246,7 +280,11 @@ fn main() -> ExitCode {
             Err(message) => refused(message),
         },
         Some("-h" | "--help" | "help") => {
-            println!("{}", usage());
+            if rest.first().map(String::as_str) == Some("commands") {
+                println!("{}", usage());
+            } else {
+                println!("{APP_USAGE}");
+            }
             ExitCode::SUCCESS
         }
         None => refused("no command".to_string()),
@@ -255,27 +293,29 @@ fn main() -> ExitCode {
 }
 
 /// `omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]`.
-fn plugins_command(args: &[String]) -> ExitCode {
+/// `plugins [list | add [--link] <dir> | remove | enable | disable <name> | new <name> [<dir>]]`:
+/// what it says, line by line (the app shows them in its log, the command prints them).
+fn plugins_lines(args: &[String]) -> Result<Vec<String>, String> {
     let registry = plugin::Registry::installed();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let done = match args.as_slice() {
         [] | ["list"] => {
-            match &registry.dir {
-                Some(dir) => println!("plugins in {}", dir.display()),
-                None => println!("this host names no plugin directory (set OMNI_PLUGINS)"),
-            }
+            let mut lines = vec![match &registry.dir {
+                Some(dir) => format!("plugins in {}", dir.display()),
+                None => "this host names no plugin directory (set OMNI_PLUGINS)".to_string(),
+            }];
             if registry.entries.is_empty() {
-                println!("none installed (the repository's plugins/ holds some: omnidroid plugins add --link plugins/<name>)");
+                lines.push("none installed (the repository's plugins/ holds some: plugins add --link plugins/<name>)".into());
             }
             for entry in &registry.entries {
                 let state = if entry.enabled { "on" } else { "off" };
                 let from = if entry.linked { format!("linked to {}", entry.dir.display()) } else { entry.dir.display().to_string() };
-                match &entry.plugin {
-                    Ok(p) => println!("{}\t{}\t{state}\t{}\t{from}", p.name, p.version, p.description),
-                    Err(error) => println!("{}\t?\t{state}\tBROKEN: {error}\t{from}", entry.name),
-                }
+                lines.push(match &entry.plugin {
+                    Ok(p) => format!("{}\t{}\t{state}\t{}\t{from}", p.name, p.version, p.description),
+                    Err(error) => format!("{}\t?\t{state}\tBROKEN: {error}\t{from}", entry.name),
+                });
             }
-            Ok(String::new())
+            return Ok(lines);
         }
         ["add", "--link", dir] | ["add", dir, "--link"] => plugin::add(&registry, Path::new(dir), true),
         ["add", dir] => plugin::add(&registry, Path::new(dir), false),
@@ -284,15 +324,16 @@ fn plugins_command(args: &[String]) -> ExitCode {
         ["disable", name] => plugin::set_enabled(&registry, name, false),
         ["new", name] => plugin::scaffold(name, Path::new(name)),
         ["new", name, dir] => plugin::scaffold(name, Path::new(dir)),
-        _ => {
-            eprintln!("omnidroid: usage: omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]");
-            return ExitCode::from(2);
-        }
+        _ => return Err("plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]".into()),
     };
-    match done {
-        Ok(message) => {
-            if !message.is_empty() {
-                println!("{message}");
+    done.map(|m| if m.is_empty() { Vec::new() } else { m.lines().map(str::to_string).collect() })
+}
+
+fn plugins_command(args: &[String]) -> ExitCode {
+    match plugins_lines(args) {
+        Ok(lines) => {
+            for l in lines {
+                println!("{l}");
             }
             ExitCode::SUCCESS
         }
@@ -917,15 +958,18 @@ mod tests {
         let (command, rest) = split(&["--apk", "a.apk", "--minutes", "1"]);
         assert_eq!(command.as_deref(), Some("aosp"));
         assert_eq!(rest, ["--apk", "a.apk", "--minutes", "1"]);
-        let (command, rest) = split(&["/x/Some App.APK", "--minutes", "5"]);
-        assert_eq!((command.as_deref(), rest.as_slice()), (Some("aosp"), &["/x/Some App.APK".to_string(), "--minutes".into(), "5".into()][..]));
-        let o = parse_aosp(rest.into_iter()).expect("a bare APK path is --apk");
+        let (command, rest) = split(&["/x/Some App.APK", "x3"]);
+        assert_eq!((command.as_deref(), rest.as_slice()), (Some("app"), &["/x/Some App.APK".to_string(), "x3".into()][..]));
+        assert_eq!(app_launch(&rest), Ok(Some((PathBuf::from("/x/Some App.APK"), 3))));
+        assert_eq!(split(&[]).0.as_deref(), Some("app"), "nothing opens the app");
+        assert!(app_launch(&["a.apk".into(), "x0".into()]).is_err());
+        let o = parse_aosp(["/x/Some App.APK".to_string(), "--minutes".into(), "5".into()].into_iter()).expect("a bare APK path is --apk");
         assert_eq!((o.apk.as_deref(), o.minutes), (Some(Path::new("/x/Some App.APK")), 5));
         assert_eq!(parse(["game.apk".to_string()].into_iter()).expect("play too").apk.as_deref(), Some(Path::new("game.apk")));
         assert!(parse_aosp(["a.apk".to_string(), "b.apk".to_string()].into_iter()).is_err(), "one APK");
         let (command, rest) = split(&["login", "name"]);
         assert_eq!((command.as_deref(), rest.as_slice()), (Some("login"), &["name".to_string()][..]));
-        assert_eq!(split(&[]).0, None);
+
     }
 
     #[test]

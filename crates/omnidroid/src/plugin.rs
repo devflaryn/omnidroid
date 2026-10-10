@@ -458,6 +458,7 @@ pub struct Session {
 
 impl Session {
     /// The last value a plugin gave `key` (`None` when unset or never given).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn var(&self, key: &str) -> Option<&str> {
         self.env.iter().rev().find(|(k, _)| k == key).and_then(|(_, v)| v.as_deref())
     }

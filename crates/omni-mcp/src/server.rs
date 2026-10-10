@@ -1675,7 +1675,9 @@ static TOOLS: &[Tool] = &[
 // ---- small helpers ----------------------------------------------------------------------------
 
 /// Wrap a JSON value as an MCP tool result (`{content:[{type:text,text:<json>}]}`).
-fn text_result(value: Json) -> Json {
+/// A tool's answer as MCP gives it: one text item holding the JSON.
+#[must_use]
+pub fn text_result(value: Json) -> Json {
     json::obj([
         ("content", Json::Array(vec![json::obj([("type", json::s("text")), ("text", json::s(value.to_string()))])])),
         ("isError", Json::Bool(false)),

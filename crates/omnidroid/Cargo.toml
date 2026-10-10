@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 publish = false
-description = "The launcher: run an APK in a real window on Windows, macOS or Linux -- `omnidroid play --apk <path>`."
+description = "The omnidroid app: warm Android devices, any APK run on them in windows of its own, and an MCP server for coding agents."
 
 # A launcher, and only that: which APK (omni-apk), where the app's storage lives (omni-platform),
 # the root module catalog and request (omni-linux's `root` module: file work only, no boot) and then
@@ -20,6 +20,15 @@ omni-platform = { workspace = true }
 omni-warm = { workspace = true }
 # The root module catalog and request (`omnidroid modules`, `aosp --root`): host-side file work only.
 omni-linux = { workspace = true }
+# The app (`omnidroid` with no command): the pool of warm devices and instances, its MCP server
+# (HTTP on 127.0.0.1, the lab's tools beside the pool's), and its full-screen terminal UI --
+# ratatui over crossterm, which draws on the Windows console and Unix terminals alike, so this crate
+# still holds no platform code of its own.
+omni-pool = { workspace = true }
+omni-mcp = { workspace = true }
+parking_lot = { workspace = true }
+ratatui = { version = "0.29.0", default-features = false, features = ["crossterm"] }
+crossterm = "0.28.1"
 
 [[bin]]
 name = "omnidroid"

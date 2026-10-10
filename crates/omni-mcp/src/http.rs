@@ -43,11 +43,26 @@ impl Listening {
     }
 }
 
-/// Serve `dispatch` on 127.0.0.1:`port` (0: any free port), a thread per connection.
+/// A dispatcher served under one lock: one message at a time. (A dispatcher that locks what it
+/// must itself -- the app's, whose pool tools need no lock -- is served as it is.)
+pub struct Locked<D>(pub Mutex<D>);
+
+impl<D: Dispatch> Dispatch for &Locked<D> {
+    fn handle(&mut self, method: &str, params: &crate::json::Json) -> Result<crate::json::Json, crate::mcp::RpcError> {
+        self.0.lock().handle(method, params)
+    }
+}
+
+/// Serve `dispatch` on 127.0.0.1:`port` (0: any free port), a thread per connection, the
+/// connections' messages handled side by side (`&D` is the dispatcher: it locks what it must).
 ///
 /// # Errors
 /// The port could not be taken.
-pub fn serve<D: Dispatch + Send + 'static>(port: u16, dispatch: Arc<Mutex<D>>) -> std::io::Result<Listening> {
+pub fn serve<D>(port: u16, dispatch: Arc<D>) -> std::io::Result<Listening>
+where
+    D: Send + Sync + 'static,
+    for<'a> &'a D: Dispatch,
+{
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let port = listener.local_addr()?.port();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -120,7 +135,10 @@ fn answer(stream: &mut TcpStream, status: &str, body: &str, close: bool) -> std:
     stream.flush()
 }
 
-fn connection<D: Dispatch>(stream: TcpStream, dispatch: &Mutex<D>) {
+fn connection<D>(stream: TcpStream, dispatch: &D)
+where
+    for<'a> &'a D: Dispatch,
+{
     let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
     let Ok(mut writer) = stream.try_clone() else { return };
     let mut reader = BufReader::new(stream);
@@ -140,7 +158,8 @@ fn connection<D: Dispatch>(stream: TcpStream, dispatch: &Mutex<D>) {
                 return;
             }
             let text = String::from_utf8_lossy(&body);
-            match handle_message(&text, &mut *dispatch.lock()) {
+            let mut d = dispatch;
+            match handle_message(&text, &mut d) {
                 Some(out) => answer(&mut writer, "200 OK", &out, close).map(|()| close),
                 None => answer(&mut writer, "202 Accepted", "", close).map(|()| close),
             }
@@ -258,7 +277,7 @@ mod tests {
 
     #[test]
     fn a_request_is_answered_a_notification_accepted_and_a_foreign_page_refused() {
-        let server = serve(0, Arc::new(Mutex::new(Echo))).expect("a port");
+        let server = serve(0, Arc::new(Locked(Mutex::new(Echo)))).expect("a port");
         let url = server.url();
         let out = post(&url, r#"{"jsonrpc":"2.0","id":7,"method":"echo","params":{"a":1}}"#).unwrap();
         let v = json::parse(&out).unwrap();
@@ -280,7 +299,7 @@ mod tests {
 
     #[test]
     fn the_bridge_carries_lines_both_ways_and_says_when_the_app_is_not_there() {
-        let server = serve(0, Arc::new(Mutex::new(Echo))).expect("a port");
+        let server = serve(0, Arc::new(Locked(Mutex::new(Echo)))).expect("a port");
         let mut out = Vec::new();
         bridge(&server.url(), "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"echo\",\"params\":2}\n\n{\"jsonrpc\":\"2.0\",\"method\":\"n\"}\n".as_bytes(), &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
