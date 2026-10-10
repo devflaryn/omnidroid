@@ -265,3 +265,49 @@ one build, a jump displacement 0x2000 apart; the same 11 with each patch).
 Why it matters: a fresh helper app's host translates 145-213k blocks (~1.7 s of CPU), the system
 host ~1.4 M in its first 20 s, the game ~9 s + ~22 s of translate + emit a boot -- on a 4-core
 machine most of that is on the boot's critical path.
+
+## Session s12 (05:54-06:07): snapshots, diagnosed (`s12-why.csv`, the s10 build)
+
+`OMNI_JIT_SNAPSHOT=<new dir> _LAZY=1 _LIB_ZONE=1 _FORGET=1 _WHY=1`, live 512 MiB: a run that fills
+the directory, then one that restores from it.
+
+| arm | fps | all ms | private commit | private WS | system host | available | system_server | boot_completed | DID_LOG_IN | Joining | **onGameLoaded** |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fill | 59.30 | 37.97 | 4.232 | 3.204 | 0.874 | 8.922 | 10.2 | 29.3 | 57.9 | 70.4 | 84.5 |
+| **restored** | 59.11 | 41.14 | **4.165** | 3.131 | 0.830 | **9.086** | 10.2 | **26.6** | **44.4** | **52.6** | **66.7** |
+
+- **18 s sooner in the world**, and no RAM cost any more (lazy pages + forgetting what was never
+  entered): commit -67 MB, available +164 MB against the filling run. (s9's +145 MB was without them.)
+- Nearly everything restored verifies now -- the library zone holds: the small daemons 99.9-100%,
+  app processes 99.7-99.8% (165k blocks), the game 1.39 M restored, 1.27 M verified (91%); what it
+  never entered by the time it settled (31k) is mostly anonymous memory (22.6k) and libroblox (5.6k).
+- Installing a snapshot is on the process's critical path: the game's **1.3 s**, system_server's
+  0.4 s -- **0095** makes it 28% cheaper.
+- Cost: **2.2 GB of disk** (158 files; the game's 562 MB, system_server's 232 MB). One directory per
+  configuration; every rebuild invalidates them (the code shape), the next save rewrites them.
+- Linux note: `a_snapshot_of_real_code_runs_it_the_same` fails on `main` too there (load -10, the
+  code shape, when a second cache is made beside the first); devices (Windows) restore fine.
+
+**For the owner:** with the RAM cost gone, snapshots are 18 s off the way to the world for 2.2 GB of
+disk. Not made a default here (the disk, and the owner's tools run this checkout).
+
+## Session s13 (06:07-): the build with everything since s10, new defaults against them off (`s13-defaults.csv`)
+
+Build: one `Sysroot` per host process (5f524ca), dynarmic 0084-0094, trims and parallel
+class_start on. `off` = `OMNI_WS_TRIM=0 OMNI_WS_TRIM_IDLE=0 OMNI_INIT_PARALLEL=0` (the sysroot change
+and the JIT patches stay).
+
+| arm | fps | all ms | private commit | private WS | system host | available | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| s11 (old build) | 59.2-59.4 | 39.5-41.5 | 4.035 | 3.02 | 0.81 | 9.23 | 10.3 | 28.6 | 56.8 | 70.8-71.1 | 83.9-84.8 |
+| new | 59.47 | 41.52 | 3.871 | 0.733 | 0.132 | 11.095 | **4.1** | **21.2** | **47.7** | 57.7 | **71.8** |
+| off | 59.47 | 40.54 | 3.864 | 2.845 | 0.658 | 9.449 | **4.0** | **21.3** | **47.0** | 60.0 | **73.1** |
+
+- **system_server 10.3 -> 4.0 s; boot_completed 28.6 -> 21.2; onGameLoaded ~85 -> 72-73 s.** init's
+  boot commands **7.7 -> 3.8 s**: every `setprop`/`wait_for_prop` opened the sysroot. A spawn is ~4
+  ms (`[spawn] ... sysroot 0.0`), `exec_start`s 80-130 ms (were 170-240), a helper app's host reaches
+  its program in ~85 ms (was 160-240).
+- Private commit 4.04 -> 3.87 GB; the system host without trims 0.81 -> 0.66 GB (each guest process's
+  copy of the sysroot's maps is gone).
+- What is left of init's boot commands: `wait_for_prop apexd.status activated` 1.86 s, bpfloader 0.39
+  s, init_user0 0.27 s, linkerconfig 2 x 0.19 s.
