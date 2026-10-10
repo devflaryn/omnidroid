@@ -491,3 +491,18 @@ From a saved device the world is there in **49-53 s** (a new device: ~72 s), boo
   reported st_mtime 0 for every file, and PackageCacher keeps an entry only while the package is
   older than it (0 < 0 is false). Image files now report 2009-01-01 and instance files the host's
   time (f273e9e).
+
+## Session s28 (10:18-10:32): the e4 snapshot crash again, with the filter kept (`s28-crash-e4.csv`, build f273e9e)
+
+| arm (`F0000`, s26's snapshots, `MAX_MB=512`) | status | fps | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| e4snap | ok (no crash; the world not in by the window's end) | -- | 8.8 | 44.5 | 97.1 | (intent 110.3) | -- |
+| e4snap | ok | 31.60 | 4.1 | 34.4 | 63.0 | 79.1 | **110.8** |
+
+No crash in two runs (s17 + s26: 3 of 4). The build changed nothing in the JIT (high QoS, labels,
+mtimes, the crash filter kept), so this is not a fix -- at a 3-in-4 rate two clean runs happen 6% of
+the time. Meanwhile a new stress test (`shared_cache.rs`, a25e8b9: restored code run by four jits
+while another evicts, forgets, invalidates and saves; 30 s on two cores) has not faulted. The run
+that loaded: **the world in 110.8 s against 140.4/140.7 without snapshots on four E-cores (s17)**.
+The vectored handler's declined reports are guests' own faults (reads of 0 and -1 that dynarmic's
+handler serves) -- four a process, noise.
