@@ -13,9 +13,9 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 | fps (60 Hz cap) | 57.4-59.0 | 59.0-59.6 | at the cap |
 | CPU a frame, all hosts | 42.5-47.4 ms | 38.6-45 ms | lower, noisy |
 | engine worker ms/frame | 13.8-14.0 (s3 `old`) | 10.6-12.3 | **-2..-3 ms** (faster translation in-world) |
-| private working set (Task Manager) | 3.04-3.21 GB | **2.97-2.99 GB**; **0.73 GB** with `OMNI_WS_TRIM=120` | -0.1 GB; -2.25 GB trimmed (real RAM freed: being measured) |
+| private working set (Task Manager) | 3.04-3.21 GB | **0.63-0.73 GB** (trims, default) | -2.4 GB shown; **+1.9 GB available to the machine** |
 | system host | 0.90-0.92 GB | **0.82 GB**; 0.14 GB trimmed | -90 MB |
-| system_server starts | 12.1-12.5 s | **10.3-10.4 s** | -2 s |
+| system_server starts | 12.1-12.5 s | **8.4-9.2 s** | -3..-4 s |
 | boot_completed | 30.8 s | **28.6-29.6 s** | -1.3..-2 s |
 | world loaded (onGameLoaded) | 87-88 s | **84-86 s**; 76-82 s with snapshots (s5) | -2..-5 s; -6..-10 s |
 | 8 E-cores (weaker PC): world loaded | 188 s | **160 s** | -28 s |
@@ -44,12 +44,17 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    from the log's own clock, and records available memory and the compressed store;
    `OMNI_JIT_TIME`, `[boot-ms]`, `[init] exec_start ... in N ms`.
 
+5. **RAM: most of what omnidroid held resident was cold** -- two minutes after a working-set trim
+   the system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of
+   ~150. Now every host process trims its working set every 120 s, and an idle one after 30 s:
+   **the machine gains ~1.9 GB of available memory** (9.2 -> 11.1 GB, twice; ~1.0 GB of it held
+   compressed by Windows), Task Manager's figure 3.0 -> ~0.7 GB, with fps, CPU a frame and frame
+   pacing unchanged (s10). `OMNI_WS_TRIM=0` / `OMNI_WS_TRIM_IDLE=0` turn them off.
+6. **Boot: init's services started side by side** (2.37 -> 0.42 s): system_server -1.1..-1.9 s,
+   boot_completed -1 s (s10). `OMNI_INIT_PARALLEL=0` is the old order.
+
 ## Found, being measured
 
-- **Most of the RAM omnidroid holds resident is cold.** Two minutes after a working-set trim the
-  system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of ~150.
-  `OMNI_WS_TRIM=<s>` (periodic) and `OMNI_WS_TRIM_IDLE=<s>` (idle processes only) -- s10 measures
-  what really leaves RAM (the compressed store keeps part of it).
 - **Translation snapshots: 4-16 s sooner into the world (about 5 s typical)** (last night's WIP, now built, fixed and on
   this branch; opt-in). With the game's live code budget at 512 MiB its snapshot survives, and from
   the second run on it verifies up to 70% of what it restores: world at 81.6 / 68.6 / 79.6 s against 84.8-85.9 s without
@@ -57,7 +62,8 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   system_server's part is still weak (8% verify; s12 names where its code moves). Yours to weigh:
   `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1 OMNI_JIT_SNAPSHOT_LIB_ZONE=1
   OMNI_JIT_SNAPSHOT_FORGET=1 OMNI_JIT_SHARED_CACHE_LIVE_MB=512`.
-- **init's class_start**: 47 services spawned one after another; `OMNI_INIT_PARALLEL=1` -- s10.
+- **init's boot commands take 7.5 s** before system_server can start (`exec_start` ~2 s of it):
+  the rest is now timed (`wait_for_prop`, `init_user0`, linkerconfig, each spawn's phases).
 
 ## For you to decide
 

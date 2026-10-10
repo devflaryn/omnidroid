@@ -63,6 +63,8 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 7 | dynarmic **0079**: Xbyak's label manager without heap nodes (tsl robin map/set, flat waiting list) | `the_speed_of_emission`, byte-identical | emit **15.7 -> 13.1 us/block (-16.5%)**, i5-4460 | yes (device check s5) |
 | 8 | dynarmic **0080**: a value's host location from a checked hint, not a search | same | emit **13.1 -> 11.9 us/block (-9%)** | yes (device check s5) |
 | 9 | system_server and the HALs after servicemanager is ready, not a fixed 1.5 s sleep (`OMNI_INIT_FIXED_WAIT=1` = old) | s6 `s6-boot.csv`, ABCCBA, 2 pairs; `[t]` milestones | servicemanager was ready "after 0 ms": **system_server 12.5/12.1 -> 10.4/10.4 s, boot_completed 30.8/30.8 -> 29.5/29.5, DID_LOG_IN 59.2/61.0 -> 58.6/58.6, onGameLoaded 87.3/88.0 -> 84.7/85.7** | **yes** |
+| 12 | working-set trims: periodic `OMNI_WS_TRIM=120`, idle `OMNI_WS_TRIM_IDLE=30` | s8 + s10, 2 pairs each | **available memory +1.9 GB** (9.2 -> 11.1, twice), private WS 3.0 -> 0.63-0.73 GB; fps/CPU/vsync unchanged | **yes, default** |
+| 13 | init's class_start side by side | s10, 2 runs | class_start 2.37 -> 0.42 s; system_server 10.3 -> 8.4/9.2 s; boot -1.0 s, sign-in -1.4 s | **yes, default** |
 | 11 | the game's live code 512 MiB (`OMNI_JIT_SHARED_CACHE_LIVE_MB=512`, default 256) | s7, 2 pairs | 2 regions retired during the start instead of ~18; onGameLoaded and private WS unchanged | no (neutral; with snapshots: s9) |
 | 10 | the place's link at once after sign-in (`OMNI_R_LINK_DELAY=0`, default 3) | s6, 2 runs | Joining 71.8/63.6 vs 70.6/67.7: the sign-in-to-Joining gap swings 5-14 s run to run (matchmaking, network) | no (inconclusive; default unchanged) |
 
@@ -208,3 +210,27 @@ MB), and every rebuild of the host binary starts them again. system_server still
 most of what it restored before then did not match -- s12 names where. Not a default yet: the RAM and
 disk are yours to weigh against 16 s; `OMNI_JIT_SNAPSHOT=<dir>` with `_LAZY=1 _LIB_ZONE=1 _FORGET=1`
 and `OMNI_JIT_SHARED_CACHE_LIVE_MB=512` is the measured set.
+
+## Session s10 (04:13-05:10): the trims' real RAM, and init's class_start side by side (`s10-trim2.csv`)
+
+Build with 0081-0083 (a stability run of them too: no crash in 8 boots). `avail_gb` is the machine's
+available physical memory, `mc_gb` the system's compressed store.
+
+| arm | fps | all ms/frame | private WS | system host | **available** | compressed store | system_server | boot_completed | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|---|---|
+| base | 59.46 | 38.92 | 3.022 | 0.809 | 9.206 | 0.661 | 10.3 | 28.5 | 56.9 | 87.6 |
+| idle (`OMNI_WS_TRIM_IDLE=30`) | 59.51 | 37.60 | 2.765 | 0.821 | 9.312 | 0.662 | 10.4 | 29.4 | 58.2 | 86.3 |
+| **trim** (`OMNI_WS_TRIM=120`) | 59.49 / 59.57 | 37.50 / 39.05 | **0.727 / 0.632** | 0.139 / 0.127 | **11.134 / 11.084** | 1.679 / 1.664 | 10.4 / 10.3 | 28.7 / 28.7 | 56.8 / 56.7 | 81.8 / 86.3 |
+| **par** (`OMNI_INIT_PARALLEL=1`) | 59.39 / 59.37 | 40.67 / 40.88 | 2.984 / 3.001 | 0.821 / 0.823 | 9.288 / 9.144 | 0.682 / 0.651 | **8.4 / 9.2** | **27.6 / 27.4** | **55.7 / 55.5** | 85.8 / 81.6 |
+
+- **The periodic trim frees ~1.9 GB of the machine's memory** (available 9.2 -> 11.1 GB, twice),
+  of which ~1.0 GB lands compressed in the system's store: omnidroid's real footprint drops by
+  1.2-1.9 GB of ~3 GB. fps, CPU a frame and the vsync pacer's worst lateness a 30 s period (0.9-5.7
+  ms against 1.0-7.7 on base) unchanged.
+- The idle trim: Android's five idle helper apps 205-266 MB -> 0-12 MB each; private WS -257 MB.
+- class_start side by side: 2,371 -> 416-419 ms; system_server's runtime 10.3 -> 8.4/9.2 s.
+- `[init] boot commands 7.5-7.7 s` -- of which `exec_start` ~2 s; the rest is timed by the next build.
+
+**All three are the defaults now** (c9eab23); `OMNI_WS_TRIM=0`, `OMNI_WS_TRIM_IDLE=0`,
+`OMNI_INIT_PARALLEL=0` turn them off. **Note for later A/Bs:** with the trims on, `wspriv_gb` measures
+what is touched between trims; RAM comparisons now go by `avail_gb`, or set `OMNI_WS_TRIM=0`.
