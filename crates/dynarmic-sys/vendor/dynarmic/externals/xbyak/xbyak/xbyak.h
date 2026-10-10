@@ -1162,24 +1162,44 @@ public:
 		addrInfoList_.clear();
 		isCalledCalcJmpAddress_ = false;
 	}
+	// Omnidroid patch 0084: a byte written in place when there is room, the growing (or the error)
+	// out of line -- `db` was a call per byte of emitted code (4% of emission), too big to inline.
+	// Multi-byte writes check the room once. The same bytes.
+#if defined(_MSC_VER)
+	__declspec(noinline)
+#else
+	__attribute__((noinline, cold))
+#endif
+	bool makeRoomForByte()
+	{
+		if (type_ == AUTO_GROW) {
+			growMemory();
+			return size_ < maxSize_;
+		}
+		XBYAK_THROW_RET(ERR_CODE_IS_TOO_BIG, false)
+	}
 	void db(int code)
 	{
-		if (size_ >= maxSize_) {
-			if (type_ == AUTO_GROW) {
-				growMemory();
-			} else {
-				XBYAK_THROW(ERR_CODE_IS_TOO_BIG)
-			}
-		}
+		if (size_ >= maxSize_ && !makeRoomForByte()) return;
 		top_[size_++] = static_cast<uint8_t>(code);
 	}
 	void db(const uint8_t *code, size_t codeSize)
 	{
+		if (codeSize <= maxSize_ - size_) {
+			for (size_t i = 0; i < codeSize; i++) top_[size_ + i] = code[i];
+			size_ += codeSize;
+			return;
+		}
 		for (size_t i = 0; i < codeSize; i++) db(code[i]);
 	}
 	void db(uint64_t code, size_t codeSize)
 	{
 		if (codeSize > 8) XBYAK_THROW(ERR_BAD_PARAMETER)
+		if (codeSize <= maxSize_ - size_) {
+			for (size_t i = 0; i < codeSize; i++) top_[size_ + i] = static_cast<uint8_t>(code >> (i * 8));
+			size_ += codeSize;
+			return;
+		}
 		for (size_t i = 0; i < codeSize; i++) db(static_cast<uint8_t>(code >> (i * 8)));
 	}
 	void dw(uint32_t code) { db(code, 2); }

@@ -280,6 +280,18 @@ fn the_speed_of_emission() {
         return;
     }
     let passes: usize = std::env::var("OMNI_EMIT_PASSES").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    // `OD_PROD=1`: the live switches omni-linux sets by default (as `dump_blocks.rs`), so the
+    // emitter takes the paths a device's does.
+    if std::env::var("OD_PROD").as_deref() == Ok("1") {
+        // SAFETY: process-wide switches, set before anything is translated.
+        unsafe {
+            dynarmic_sys::od_set_fast_dispatch_inline(1);
+            dynarmic_sys::od_set_scalar_fp_in_xmm(1);
+            dynarmic_sys::od_set_compact_code(1);
+            dynarmic_sys::od_set_tbi_unmasked(1);
+            dynarmic_sys::od_set_precise_get_set(1);
+        }
+    }
     let libs = [
         "/apex/com.android.runtime/lib64/bionic/libc.so",
         "/apex/com.android.art/lib64/libart.so",

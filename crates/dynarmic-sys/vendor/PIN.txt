@@ -70,6 +70,7 @@ dynarmic/
                and ../patches/0081-ir-get-set-forwarded-across-a-width-change.patch
                and ../patches/0082-x64-a-spilled-value-goes-to-a-free-callee-saved-register.patch
                and ../patches/0083-x64-zero-extensions-of-zero-extended-loads-aliased.patch
+               and ../patches/0084-xbyak-a-byte-written-in-place-the-growing-out-of-line.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

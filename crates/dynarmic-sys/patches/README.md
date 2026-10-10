@@ -876,3 +876,17 @@ With 0081, Luau's dispatch is now `movzx eax, byte [..]; ...; shl rax, 3; lea; m
 `movzx eax, al` and `mov eax, eax` after the load are gone from the chain (they were two of its
 cycles, next to the store-and-reload 0081 removed). Code -0.2..-0.3% (libc 387.7 -> 386.8
 B/block); first translation within noise. Guest-visible differential: identical on and off.
+
+### 0084 — Xbyak: a byte written in place, the growing out of line
+
+`CodeArray::db(int)` checked the room, grew the buffer or threw, and wrote the byte: too big to
+inline, so every byte of emitted code was a call (`Xbyak::CodeArray::db` 4.3% of emission's
+samples, the largest single function after the register selection), and `dd`/`dq` were four or
+eight of them. The growing and the error are now a `noinline`/`cold` function, `db(int)` a compare
+and a store that inlines into Xbyak's encoders, and the multi-byte forms check the room once. The
+same bytes (`compare_emit_dumps.py`: the same 11 blocks differ as between two runs of one build, a
+jump displacement 0x2000 apart).
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1` -- the live switches a device sets,
+now in that test too -- i5-4460, 3 interleaved runs): emit **11.06/11.06/11.11 -> 10.51/10.50/10.57
+us/block (-5%)**; the frontend unchanged.
