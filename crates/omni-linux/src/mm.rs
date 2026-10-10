@@ -50,6 +50,43 @@ pub struct Mm {
     files: Mutex<std::collections::BTreeMap<u64, FileMapping>>,
 }
 
+/// `OMNI_SHARED_TAIL=0`: a shared mapping's part past its file's end is anonymous memory again.
+///
+/// That part is not the file's (Linux faults there until the file grows; here it was always
+/// lenient memory), and it stays apart from the file when the file grows. Roblox maps its asset pool
+/// this way -- `cache/wob/wob-<n>`, 1 GiB mapped `MAP_SHARED` over a file it then unlinks and grows
+/// -- and as anonymous memory the ~570 MiB it filled was the game's private commit, where on Linux
+/// it is a file's pages the kernel may write back and drop. Now it is a view of a host file of its
+/// own: sparse, its name removed once mapped, so it costs no commit and no disk until written, and
+/// the host may write its pages to that file rather than to the pagefile.
+fn tail_files() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SHARED_TAIL").as_deref() != Ok("0"))
+}
+
+/// The smallest part past a file's end given a file of its own ([`tail_files`]): smaller ones stay
+/// anonymous (a file and a section each would cost more than they save).
+const TAIL_FILE_MIN: u64 = 1 << 20;
+
+/// A host file of `len` bytes for the part of a shared mapping of `name` past its file's end (see
+/// [`tail_files`]): sparse, and its name removed once the section holds it. `None` when off, small,
+/// or any step fails -- the caller maps anonymous memory, as before.
+fn tail_backing(name: &str, len: u64) -> Option<Arc<omni_mem::Backing>> {
+    if !tail_files() || len < TAIL_FILE_MIN {
+        return None;
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Named as a shared-memory region's file is: a killed run's is cleaned with them.
+    let path = crate::shm::host_dir().join(format!("omni-shm-{}-tail{n}", std::process::id()));
+    let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path).ok()?;
+    let made = (omni_platform::fs::set_sparse(&file) && file.set_len(len).is_ok())
+        .then(|| omni_mem::Backing::share(file, &format!("{name} (past its end)")).ok())
+        .flatten();
+    let _ = std::fs::remove_file(&path);
+    made
+}
+
 /// `OMNI_STRICT_GAPS=<prefix>,...`: named ranges (`PR_SET_VMA_ANON_NAME`, or a file's path) whose
 /// unmapped 4 KiB must fault even inside a host page that holds other mappings (D42's escape
 /// hatch; by default such a gap is lenient). Empty by default.
@@ -144,9 +181,30 @@ impl Mm {
         if from_at > len {
             self.space.unmap((at + len) as usize, (from_at - len) as usize)?;
         } else if len > from_at {
-            self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), (len - from_at) as usize, prot, CommitPolicy::Lazy)?;
+            let tail = len - from_at;
+            let viewed_tail = tail_backing(backing.name(), self.round_up_host(tail)).is_some_and(|file| {
+                let request = MapRequest { offset: 0, ..*req };
+                self.map_shared_view(&file, &request, Placement::Fixed((at + from_at) as usize), tail, tail, prot).is_ok()
+            });
+            if !viewed_tail {
+                self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), tail as usize, prot, CommitPolicy::Lazy)?;
+            }
         }
         Ok(at)
+    }
+
+    /// A shared mapping of which nothing is in its file yet (a pool mapped, then grown with
+    /// `ftruncate`): all of it the view of a [`tail_backing`] file, or else anonymous memory.
+    fn map_shared_past_end(&self, name: &str, req: &MapRequest, placement: Placement, len: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
+        // The same offset within a host page as asked, so a fixed address agrees with it.
+        let head = req.offset % self.host_page;
+        if let Some(file) = tail_backing(name, self.round_up_host(head + len)) {
+            let request = MapRequest { offset: head, ..*req };
+            if let Ok(at) = self.map_shared_view(&file, &request, placement, len, len, prot) {
+                return Ok(at);
+            }
+        }
+        self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map(|a| a as u64)
     }
 
     /// `len` rounded up to pages, if `[addr, addr + len)` fits in the 56-bit user address range.
@@ -442,16 +500,18 @@ impl Mm {
         if let Some((host, guest, file_len)) = shared {
             self.refuse_unshareable(p, t, &req, fixed)?;
             let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
-            // Past the file's end the mapping is anonymous memory, private commit, and stays so when
-            // the file grows (a pool mapped first and grown with ftruncate) -- said, for a large one.
+            // Past the file's end the mapping is not the file's, and stays so when the file grows (a
+            // pool mapped first and grown with ftruncate): a view of a file of its own when it is
+            // large (`tail_backing`), else anonymous memory -- said, for a large one.
             if len - in_file >= 16 << 20 {
                 eprintln!(
-                    "[mm] shared {} +{} MiB at offset {:#x}: {} MiB of it past the file's end ({} bytes), anonymous",
+                    "[mm] shared {} +{} MiB at offset {:#x}: {} MiB of it past the file's end ({} bytes), {}",
                     String::from_utf8_lossy(&guest),
                     len >> 20,
                     req.offset,
                     (len - in_file) >> 20,
-                    file_len
+                    file_len,
+                    if tail_files() { "a host file's view" } else { "anonymous" }
                 );
             }
             let at = if in_file > 0 {
@@ -461,7 +521,7 @@ impl Mm {
                 })?;
                 self.map_shared_view(&backing, &req, placement, in_file, len, prot).map_err(|_| refused_fixed(ENOMEM))?
             } else {
-                self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64
+                self.map_shared_past_end(&String::from_utf8_lossy(&guest), &req, placement, len, prot).map_err(|_| refused_fixed(ENOMEM))?
             };
             self.forget(at, len);
             self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });

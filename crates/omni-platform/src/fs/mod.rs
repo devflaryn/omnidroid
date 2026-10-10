@@ -159,6 +159,39 @@ pub fn compress_dir(dir: &std::path::Path) -> bool {
     }
 }
 
+/// Makes `file` sparse (Windows: `FSCTL_SET_SPARSE`), so growing it reserves no disk until its
+/// pages are written. Elsewhere a file grown by `set_len` is sparse already: `true` there.
+#[must_use]
+pub fn set_sparse(file: &std::fs::File) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        // winioctl.h: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 49, METHOD_BUFFERED, FILE_SPECIAL_ACCESS).
+        const FSCTL_SET_SPARSE: u32 = 0x0009_00C4;
+        let mut returned = 0u32;
+        // SAFETY: the handle is open for this call; no input buffer means "make it sparse", no
+        // output buffer, `returned` is a live u32; no OVERLAPPED (a synchronous handle).
+        unsafe {
+            DeviceIoControl(
+                file.as_raw_handle(),
+                FSCTL_SET_SPARSE,
+                std::ptr::null(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            ) != 0
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = file;
+        true
+    }
+}
+
 /// The host path an open file is at now (after any rename), for another host process to open the
 /// same file: Windows `GetFinalPathNameByHandleW`, Linux `/proc/self/fd`, macOS `F_GETPATH`.
 ///

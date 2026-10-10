@@ -28,6 +28,7 @@ dex/hello.dex, from dex/Hello.java with JDK 21 and SDK build-tools 36.0.0:
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -Wno-unused-result -o unixsock unixsock.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o inetbind inetbind.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o sharedmap sharedmap.c
+    <ndk>/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang -O2 -Wall -Wextra -Werror -o sharedtail sharedtail.c   (r28c, on Linux)
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o peercred peercred.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o pimutex pimutex.c
     <ndk>/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android35-clang.cmd -O2 -Wall -Wextra -Werror -o seccomp seccomp.c
