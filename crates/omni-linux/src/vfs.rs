@@ -85,15 +85,18 @@ impl Sysroot {
         if !*SHARED.get_or_init(|| std::env::var("OMNI_SYSROOT_SHARED").as_deref() != Ok("0")) {
             return Self::open_uncached(dir);
         }
-        // What else shapes it (the boot image switch, the GPU backend) is fixed for the process.
-        static OPENED: Mutex<Vec<(PathBuf, Arc<Sysroot>)>> = Mutex::new(Vec::new());
+        // What else shapes it (the boot image switch, the GPU backend) is fixed for the process;
+        // what the device leaves out is read from the environment, which a test changes between
+        // opens (`lean_image.rs`), so it is part of the key.
+        static OPENED: Mutex<Vec<(PathBuf, Vec<&'static str>, Arc<Sysroot>)>> = Mutex::new(Vec::new());
+        let left_out = crate::device::left_out();
         // Held while opening: services started side by side wait for the one open.
         let mut opened = OPENED.lock();
-        if let Some((_, s)) = opened.iter().find(|(d, _)| d == dir) {
+        if let Some((_, _, s)) = opened.iter().find(|(d, l, _)| d == dir && *l == left_out) {
             return Ok(Arc::clone(s));
         }
         let s = Self::open_uncached(dir)?;
-        opened.push((dir.to_path_buf(), Arc::clone(&s)));
+        opened.push((dir.to_path_buf(), left_out, Arc::clone(&s)));
         Ok(s)
     }
 
