@@ -158,8 +158,8 @@ A snapshot comparison needs one directory per configuration.
 
 | arm | fps | all ms/frame | private WS | system host | onGameLoaded |
 |---|---|---|---|---|---|
-| base | 59.03 | 45.40 | 2.982 GB | 0.819 GB | 86.7 s |
-| wstrim | 59.47 | 39.82 | **0.735 GB** | **0.138 GB** | 83.7 s |
+| base | 59.03 / 59.45 | 45.40 / 40.58 | 2.982 / 2.965 GB | 0.819 / 0.819 GB | 86.7 / 85.5 s |
+| wstrim | 59.47 / 59.06 | 39.82 / 43.89 | **0.735 / 0.734 GB** | **0.138 / 0.138 GB** | 83.7 / 84.8 s |
 
 No hitch in the 5 s fps windows around the game's trim (59.92 / 59.71 / 60.11). Most of the memory
 omnidroid holds resident is **cold**: the system host touches ~190 MB in two minutes, the game ~750
@@ -167,3 +167,18 @@ MB, the helper apps nearly nothing. What this frees for the machine is less than
 working set says -- trimmed pages go to the system's compressed store (or the page file) -- so the
 harness now also records available physical memory and the compressed store's working set
 (`avail_gb`, `mc_gb`); the next sessions measure the real RAM freed.
+
+**Weaker PCs on this build** (same session, one run each; `-Affinity`, the eight or four E-cores):
+
+| | fps | engine worker ms/frame | all ms/frame | cores | boot_completed | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| 8 E-cores, baseline dc72223 (22:51) | 33.79 | 20.15 | 54.55 | 1.84 | -- | -- | 188 s |
+| 8 E-cores, this build | 29.88 | 21.95 | 58.66 | 1.75 | 57.8 s | 107.8 s | **160.1 s** |
+| **4 E-cores**, this build | **32.89** | 18.21 | 48.12 | 1.58 | 63.3 s | 122.1 s | **178.9 s** |
+
+The world is reached **~25 s sooner on eight E-cores** (faster translation weighs more on a weak CPU).
+**On four E-cores the Delta build now starts and plays** (~33 fps): libzstd-jni loaded at 97.8 s and
+the app signed in at 122.1 s, its initialisation inside the injected worker's 20 s (the 22:23 four-core
+run had no network, so it never got that far either way). In-world fps on the E-cores moves with the
+live world as much as on the P-cores (29.9 on eight vs 32.9 on four, an hour apart): judging a lever
+there needs interleaved pairs, as everywhere.
