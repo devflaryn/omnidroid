@@ -114,7 +114,7 @@ void EmitX64::SnapshotSitesIn(const u8* begin, const u8* end, std::vector<Snapsh
     }
 }
 
-void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily) {
+void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily, bool commit_sites) {
     ASSERT(shared_code && (size & UNVERIFIED_BLOCK) == 0);
     u8* const buffer = const_cast<u8*>(code.getCode());
     u32 first = NO_LINK;
@@ -146,7 +146,9 @@ void EmitX64::RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size,
         const SnapshotSite& s = sites[i];
         RecordSharedFastmemSite(reinterpret_cast<u64>(buffer + s.site), reinterpret_cast<u64>(buffer + s.resume), reinterpret_cast<u64>(buffer + s.callback));
     }
-    CommitSharedFastmemSites();
+    if (commit_sites) {
+        CommitSharedFastmemSites();
+    }
     const auto [stored, inserted] = block_descriptors.insert({Key64{location}, StoredBlock{entry, size | UNVERIFIED_BLOCK, first}});
     // Patch 0064: the links already waiting for this location move their head beside the block.
     if (inserted) {

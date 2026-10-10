@@ -520,3 +520,105 @@ fn a_snapshot_of_real_code_runs_it_the_same() {
     }
     let _ = std::fs::remove_file(&file);
 }
+
+/// **How fast a snapshot is installed** (patch 0070's load, lazily as omni-linux loads): `libart.so`'s
+/// functions' first blocks (`OMNI_SNAPSHOT_BENCH_BLOCKS` per function, default 16) translated on a
+/// shared cache with snapshots on and saved, then loaded into `OMNI_SNAPSHOT_BENCH_LOADS` (default
+/// 5) fresh caches, each timed: nanoseconds a block. A process's snapshot is installed when its
+/// address space is made, before its first instruction (the game's: 1.39 M blocks, 1.3 s, s12).
+///
+/// ```text
+/// OMNI_SYSROOT=<sysroot/aosp-35> cargo test -p dynarmic-sys --release --test code_size -- --ignored --nocapture the_speed_of_snapshot
+/// ```
+#[cfg(target_arch = "x86_64")]
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_speed_of_snapshot_install() {
+    use dynarmic_sys::{od_code_cache_enable_snapshots, od_code_cache_free, od_code_cache_load_snapshot, od_code_cache_save_snapshot, od_monitor_free, od_monitor_new};
+    use harness::{MEM_GUARD, MEM_SIZE};
+    let lib = "/apex/com.android.art/lib64/libart.so";
+    let Some(path) = sysroot_file(lib) else {
+        println!("no sysroot (OMNI_SYSROOT): skipped");
+        return;
+    };
+    let per_function: usize = std::env::var("OMNI_SNAPSHOT_BENCH_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    let loads: usize = std::env::var("OMNI_SNAPSHOT_BENCH_LOADS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let elf = std::fs::read(path).expect("libart.so");
+    let ((off, vaddr, len), funcs) = text_and_functions(&elf);
+    let code: Vec<u32> = elf[off as usize..(off + len) as usize].chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    let mut arena = vec![0u64; (MEM_SIZE + MEM_GUARD) / 8];
+    let file = std::env::temp_dir().join(format!("od-snapshot-bench-{}", std::process::id()));
+    let snapshot = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+    let key = std::ffi::CString::new("libart corpus").unwrap();
+    let cache_and_opts = |arena: *mut u64| {
+        // SAFETY: freed below, after the Vm.
+        let monitor = unsafe { od_monitor_new(1) };
+        let base = VmOptions {
+            cycle_counting: true,
+            check_halt_on_memory_access: true,
+            fastmem_exclusive: true,
+            optimizations: optimization::INTERRUPTIBLE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
+            shared_monitor: monitor as usize,
+            shared_arena: arena as usize,
+            ..VmOptions::default()
+        };
+        let cache = Vm::new_code_cache(&base, monitor, arena, 512 << 20, 32 << 20, 0);
+        assert!(!cache.is_null());
+        (cache, monitor, VmOptions { shared_cache: cache as usize, ..base })
+    };
+
+    let (first, monitor, opts) = cache_and_opts(arena.as_mut_ptr());
+    // SAFETY: a fresh cache.
+    unsafe { od_code_cache_enable_snapshots(first) };
+    {
+        arena.fill(0);
+        let vm = Vm::new(code.clone(), opts);
+        for &f in &funcs {
+            vm.set_pc(CODE_BASE + (f - vaddr));
+            for _ in 0..per_function {
+                vm.with_ctx(|c| {
+                    c.ticks_remaining = 1;
+                    c.ticks_used = 0;
+                });
+                let hr = vm.run();
+                if hr != 0 {
+                    // SAFETY: the jit is live and not executing.
+                    unsafe { od_jit_clear_halt(vm.raw(), hr) };
+                    break;
+                }
+                let pc = vm.pc();
+                if pc < CODE_BASE || pc >= CODE_BASE + len {
+                    break;
+                }
+            }
+        }
+    }
+    // SAFETY: no jit runs on it.
+    let saved = unsafe { od_code_cache_save_snapshot(first, snapshot.as_ptr(), key.as_ptr(), u64::MAX, 0) };
+    assert!(saved > 0, "saved {saved}");
+    // SAFETY: the Vm is gone.
+    unsafe {
+        od_code_cache_free(first);
+        od_monitor_free(monitor);
+    }
+    let mut times = Vec::new();
+    for _ in 0..loads {
+        let (cache, monitor, _) = cache_and_opts(arena.as_mut_ptr());
+        let t = std::time::Instant::now();
+        // SAFETY: a fresh cache.
+        let loaded = unsafe { od_code_cache_load_snapshot(cache, snapshot.as_ptr(), key.as_ptr(), dynarmic_sys::OD_SNAPSHOT_LOAD_LAZY) };
+        let ns = t.elapsed().as_nanos() as f64;
+        assert_eq!(loaded, saved);
+        times.push(ns / saved as f64);
+        // SAFETY: no Vm on it.
+        unsafe {
+            od_code_cache_free(cache);
+            od_monitor_free(monitor);
+        }
+    }
+    let _ = std::fs::remove_file(&file);
+    let mut sorted = times.clone();
+    sorted.sort_by(f64::total_cmp);
+    let each: Vec<f64> = times.iter().map(|x| (x * 10.0).round() / 10.0).collect();
+    println!("snapshot of {saved} blocks: install {:.1} ns/block (median of {loads}; each {each:?})", sorted[sorted.len() / 2]);
+}

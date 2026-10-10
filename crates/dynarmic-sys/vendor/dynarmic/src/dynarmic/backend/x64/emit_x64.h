@@ -244,7 +244,16 @@ public:
     /// Install a block restored from a snapshot, unverified: its code is already in place at
     /// `entry` (an offset) -- or, `lazily` (patch 0075), will be when it is entered; its slots are
     /// written unlinked (not `lazily`) and recorded, its sites recorded.
-    void RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily = false);
+    /// Omnidroid patch 0095: `commit_sites` false leaves the sites pending, for the caller to
+    /// commit once for a whole region (its blocks restored in ascending order, as they were emitted).
+    void RestoreBlock(IR::LocationDescriptor location, u32 entry, u32 size, const SnapshotSlot* slots, size_t slot_count, const SnapshotSite* sites, size_t site_count, bool lazily = false, bool commit_sites = true);
+    /// Patch 0095: room for `blocks` more blocks and `links` more link records, before a restore.
+    void ReserveForRestore(size_t blocks, size_t links) {
+        block_descriptors.reserve(block_descriptors.size() + blocks);
+        link_records.reserve(link_records.size() + links);
+    }
+    /// Patch 0095: commit the sites `RestoreBlock` left pending (`commit_sites` false).
+    void CommitRestoredSites() { CommitSharedFastmemSites(); }
     /// Omnidroid patch 0075: the pages of the code buffer restored lazily and not yet read in --
     /// reserved, not committed, holding nothing. A slot there is not written (a page is filled,
     /// and its slots set, when a block on it is first entered).

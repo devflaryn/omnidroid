@@ -1016,11 +1016,36 @@ public:
         static_assert(std::is_trivially_copyable_v<T>);
         return Bytes(&v, sizeof(T));
     }
+    // Omnidroid patch 0095: read through a buffer of its own, a large `fread` at a time -- the
+    // records are a few bytes each, and an `fread` per field (with the stream's lock) was a fifth
+    // of a snapshot's install.
     bool Bytes(void* out, size_t n) {
-        if (size - at < n || (n != 0 && std::fread(out, 1, n, f) != n)) {
+        if (size - at < n) {
             return false;
         }
-        at += n;
+        u8* to = static_cast<u8*>(out);
+        while (n != 0) {
+            if (pos == len) {
+                if (n >= buffer.size()) {
+                    if (std::fread(to, 1, n, f) != n) {
+                        return false;
+                    }
+                    at += n;
+                    return true;
+                }
+                pos = 0;
+                len = std::fread(buffer.data(), 1, static_cast<size_t>(std::min<u64>(buffer.size(), size - at)), f);
+                if (len == 0) {
+                    return false;
+                }
+            }
+            const size_t k = std::min(n, len - pos);
+            std::memcpy(to, buffer.data() + pos, k);
+            pos += k;
+            to += k;
+            n -= k;
+            at += k;
+        }
         return true;
     }
     bool Skip(u64 n) {
@@ -1028,6 +1053,11 @@ public:
             return false;
         }
         at += n;
+        if (n <= len - pos) {
+            pos += static_cast<size_t>(n);
+            return true;
+        }
+        pos = len = 0;
 #ifdef _WIN32
         return _fseeki64(f, static_cast<s64>(at), SEEK_SET) == 0;
 #else
@@ -1041,6 +1071,8 @@ private:
     std::FILE* f;
     u64 size = 0;
     u64 at = 0;
+    std::vector<u8> buffer = std::vector<u8>(1 << 20);  // patch 0095
+    size_t pos = 0, len = 0;
 };
 
 /// Read `n` bytes at `offset` of `f` into `out`.
@@ -1077,11 +1109,26 @@ struct SavedBlock {
     std::vector<EmitX64::SnapshotSite> sites;
 };
 
-struct SavedRegion {
+/// Omnidroid patch 0095: a block as a load reads it -- its slots and sites in its region's flat
+/// arrays (two allocations a region, not two a block: the game's snapshot has 1.4 M blocks).
+struct LoadedBlock {
+    u64 location;
+    u32 entry;
+    u32 size;
+    u64 first;
+    u32 span;
+    u64 hash;
+    u32 slot_begin, slot_count;
+    u32 site_begin, site_count;
+};
+
+struct LoadedRegion {
     u32 index;
     u64 used;
-    u64 file_offset;  // of its bytes in the snapshot file
-    std::vector<SavedBlock> blocks;
+    u64 file_offset;
+    std::vector<LoadedBlock> blocks;
+    std::vector<EmitX64::SnapshotSlot> slots;
+    std::vector<EmitX64::SnapshotSite> sites;
 };
 
 }  // namespace
@@ -1416,10 +1463,11 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
         return -8;
     }
     u8* const buffer = const_cast<u8*>(block_of_code.getCode());
-    std::vector<SavedRegion> saved_regions(region_count);
+    std::vector<LoadedRegion> saved_regions(region_count);
     std::vector<bool> seen(regions.size(), false);
     u64 block_total = 0;
-    for (SavedRegion& r : saved_regions) {
+    u64 slot_total = 0;
+    for (LoadedRegion& r : saved_regions) {
         if (!in.Value(r.index) || r.index >= regions.size() || seen[r.index] || !in.Value(r.used)) {
             return -8;
         }
@@ -1436,7 +1484,8 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
         const u64 lo = static_cast<u64>(region.begin - buffer);
         const u64 hi = lo + r.used;
         r.blocks.resize(count);
-        for (SavedBlock& b : r.blocks) {
+        const u64 prelude_end = static_cast<u64>(static_cast<const u8*>(block_of_code.GetCodeBegin()) - buffer);
+        for (LoadedBlock& b : r.blocks) {
             u32 slots = 0, sites = 0;
             if (!in.Value(b.location) || !in.Value(b.entry) || !in.Value(b.size) || !in.Value(b.first) || !in.Value(b.span) || !in.Value(b.hash)) {
                 return -8;
@@ -1447,11 +1496,14 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
             if (!in.Value(slots) || slots > b.size / 8) {
                 return -8;
             }
-            b.slots.resize(slots);
-            if (!in.Bytes(b.slots.data(), slots * sizeof(EmitX64::SnapshotSlot))) {
+            b.slot_begin = static_cast<u32>(r.slots.size());
+            b.slot_count = slots;
+            r.slots.resize(r.slots.size() + slots);
+            if (!in.Bytes(r.slots.data() + b.slot_begin, slots * sizeof(EmitX64::SnapshotSlot))) {
                 return -8;
             }
-            for (const auto& s : b.slots) {
+            for (u32 i = 0; i < slots; i++) {
+                const auto& s = r.slots[b.slot_begin + i];
                 if (s.slot < b.entry || static_cast<u64>(s.slot) + 8 > static_cast<u64>(b.entry) + b.size || s.slot % 8 != 0 || s.unlinked >= hi) {
                     return -8;
                 }
@@ -1459,18 +1511,21 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
             if (!in.Value(sites) || sites > b.size) {
                 return -8;
             }
-            b.sites.resize(sites);
-            if (!in.Bytes(b.sites.data(), sites * sizeof(EmitX64::SnapshotSite))) {
+            b.site_begin = static_cast<u32>(r.sites.size());
+            b.site_count = sites;
+            r.sites.resize(r.sites.size() + sites);
+            if (!in.Bytes(r.sites.data() + b.site_begin, sites * sizeof(EmitX64::SnapshotSite))) {
                 return -8;
             }
-            const u64 prelude_end = static_cast<u64>(static_cast<const u8*>(block_of_code.GetCodeBegin()) - buffer);
-            for (const auto& s : b.sites) {
+            for (u32 i = 0; i < sites; i++) {
+                const auto& s = r.sites[b.site_begin + i];
                 if (s.site < b.entry || s.site >= b.entry + b.size || s.resume < lo || s.resume >= hi || s.callback >= prelude_end) {
                     return -8;
                 }
             }
         }
         block_total += count;
+        slot_total += r.slots.size();
     }
     u64 trailer = 0;
     if (!in.Value(trailer) || trailer != SNAPSHOT_MAGIC || !in.AtEnd()) {
@@ -1495,10 +1550,13 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
     if (lazily) {
         emitter.lazy_pages = &lazy_pages;
     }
+    // Patch 0095: the tables sized for what is restored, once, rather than grown through it.
+    emitter.ReserveForRestore(static_cast<size_t>(block_total), static_cast<size_t>(slot_total));
+    unverified.reserve(unverified.size() + static_cast<size_t>(block_total));
     // The constructor started region 0; the snapshot's regions are started in its order instead.
     regions[0].state = Region::State::Free;
     current = NO_REGION;
-    for (SavedRegion& r : saved_regions) {
+    for (LoadedRegion& r : saved_regions) {
         if (current != NO_REGION) {
             regions[current].state = Region::State::Full;
             current = NO_REGION;
@@ -1526,18 +1584,25 @@ s64 SharedCodeCache::Impl::LoadSnapshot(const char* path, const char* key, bool 
             lazy_regions.push_back(LazyRegion{r.index, r.file_offset, r.used, {}});
         }
         region.code_committed_end = std::max(region.code_committed_end, committed);
-        for (const SavedBlock& b : r.blocks) {
+        if (lazily) {
+            lazy_regions.back().slots.reserve(r.slots.size());
+        }
+        for (const LoadedBlock& b : r.blocks) {
             const IR::LocationDescriptor location{b.location};
+            const EmitX64::SnapshotSlot* const slots = r.slots.data() + b.slot_begin;
             if (lazily) {
                 const u32 first_serial = emitter.NextLinkSerial();
-                for (size_t i = 0; i < b.slots.size(); i++) {
-                    lazy_regions.back().slots.emplace_back(b.slots[i].slot, static_cast<u32>(first_serial + i));
+                for (size_t i = 0; i < b.slot_count; i++) {
+                    lazy_regions.back().slots.emplace_back(slots[i].slot, static_cast<u32>(first_serial + i));
                 }
             }
-            emitter.RestoreBlock(location, b.entry, b.size, b.slots.data(), b.slots.size(), b.sites.data(), b.sites.size(), lazily);
+            // Patch 0095: the sites committed once for the region, below (its blocks are in the
+            // order they were emitted, ascending, so the records are the same).
+            emitter.RestoreBlock(location, b.entry, b.size, slots, b.slot_count, r.sites.data() + b.site_begin, b.site_count, lazily, false);
             emitter.RestoreGuestRange(location, b.first, b.span);
             unverified[b.location] = Unverified{b.first, b.span, b.hash};
         }
+        emitter.CommitRestoredSites();
         if (lazily) {
             std::sort(lazy_regions.back().slots.begin(), lazy_regions.back().slots.end());
         }

@@ -1008,3 +1008,28 @@ bytes; a perf map is written as before when `PERF_BUILDID_DIR` is set at the fir
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460 Linux, 4 interleaved runs
 against 0093): emit **9.23/9.26/9.37/9.27 -> 8.82/8.79/8.72/8.72 us/block (-5.6%)**. On Windows
 only the formatting (and its allocation) was wasted.
+
+### 0095 — x64: a snapshot installs faster (buffered reads, flat arrays, one commit a region, tables reserved)
+
+A process's snapshot is installed when its address space is made, before its first instruction:
+the game's 1.39 M blocks took 1.3 s, system_server's 0.5 M 0.4 s (s12). The sampler on
+`code_size.rs::the_speed_of_snapshot_install` (new, `libart.so`'s blocks) put a fifth of it in
+`fread` -- the reader read every field of every record with its own `fread` (a lock, a call) --
+a tenth in `malloc`/`free` for each block's two vectors (slots, sites), ~8% in
+`CommitSharedFastmemSites` once per block (a `stable_sort` with its buffer, a search for the run),
+and more in the block map, link records and unverified map growing through the install. Now:
+
+- `Reader` reads through a 1 MiB buffer of its own (a large `fread` at a time; a skip inside it
+  moves in it, a longer one seeks);
+- a region's slots and sites are two flat arrays (`LoadedRegion`), a block an index into them;
+- `RestoreBlock(..., commit_sites = false)` leaves the sites pending and the load commits them
+  once per region: its blocks were saved in emission order, ascending, so the records are the same;
+- the block map, the link records and the unverified map are reserved for the whole snapshot first.
+
+The snapshot format does not change. `a_snapshot_of_real_code_runs_it_the_same` passes (lazily
+and not) -- on Linux with the first cache freed before the second is made: there the test fails
+before this patch too, `main` included (load -10, the code shape: a second cache alive beside the
+first differs in shape on Linux; not on Windows, where devices restore snapshots).
+
+MEASURED (`the_speed_of_snapshot_install`, i5-4460, 40 loads each, 3 interleaved runs): **783/783/781
+-> 559/559/569 ns a block (-28%)**.
