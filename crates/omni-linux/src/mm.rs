@@ -299,7 +299,10 @@ impl Mm {
         // game's MADV_DONTNEEDs (53,883 in its first minute, s30) waited for every copy in flight
         // and held every other thread's copies and mappings off while it ran.
         let _g = if discard_shared() { Lock::Shared(self.lock.read()) } else { Lock::Exclusive(self.lock.write()) };
-        self.space.discard(addr as usize, len as usize).map(|_| ()).map_err(|_| EINVAL)
+        self.space.discard(addr as usize, len as usize).map(|_| ()).map_err(|e| {
+            eprintln!("[madvise] discard {addr:#x}+{len:#x} refused: {e}");
+            EINVAL
+        })
     }
 
     pub fn map(&self, p: &Process, t: &Task, req: MapRequest) -> Result<u64, Errno> {
@@ -793,6 +796,12 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     let addr = crate::guest::untag(a[0]);
     if addr % p.mm.page != 0 {
         return Err(EINVAL);
+    }
+    // A length of 0 is a success that does nothing, as Linux answers it (`if (!len) return 0`):
+    // AppSearch's icing asks it of an empty array when a user stops, and aborts system_server on an
+    // error (2026-10-10, `am stop-user`: "icing-array-storage.cc:368: Failed to madvise()").
+    if a[1] == 0 {
+        return Ok(0);
     }
     madvise_stats::count(a[2], a[1]);
     let discards = matches!(a[2], MADV_DONTNEED | MADV_REMOVE)

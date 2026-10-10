@@ -248,6 +248,8 @@ fn main() -> ExitCode {
     let mut _served = Vec::new();
     let mut _composers = Vec::new();
     let mut framebuffer: Option<std::sync::Arc<omni_linux::hal::framebuffer::Framebuffer>> = None;
+    // The composer's displays beyond display 0, for the control channel's `#host` commands.
+    let mut host_displays: Option<std::sync::Arc<omni_linux::displays::Displays>> = None;
     for hal in &hals {
         let broker = omni_linux::binder::broker(omni_linux::binder::Context::Binder);
         match hal.as_str() {
@@ -281,22 +283,34 @@ fn main() -> ExitCode {
                 }
                 // OMNI_WINDOW=1: the display in a live host window whose size is the display's
                 // (`omni_linux::display_window`); OMNI_WINDOW_CONTROL=<file> scripts its resizes.
-                if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") {
-                    let options = omni_linux::display_window::Options {
-                        title: "omnidroid".into(),
-                        control: std::env::var_os("OMNI_WINDOW_CONTROL").map(PathBuf::from),
-                        // OMNI_WINDOW_INPUT=0: the window shows, and Android has no keyboard or mouse.
-                        input: std::env::var("OMNI_WINDOW_INPUT").as_deref() != Ok("0"),
-                    };
-                    // The window's keyboard types what the host's layout types (`omni_linux::keymap`):
-                    // its key layout and character map written to the data partition here, before
-                    // the program runs and so before EventHub opens the device. OMNI_HOST_KEYMAP=0:
-                    // Android's own (Generic, US).
-                    if options.input {
-                        omni_linux::keymap::install(&instance, p.vfs.sysroot());
-                    }
-                    if let Err(e) = omni_linux::display_window::spawn(std::sync::Arc::clone(&fb), std::sync::Arc::clone(&composer), options) {
-                        eprintln!("[window] {e}");
+                // OMNI_WINDOW_INPUT=0: the windows show, and Android has no keyboard or mouse.
+                let windows = std::env::var("OMNI_WINDOW").as_deref() == Ok("1");
+                let input = windows && std::env::var("OMNI_WINDOW_INPUT").as_deref() != Ok("0");
+                // The keyboard and mouse every window shares, registered now -- before
+                // system_server's `InputReader` scans. The keyboard types what the host's layout
+                // types (`omni_linux::keymap`): its key layout and character map written to the data
+                // partition here, before EventHub opens the device. OMNI_HOST_KEYMAP=0: Android's
+                // own (Generic, US).
+                let shared = input.then(|| {
+                    omni_linux::keymap::install(&instance, p.vfs.sysroot());
+                    let shared = omni_linux::display_window::register_input();
+                    eprintln!("[window] input: {shared:?}; the pointer injected per window");
+                    shared
+                });
+                if windows {
+                    // OMNI_PRIMARY_WINDOW=0: display 0 has no window (a device whose apps each run
+                    // on a display of their own, `omni_linux::displays`, shows only theirs).
+                    if std::env::var("OMNI_PRIMARY_WINDOW").as_deref() != Ok("0") {
+                        let options = omni_linux::display_window::Options {
+                            title: "Omnidroid".into(),
+                            control: std::env::var_os("OMNI_WINDOW_CONTROL").map(PathBuf::from),
+                            input,
+                            shared_input: shared.clone(),
+                            ..Default::default()
+                        };
+                        if let Err(e) = omni_linux::display_window::spawn(std::sync::Arc::clone(&fb), std::sync::Arc::clone(&composer), options) {
+                            eprintln!("[window] {e}");
+                        }
                     }
                     // What the guest copies, on the host's clipboard (text and images only; on by
                     // default, OMNI_CLIPBOARD=0 turns it off).
@@ -311,48 +325,35 @@ fn main() -> ExitCode {
                         omni_linux::browser::start(std::sync::Arc::clone(&broker));
                     }
                 }
-                // OMNI_DISPLAYS=<n>: that many displays, each with a window of its own, so that an
-                // app started with `am start --display <id>` runs beside the one on display 0
-                // rather than backgrounding it. Added before SurfaceFlinger's callback, so
-                // `registerCallback` hotplugs them all at once.
-                // **Two is the ceiling, and it is SurfaceFlinger's**: its HWComposer takes a primary
-                // and one external physical display and refuses the rest ("Ignoring connection of
-                // tertiary display 2"), so a third app needs a virtual display, not a third
-                // physical one. Asking for more is capped, and said so.
+                // The displays beyond display 0 (`omni_linux::displays`): each in a window of its
+                // own once it draws, added at boot (OMNI_DISPLAYS=<n>) or while the device runs (the
+                // control channel's `#host display add`), so that an app started with
+                // `am start --display <id>` runs beside the others rather than backgrounding them.
+                let every = std::time::Duration::from_millis(std::env::var("OMNI_SCREENSHOT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5000).max(100));
+                let extra = omni_linux::displays::Displays::new(
+                    std::sync::Arc::clone(&composer),
+                    windows,
+                    shared,
+                    std::env::var_os("OMNI_SCREENSHOT").map(PathBuf::from),
+                    every,
+                    control.clone(),
+                );
+                // **Two is SurfaceFlinger's ceiling unless the displays identify themselves**: its
+                // HWComposer takes a primary and one external display and refuses the rest
+                // ("Ignoring connection of tertiary display") when the composer has no
+                // identification data -- `OMNI_MULTI_DISPLAY=1` gives it (`hal::composer::edid`),
+                // and then there is no ceiling here.
                 let asked = std::env::var("OMNI_DISPLAYS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
-                let displays = asked.min(2);
+                let displays = if omni_linux::hal::composer::multi_display() { asked } else { asked.min(2) };
                 if asked > displays {
-                    eprintln!("[composer] OMNI_DISPLAYS={asked}: SurfaceFlinger takes one external display beside the primary, so {displays} are made");
+                    eprintln!("[composer] OMNI_DISPLAYS={asked}: SurfaceFlinger takes one external display beside the primary (OMNI_MULTI_DISPLAY=1 lifts that), so {displays} are made");
                 }
                 for _ in 1..displays {
-                    match composer.add_display(w, h) {
-                        Ok((id, extra)) => {
-                            if std::env::var("OMNI_WINDOW").as_deref() == Ok("1") {
-                                // **Its window opens when it first draws.** A display with no app on
-                                // it has nothing to show, and a device booted with displays to spare
-                                // would otherwise put an empty window on screen for each.
-                                let composer = std::sync::Arc::clone(&composer);
-                                let _ = std::thread::Builder::new().name(format!("omni-display-{id}-wait")).spawn(move || {
-                                    if !extra.wait_frame(1, std::time::Duration::from_secs(24 * 3600)) {
-                                        return;
-                                    }
-                                    let options = omni_linux::display_window::Options {
-                                        title: format!("omnidroid — display {id}"),
-                                        control: None,
-                                        // One window's keyboard and mouse are the device's; a second
-                                        // set would reach display 0 too, until input is associated
-                                        // with a display (the multi-instance design's phase 2).
-                                        input: false,
-                                    };
-                                    if let Err(e) = omni_linux::display_window::spawn(extra, composer, options) {
-                                        eprintln!("[window] display {id}: {e}");
-                                    }
-                                });
-                            }
-                        }
-                        Err(e) => eprintln!("[composer] a display could not be added: {e}"),
+                    if let Err(e) = extra.add(w, h) {
+                        eprintln!("[composer] a display could not be added: {e}");
                     }
                 }
+                host_displays = Some(extra);
                 framebuffer = Some(fb);
                 _composers.push(composer);
             }
@@ -521,7 +522,8 @@ fn main() -> ExitCode {
     if let Some(dir) = control {
         let (sysroot, instance) = (sysroot.clone(), instance.clone());
         let envp: Vec<Vec<u8>> = envp.iter().filter(|e| !e.starts_with(b"CLASSPATH=")).cloned().collect();
-        serve_control(dir, move |command, uid, out| {
+        let host: Option<HostCommand> = host_displays.clone().map(|d| -> HostCommand { std::sync::Arc::new(move |command: &str| d.handle(command)) });
+        serve_control(dir, host, move |command, uid, out| {
             let config = SpawnConfig {
                 sysroot: sysroot.clone(),
                 instance_dir: instance.clone(),
@@ -591,8 +593,12 @@ fn main() -> ExitCode {
 /// order, each whole. `dir/pid` names this host process. Commands run at once and side by side;
 /// the directory is looked at every 50 ms, a host-side poll that costs the device nothing while
 /// idle.
+/// A command for the host side of the device (a first line `#host`): its status and output.
+type HostCommand = std::sync::Arc<dyn Fn(&str) -> (i64, String) + Send + Sync>;
+
 fn serve_control(
     dir: PathBuf,
+    host: Option<HostCommand>,
     spawn: impl Fn(&str, u32, std::sync::Arc<parking_lot::Mutex<Vec<u8>>>) -> Result<std::sync::Arc<Process>, String> + Send + Sync + 'static,
 ) {
     let _ = std::fs::create_dir_all(&dir);
@@ -617,9 +623,28 @@ fn serve_control(
             let text = std::fs::read_to_string(&run).unwrap_or_default();
             let uid = text.lines().next().and_then(|l| l.strip_prefix("#uid=")).and_then(|u| u.trim().parse().ok()).unwrap_or(2000);
             let spawn = std::sync::Arc::clone(&spawn);
+            let host = host.clone();
             std::thread::spawn(move || {
                 let out = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-                let code = match spawn(&text, uid, std::sync::Arc::clone(&out)) {
+                // `#host <command>`: done by this process itself (the device's displays,
+                // `omni_linux::displays`), not by a shell in the guest.
+                let host_command = text.lines().next().and_then(|l| l.strip_prefix("#host")).map(|rest| {
+                    let body: String = text.lines().skip(1).collect::<Vec<_>>().join(" ");
+                    format!("{} {body}", rest.trim()).trim().to_string()
+                });
+                let code = if let Some(command) = host_command {
+                    match &host {
+                        Some(host) => {
+                            let (code, said) = host(&command);
+                            out.lock().extend_from_slice(said.as_bytes());
+                            code
+                        }
+                        None => {
+                            out.lock().extend_from_slice(b"control: this device serves no host commands\n");
+                            127
+                        }
+                    }
+                } else { match spawn(&text, uid, std::sync::Arc::clone(&out)) {
                     Ok(sh) => match sh.run() {
                         ExitStatus::Exited(code) => code as i64,
                         ExitStatus::Killed { signal, .. } => 128 + signal as i64,
@@ -628,7 +653,7 @@ fn serve_control(
                         out.lock().extend_from_slice(format!("control: {e}\n").as_bytes());
                         127
                     }
-                };
+                } };
                 let whole = |to: PathBuf, bytes: &[u8]| {
                     let part = to.with_extension("part");
                     if std::fs::write(&part, bytes).is_ok() {

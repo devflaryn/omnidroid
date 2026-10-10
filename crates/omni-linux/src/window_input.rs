@@ -106,9 +106,9 @@ pub enum Out {
 }
 
 /// The title while the mouse is free.
-pub const TITLE_FREE: &str = "omnidroid";
+pub const TITLE_FREE: &str = "Omnidroid";
 /// The title while the app holds the mouse.
-pub const TITLE_HELD: &str = "omnidroid \u{2014} the app holds the mouse (Alt+Tab frees it)";
+pub const TITLE_HELD: &str = "Omnidroid \u{2014} the app holds the mouse (Alt+Tab frees it)";
 
 /// The evdev button of a host button.
 #[must_use]

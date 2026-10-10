@@ -659,6 +659,16 @@ fn boot_args(locale: &str) -> Vec<String> {
     args
 }
 
+/// `-md`: a device whose displays identify themselves (`OMNI_MULTI_DISPLAY=1`,
+/// `hal::composer::edid`) knows them by other ids, and is another device.
+fn multi_display_key() -> &'static str {
+    if omni_linux::hal::composer::multi_display() {
+        "-md"
+    } else {
+        ""
+    }
+}
+
 /// `OMNI_R_WARM=1`: a **warm device** -- Android booted and idle, no app of its own, kept for the
 /// apps a host program (the MCP server) installs, starts and stops through the device's control
 /// channel (`<instance>.ctl`, `omni-linux-run --control`) one after another. The device is the
@@ -693,7 +703,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix())));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key())));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");

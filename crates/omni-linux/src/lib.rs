@@ -25,6 +25,7 @@ pub mod proccpu;
 pub mod bpf;
 pub mod device;
 pub mod display_window;
+pub mod displays;
 pub mod dnsproxy;
 pub mod errno;
 pub mod evdev;

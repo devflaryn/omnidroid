@@ -280,6 +280,62 @@ struct Mode {
     height: u32,
 }
 
+/// `OMNI_MULTI_DISPLAY=1`: displays identify themselves (a port and an EDID each), which is what lets
+/// SurfaceFlinger take more than two. Read once.
+#[must_use]
+pub fn multi_display() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_MULTI_DISPLAY").as_deref() == Ok("1"))
+}
+
+/// The name a display goes by: in its EDID, and so in `dumpsys display`, where a host program finds
+/// the id Android gave the display it added.
+#[must_use]
+pub fn display_name(display: i64) -> String {
+    if display == DISPLAY {
+        "omnidroid".to_string()
+    } else {
+        format!("omnidroid-{display}")
+    }
+}
+
+/// A minimal EDID 1.4 base block for the display on `port` named `name` (at most 13 characters):
+/// the header, the manufacturer `OMD`, the port as product code and serial, a digital input, and a
+/// display-name descriptor -- what SurfaceFlinger's `parseEdid` reads -- and the checksum.
+#[must_use]
+pub fn edid(port: u8, name: &str) -> Vec<u8> {
+    let mut e = vec![0u8; 128];
+    e[..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // Three letters, five bits each, 'A' = 1, big-endian: O M D.
+    let id = (u16::from(b'O' - b'@') << 10) | (u16::from(b'M' - b'@') << 5) | u16::from(b'D' - b'@');
+    e[8..10].copy_from_slice(&id.to_be_bytes());
+    e[10] = port;
+    e[12] = port;
+    e[16] = 1; // week
+    e[17] = 34; // 2024
+    e[18] = 1;
+    e[19] = 4;
+    e[20] = 0x80; // digital input
+    e[23] = 120; // gamma 2.2
+    for t in e[38..54].chunks_exact_mut(2) {
+        t.copy_from_slice(&[0x01, 0x01]); // standard timings unused
+    }
+    // Four 18-byte descriptors: the name, then three dummies.
+    let mut name_bytes: Vec<u8> = name.bytes().filter(u8::is_ascii_graphic).take(13).collect();
+    if name_bytes.len() < 13 {
+        name_bytes.push(b'\n');
+    }
+    name_bytes.resize(13, b' ');
+    e[54..59].copy_from_slice(&[0, 0, 0, 0xFC, 0]);
+    e[59..72].copy_from_slice(&name_bytes);
+    for at in [72, 90, 108] {
+        e[at + 3] = 0x10;
+    }
+    let sum = e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    e[127] = 0u8.wrapping_sub(sum);
+    e
+}
+
 /// The windows that are the system's chrome, by the start of their title: SystemUI's bars and
 /// screen decorations (rounded corners, cutout), and the launcher's taskbar.
 const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer"];
@@ -360,11 +416,23 @@ impl Composer {
         }
     }
 
-    /// The display's size now.
+    /// Display 0's size now.
     #[must_use]
     pub fn display_size(&self) -> (u32, u32) {
-        let m = self.screen(DISPLAY).map_or(Mode { config: 0, width: WIDTH, height: HEIGHT }, |s| s.mode());
+        self.display_size_of(DISPLAY)
+    }
+
+    /// The size of the display `id` now (the initial size if it is gone).
+    #[must_use]
+    pub fn display_size_of(&self, id: i64) -> (u32, u32) {
+        let m = self.screen(id).map_or(Mode { config: 0, width: WIDTH, height: HEIGHT }, |s| s.mode());
         (m.width, m.height)
+    }
+
+    /// The ids of the displays there are, display 0 first.
+    #[must_use]
+    pub fn display_ids(&self) -> Vec<i64> {
+        self.screens.lock().keys().copied().collect()
     }
 
     /// **Resize the display** to `width` x `height` (each at least [`MIN_SIDE`]): a configuration
@@ -375,8 +443,16 @@ impl Composer {
     /// # Errors
     /// The hotplug's delivery failed (SurfaceFlinger gone).
     pub fn set_display_size(&self, width: u32, height: u32) -> Result<(u32, u32), String> {
+        self.set_display_size_of(DISPLAY, width, height)
+    }
+
+    /// [`Self::set_display_size`] for the display `id`: each display is resized on its own.
+    ///
+    /// # Errors
+    /// The hotplug's delivery failed (SurfaceFlinger gone).
+    pub fn set_display_size_of(&self, id: i64, width: u32, height: u32) -> Result<(u32, u32), String> {
         let (width, height) = (width.max(MIN_SIDE), height.max(MIN_SIDE));
-        let Some(screen) = self.screen(DISPLAY) else { return Ok((width, height)) };
+        let Some(screen) = self.screen(id) else { return Ok((width, height)) };
         let config = {
             let mut m = screen.mode.lock();
             if (m.width, m.height) == (width, height) {
@@ -386,11 +462,31 @@ impl Composer {
             m.config
         };
         let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
-        eprintln!("[composer] display {width}x{height} (config {config}): {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
+        eprintln!("[composer] display {id} {width}x{height} (config {config}): {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
         if let Some(callback) = callback {
-            IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(DISPLAY, true).map_err(|e| format!("onHotplug: {e:?}"))?;
+            IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(id, true).map_err(|e| format!("onHotplug: {e:?}"))?;
         }
         Ok((width, height))
+    }
+
+    /// **Remove the display `id`** (never display 0): reported disconnected, and forgotten. What was
+    /// on it Android moves or stops, as it does for an unplugged external display.
+    ///
+    /// # Errors
+    /// Display 0, a display there is not, or the hotplug's delivery failed.
+    pub fn remove_display(&self, id: i64) -> Result<(), String> {
+        if id == DISPLAY {
+            return Err("display 0 is the device's own and is never removed".into());
+        }
+        if self.screens.lock().remove(&id).is_none() {
+            return Err(format!("no display {id}"));
+        }
+        let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
+        eprintln!("[composer] display {id} removed");
+        if let Some(callback) = callback {
+            IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_hotplug(id, false).map_err(|e| format!("onHotplug: {e:?}"))?;
+        }
+        Ok(())
     }
 
     /// **Add a display** of this size, and connect it: its id, and the framebuffer its frames are
@@ -1418,11 +1514,19 @@ impl IComposerClientServer for Client {
 
     fn get_display_identification_data(&self, _ctx: &Ctx<'_>, display: i64) -> Result<super::aidl::android_hardware_graphics_composer3::DisplayIdentification, Status> {
         self.screen(display)?;
-        Err(Status::ServiceSpecific(EX_UNSUPPORTED))
+        // With identification data for the first display, SurfaceFlinger takes any number of
+        // displays; without it, a primary and one external, and "Ignoring connection of tertiary
+        // display" for the rest (HWComposer::onHotplugConnect). Off unless asked for: the display's
+        // id is derived from it, and a saved device knows its displays by id.
+        if !multi_display() {
+            return Err(Status::ServiceSpecific(EX_UNSUPPORTED));
+        }
+        let port = u8::try_from(display).map_err(|_| Status::ServiceSpecific(EX_UNSUPPORTED))?;
+        Ok(super::aidl::android_hardware_graphics_composer3::DisplayIdentification { port: port as i8, data: edid(port, &display_name(display)) })
     }
 
     fn get_display_name(&self, _ctx: &Ctx<'_>, display: i64) -> Result<String, Status> {
-        self.screen(display).map(|_| if display == DISPLAY { "omnidroid".to_string() } else { format!("omnidroid-{display}") })
+        self.screen(display).map(|_| display_name(display))
     }
 
     fn get_display_vsync_period(&self, _ctx: &Ctx<'_>, display: i64) -> Result<i32, Status> {
@@ -1528,6 +1632,20 @@ impl IComposerClientServer for Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_edid_names_its_display_and_sums_to_zero() {
+        let e = super::edid(3, "omnidroid-3");
+        assert_eq!(e.len(), 128);
+        assert_eq!(&e[..8], &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00], "the header");
+        assert_eq!(e.iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0, "the checksum");
+        assert_eq!(u16::from_be_bytes([e[8], e[9]]), 0x3DA4, "OMD");
+        assert_eq!((e[10], e[12]), (3, 3), "the port as product code and serial");
+        assert_eq!(&e[54..59], &[0, 0, 0, 0xFC, 0], "a display-name descriptor");
+        assert_eq!(&e[59..72], b"omnidroid-3\n ");
+        let long = super::edid(200, "a-name-longer-than-thirteen");
+        assert_eq!(&long[59..72], b"a-name-longer", "cut to 13");
+    }
+
     use super::is_chrome;
     use super::Pacer;
     use std::time::{Duration, Instant};

@@ -82,7 +82,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use omni_platform::window::{Presenter, Window, WindowDesc, WindowEvent};
 
@@ -141,6 +141,39 @@ pub struct Options {
     pub control: Option<PathBuf>,
     /// The window's keyboard and mouse as the device's (see this module's "Keyboard and mouse").
     pub input: bool,
+    /// The composer's display the window shows (0, the device's own, unless another): its size is
+    /// the window's, and a resize of the window resizes this display alone.
+    pub display: i64,
+    /// The Android display id the window's pointer goes to, shared so a host program can set it
+    /// once it learns the id Android gave this display (0 until then; `None`: always 0).
+    pub android_display: Option<Arc<AtomicI32>>,
+    /// The keyboard and mouse every window of the device shares ([`register_input`]); `None`:
+    /// registered for this window (the device's first).
+    pub shared_input: Option<SharedInput>,
+    /// Set by the host to close the window (its display was removed).
+    pub stop: Option<Arc<AtomicBool>>,
+    /// Written when the person closes the window, so a host program can end what it showed.
+    pub closed_marker: Option<PathBuf>,
+}
+
+/// The keyboard and the relative mouse, one pair for the device: whichever window has the focus
+/// types and moves through them, and Android gives keys to the display last touched.
+#[derive(Clone)]
+pub struct SharedInput {
+    keyboard: Arc<Device>,
+    mouse: Arc<Device>,
+}
+
+impl std::fmt::Debug for SharedInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SharedInput(event{}, event{})", self.keyboard.number, self.mouse.number)
+    }
+}
+
+/// Register the device's keyboard and relative mouse -- before system_server's `InputReader` scans.
+#[must_use]
+pub fn register_input() -> SharedInput {
+    SharedInput { keyboard: crate::evdev::register(Spec::keyboard("omnidroid keyboard")), mouse: crate::evdev::register(Spec::mouse("omnidroid mouse")) }
 }
 
 /// The input devices: the keyboard, the relative mouse, the absolute pointer.
@@ -158,10 +191,14 @@ struct Devices {
 /// The thread could not be started.
 pub fn spawn(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: Options) -> std::io::Result<JoinHandle<()>> {
     // The devices now, on the caller's thread: they must exist before `InputReader` scans.
-    let devices = options.input.then(|| Devices {
-        keyboard: crate::evdev::register(Spec::keyboard("omnidroid keyboard")),
-        mouse: crate::evdev::register(Spec::mouse("omnidroid mouse")),
-        pointer: crate::inject::Injector::new(crate::binder::broker(crate::binder::Context::Binder)),
+    let devices = options.input.then(|| {
+        let shared = options.shared_input.clone().unwrap_or_else(register_input);
+        let pointer = crate::inject::Injector::new(crate::binder::broker(crate::binder::Context::Binder));
+        let pointer = match &options.android_display {
+            Some(display) => pointer.with_display(Arc::clone(display)),
+            None => pointer,
+        };
+        Devices { keyboard: shared.keyboard, mouse: shared.mouse, pointer }
     });
     if let Some(d) = &devices {
         eprintln!("[window] input: /dev/input/event{} keyboard, /dev/input/event{} mouse; the pointer injected", d.keyboard.number, d.mouse.number);
@@ -289,8 +326,8 @@ impl HostCursor {
 }
 
 /// Display pixels per window pixel, each way.
-fn scale(window: &Window, composer: &Composer) -> (f64, f64) {
-    let (dw, dh) = composer.display_size();
+fn scale(window: &Window, composer: &Composer, display: i64) -> (f64, f64) {
+    let (dw, dh) = composer.display_size_of(display);
     match window.client_size() {
         Ok((w, h)) if w > 0 && h > 0 => (f64::from(dw) / f64::from(w), f64::from(dh) / f64::from(h)),
         _ => (1.0, 1.0),
@@ -299,7 +336,8 @@ fn scale(window: &Window, composer: &Composer) -> (f64, f64) {
 
 /// The window thread: make the window, start the present thread, pump, run the control file.
 fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options, devices: Option<&Devices>) {
-    let (width, height) = composer.display_size();
+    let shown = options.display;
+    let (width, height) = composer.display_size_of(shown);
     let mut window = match Window::new(&WindowDesc::new(&options.title, width, height)) {
         Ok(w) => w,
         Err(e) => {
@@ -331,7 +369,7 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     let present = {
         let stop = Arc::clone(&stop);
         let composer = Arc::clone(&composer);
-        std::thread::Builder::new().name("omni-display-present".into()).spawn(move || present(&presenter, raw, &framebuffer, &composer, &stop))
+        std::thread::Builder::new().name("omni-display-present".into()).spawn(move || present(&presenter, raw, &framebuffer, &composer, shown, &stop))
     };
     let present = match present {
         Ok(handle) => handle,
@@ -360,12 +398,19 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
         // A copy in the guest is shared with the host's clipboard only while a window is in use.
         crate::clipboard::window_focus(window.has_focus());
         if events.contains(&WindowEvent::CloseRequested) {
+            if let Some(marker) = &options.closed_marker {
+                let _ = std::fs::write(marker, b"closed");
+            }
+            break;
+        }
+        if options.stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire)) {
+            eprintln!("[window] display {shown} removed: closing its window");
             break;
         }
         if let Some(devices) = devices {
             let now = Instant::now();
-            let s = scale(&window, &composer);
-            let display = composer.display_size();
+            let s = scale(&window, &composer, shown);
+            let display = composer.display_size_of(shown);
             let (wanted, count) = crate::input_channel::capture();
             if count != capture_seen {
                 capture_seen = count;
@@ -432,8 +477,8 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
                             Some(command) => match devices {
                                 Some(devices) => {
                                     eprintln!("[window] control: {line}");
-                                    let (now, s) = (Instant::now(), scale(&window, &composer));
-                                    let outs = scripted(command, &mut input, now, s, composer.display_size());
+                                    let (now, s) = (Instant::now(), scale(&window, &composer, shown));
+                                    let outs = scripted(command, &mut input, now, s, composer.display_size_of(shown));
                                     perform(outs, &mut window, &mut input, devices);
                                 }
                                 None => eprintln!("[window] control: {line:?}: no input devices (OMNI_WINDOW_INPUT=0)"),
@@ -521,7 +566,7 @@ impl crate::hal::framebuffer::ZeroSink for WindowSink {
 }
 
 /// The present thread: each frame to the window, and the window's size to the display.
-fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebuffer: &Framebuffer, composer: &Composer, stop: &AtomicBool) {
+fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebuffer: &Framebuffer, composer: &Composer, shown_display: i64, stop: &AtomicBool) {
     // The framebuffer frame last shown, and how many frames were shown.
     let (mut shown, mut presented) = (0u64, 0u64);
     let mut refused = false;
@@ -647,8 +692,8 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
                 pending = None;
                 let (dw, dh) = display_for_window(w, h, max_pixels);
                 let want = (dw.max(MIN_SIDE), dh.max(MIN_SIDE));
-                if want != composer.display_size() {
-                    match composer.set_display_size(dw, dh) {
+                if want != composer.display_size_of(shown_display) {
+                    match composer.set_display_size_of(shown_display, dw, dh) {
                         Ok((dw, dh)) => eprintln!("[window] window {w}x{h}: display {dw}x{dh}"),
                         Err(e) => eprintln!("[window] window {w}x{h}: the display could not follow: {e}"),
                     }

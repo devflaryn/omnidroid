@@ -192,7 +192,7 @@ impl Mouse {
 /// `injectInputEvent(ev, INJECT_INPUT_EVENT_MODE_ASYNC)`'s parcel for `m`: `MotionEvent::writeToParcel`
 /// (AOSP 15) after the typed object's marker and Java's token.
 #[must_use]
-pub fn parcel(m: &Motion, id: i32) -> Vec<u8> {
+pub fn parcel(m: &Motion, id: i32, display: i32) -> Vec<u8> {
     let mut p = Parcel::with_interface_token(INPUT_MANAGER);
     p.i32(1); // writeTypedObject: not null
     p.i32(PARCEL_TOKEN_MOTION_EVENT);
@@ -201,7 +201,7 @@ pub fn parcel(m: &Motion, id: i32) -> Vec<u8> {
     p.i32(id);
     p.i32(0); // deviceId
     p.i32(SOURCE_MOUSE);
-    p.i32(0); // displayId
+    p.i32(display); // displayId
     p.byte_vector(&[0; 32]); // hmac
     p.i32(m.action);
     p.i32(m.action_button);
@@ -256,6 +256,8 @@ pub struct Injector {
     /// The pointer icon the app last asked for (`setPointerIcon`, heard through a tap on the input
     /// service), or [`POINTER_ICON_UNKNOWN`].
     icon: Arc<AtomicI32>,
+    /// The Android display the events go to ([`Injector::with_display`]).
+    display: Arc<AtomicI32>,
 }
 
 struct Inner {
@@ -274,7 +276,17 @@ impl Injector {
             broker,
             inner: Mutex::new(Inner { mouse: Mouse::default(), handle: None, looked: None, confirmed: false, next_id: 0x0100_0000 }),
             icon: Arc::new(AtomicI32::new(POINTER_ICON_UNKNOWN)),
+            display: Arc::new(AtomicI32::new(0)),
         }
+    }
+
+    /// The Android display the events go to (display 0 unless set): a window shows one display,
+    /// and its pointer is that display's. The holder is shared, so it can be set after the
+    /// window is made (once the host learns the id Android gave the display).
+    #[must_use]
+    pub fn with_display(mut self, display: Arc<AtomicI32>) -> Self {
+        self.display = display;
+        self
     }
 
     /// The pointer icon the app last asked Android for over its view (`PointerIcon.TYPE_*`), once
@@ -297,7 +309,7 @@ impl Injector {
         let Some(handle) = self.handle(&mut inner) else { return };
         for m in motions {
             inner.next_id = inner.next_id.wrapping_add(1);
-            let data = parcel(&m, inner.next_id);
+            let data = parcel(&m, inner.next_id, self.display.load(Ordering::Relaxed));
             if inner.confirmed {
                 if let Err(e) = self.broker.host_transact_oneway(handle, INJECT_INPUT_EVENT, data, &[]) {
                     eprintln!("[inject] the input service is gone (errno {}): looking it up again", e.0);
@@ -420,7 +432,7 @@ mod tests {
     #[test]
     fn the_parcel_is_motion_event_write_to_parcels() {
         let m = Motion { action: ACTION_DOWN, action_button: 0, buttons: 1, x: 400.0, y: 300.0, dx: 0.0, dy: 0.0, vscroll: 0.0, hscroll: 0.0, pressure: 1.0, down_time: 7, event_time: 9 };
-        let bytes = parcel(&m, 42);
+        let bytes = parcel(&m, 42, 0);
         let token_len = 12 + 4 + (INPUT_MANAGER.len() + 1) * 2;
         let at = (token_len + 3) & !3;
         let i32_at = |o: usize| i32::from_le_bytes(bytes[at + o..at + o + 4].try_into().unwrap());
@@ -428,6 +440,8 @@ mod tests {
         let i64_at = |o: usize| i64::from_le_bytes(bytes[at + o..at + o + 8].try_into().unwrap());
         assert_eq!([i32_at(0), i32_at(4), i32_at(8), i32_at(12), i32_at(16)], [1, 1, 1, 1, 42], "non-null, token, 1 pointer, 1 sample, id");
         assert_eq!([i32_at(24), i32_at(28), i32_at(32)], [SOURCE_MOUSE, 0, 32], "source, display, hmac length");
+        let on_5 = parcel(&m, 42, 5);
+        assert_eq!(on_5[at + 28..at + 32], 5i32.to_le_bytes(), "the display the injector is for");
         let after_hmac = 36 + 32;
         assert_eq!([i32_at(after_hmac), i32_at(after_hmac + 20)], [ACTION_DOWN, 1], "action, buttons");
         let cursor = after_hmac + 28 + 24 + 8;
