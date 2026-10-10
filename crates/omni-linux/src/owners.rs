@@ -92,6 +92,12 @@ impl Owners {
         }
     }
 
+    /// The instance directory this table is of (`None`: a detached one).
+    #[must_use]
+    pub fn instance(&self) -> Option<&Path> {
+        self.instance.as_deref()
+    }
+
     #[must_use]
     pub fn get(&self, host: &Path) -> Option<Owner> {
         self.map.lock().get(host).copied()

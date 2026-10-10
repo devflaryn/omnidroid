@@ -87,14 +87,28 @@ fn set(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
         value.push(0);
     }
     let mut store = store().lock();
-    let attrs = store.entry(key).or_default();
+    let attrs = store.entry(key.clone()).or_default();
     match (attrs.contains_key(&name), a[4]) {
         (true, XATTR_CREATE) => return Err(EEXIST),
         (false, XATTR_REPLACE) => return Err(ENODATA),
         _ => {}
     }
+    // A directory's label is kept across boots too (`crate::labels`).
+    let kept = (name == SELINUX).then(|| value.clone());
     attrs.insert(name, value);
+    drop(store);
+    if let (Some(label), Key::Host(host)) = (kept, &key) {
+        if let Some(labels) = p.vfs.owners().instance().and_then(crate::labels::Labels::of) {
+            labels.set(host, &label);
+        }
+    }
     Ok(0)
+}
+
+/// The label kept for a directory of this instance at an earlier boot (`crate::labels`).
+fn kept_label(p: &Process, key: &Key) -> Option<Vec<u8>> {
+    let Key::Host(host) = key else { return None };
+    p.vfs.owners().instance().and_then(crate::labels::Labels::of)?.get(host)
 }
 
 fn get(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
@@ -113,6 +127,7 @@ fn get(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
         None if image_attr(p, &key, &name).is_some() => image_attr(p, &key, &name).expect("checked"),
         // A file of an instance whose label must outlive the host process that set it.
         None if name == SELINUX && persistent_label(&key).is_some() => persistent_label(&key).expect("checked").to_vec(),
+        None if name == SELINUX && kept_label(p, &key).is_some() => kept_label(p, &key).expect("checked"),
         None if name == SELINUX => UNLABELED.to_vec(),
         None => return Err(ENODATA),
     };

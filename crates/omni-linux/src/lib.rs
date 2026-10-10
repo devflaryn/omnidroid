@@ -46,6 +46,7 @@ pub mod mount;
 pub mod inet;
 pub mod loopns;
 pub mod netlink;
+pub mod labels;
 pub mod owners;
 pub mod mm;
 pub mod mmap_log;
