@@ -300,8 +300,8 @@ and the JIT patches stay).
 | arm | fps | all ms | private commit | private WS | system host | available | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | s11 (old build) | 59.2-59.4 | 39.5-41.5 | 4.035 | 3.02 | 0.81 | 9.23 | 10.3 | 28.6 | 56.8 | 70.8-71.1 | 83.9-84.8 |
-| new | 59.47 | 41.52 | 3.871 | 0.733 | 0.132 | 11.095 | **4.1** | **21.2** | **47.7** | 57.7 | **71.8** |
-| off | 59.47 | 40.54 | 3.864 | 2.845 | 0.658 | 9.449 | **4.0** | **21.3** | **47.0** | 60.0 | **73.1** |
+| new | 59.47 / 59.21 | 41.52 / 41.08 | 3.871 / 3.860 | 0.733 / 0.699 | 0.132 / 0.135 | 11.095 / 11.215 | **4.1 / 4.1** | **21.2 / 21.3** | **47.7 / 47.6** | 57.7 / 59.9 | **71.8 / 72.0** |
+| off | 59.47 / 59.56 | 40.54 / 37.85 | 3.864 / 3.830 | 2.845 / 2.837 | 0.658 / 0.649 | 9.449 / 9.486 | **4.0 / 4.1** | **21.3 / 21.3** | **47.0 / 47.0** | 60.0 / 57.0 | **73.1 / 72.9** |
 
 - **system_server 10.3 -> 4.0 s; boot_completed 28.6 -> 21.2; onGameLoaded ~85 -> 72-73 s.** init's
   boot commands **7.7 -> 3.8 s**: every `setprop`/`wait_for_prop` opened the sysroot. A spawn is ~4
@@ -309,5 +309,9 @@ and the JIT patches stay).
   its program in ~85 ms (was 160-240).
 - Private commit 4.04 -> 3.87 GB; the system host without trims 0.81 -> 0.66 GB (each guest process's
   copy of the sysroot's maps is gone).
+- The trims again give **+1.7 GB available** (11.10/11.22 vs 9.45/9.49) -- but this time CPU a frame
+  is higher with them, 2/2: all threads 41.5/41.1 vs 40.5/37.9 ms, the top thread 12.3/12.0 vs
+  11.8/10.4 (s10 saw no cost). Suspect: re-trimming the game's hot set every 120 s, which then
+  faults back. s18 tries one trim only (`OMNI_WS_TRIM_ONCE=1`).
 - What is left of init's boot commands: `wait_for_prop apexd.status activated` 1.86 s, bpfloader 0.39
   s, init_user0 0.27 s, linkerconfig 2 x 0.19 s.
