@@ -73,6 +73,7 @@ dynarmic/
                and ../patches/0084-xbyak-a-byte-written-in-place-the-growing-out-of-line.patch
                and ../patches/0086-ir-get-arg-inline-set-arg-type-check-with-verification.patch
                and ../patches/0087-ir-opcode-return-types-and-predicates-from-tables.patch
+               and ../patches/0089-x64-shared-labels-from-a-per-thread-free-list.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

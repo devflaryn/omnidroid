@@ -925,3 +925,19 @@ two runs); `OMNI_JIT_VERIFY=1` passes on the corpus.
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0086): frontend **4.69/4.57/4.62/4.56 -> 4.25/4.32/4.28/4.28 us/block (-7%)**, emit
 **10.36/10.23/10.29/10.16 -> 9.92/10.10/9.99/10.07 (-2%)**.
+
+(0088, `SelectARegister`'s two partitions replayed over bitmasks of the locations -- the same swaps
+as `std::partition`, so the same choice, with each location looked at once -- was **slower**: 10.12
+-> 10.47 us/block over four pairs. Dropped.)
+
+### 0089 — x64: shared labels from a per-thread free list
+
+Every memory access a block makes takes two `SharedLabel`s (`std::make_shared<Xbyak::Label>`: the
+slow path's entry and the join), and floating point more: a `malloc` and a `free` each, all within
+the block's emission (the sampler put ~1.5% of emission in `malloc`/`free` under `EmitMemoryRead`/
+`Write` and `~EmitContext`). `GenSharedLabel` now uses `std::allocate_shared` with an allocator whose
+single objects come from, and go back to, a free list of the emitting thread (freed at the thread's
+end); the same `shared_ptr`s otherwise. The same bytes (`compare_emit_dumps.py`).
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0087): emit **10.31/10.10/10.09/10.01 -> 9.75/9.81/9.81/9.80 us/block (-3.3%)**.

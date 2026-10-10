@@ -109,8 +109,61 @@ struct EmitContext {
 
 using SharedLabel = std::shared_ptr<Xbyak::Label>;
 
+namespace detail {
+/// Omnidroid patch 0089: a shared label's memory (its control block and the label) from a free
+/// list of the emitting thread -- two of them for every memory access a block makes, each a
+/// `malloc` and a `free` within the block's emission. Single objects only; anything else, and a
+/// block freed on another thread, is just heap memory moving between lists.
+template<typename T>
+struct LabelPoolAllocator {
+    using value_type = T;
+    LabelPoolAllocator() = default;
+    template<typename U>
+    LabelPoolAllocator(const LabelPoolAllocator<U>&) {}
+
+    struct FreeList {
+        void* head = nullptr;
+        ~FreeList() {
+            while (head) {
+                void* next = *static_cast<void**>(head);
+                ::operator delete(head);
+                head = next;
+            }
+        }
+    };
+    static FreeList& List() {
+        thread_local FreeList list;
+        return list;
+    }
+
+    T* allocate(std::size_t n) {
+        static_assert(sizeof(T) >= sizeof(void*) && alignof(T) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+        FreeList& list = List();
+        if (n == 1 && list.head) {
+            void* p = list.head;
+            list.head = *static_cast<void**>(p);
+            return static_cast<T*>(p);
+        }
+        return static_cast<T*>(::operator new(n * sizeof(T)));
+    }
+    void deallocate(T* p, std::size_t n) {
+        if (n == 1) {
+            FreeList& list = List();
+            *reinterpret_cast<void**>(p) = list.head;
+            list.head = p;
+            return;
+        }
+        ::operator delete(p);
+    }
+    template<typename U>
+    bool operator==(const LabelPoolAllocator<U>&) const { return true; }
+    template<typename U>
+    bool operator!=(const LabelPoolAllocator<U>&) const { return false; }
+};
+}  // namespace detail
+
 inline SharedLabel GenSharedLabel() {
-    return std::make_shared<Xbyak::Label>();
+    return std::allocate_shared<Xbyak::Label>(detail::LabelPoolAllocator<Xbyak::Label>{});
 }
 
 class EmitX64 {
