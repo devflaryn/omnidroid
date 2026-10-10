@@ -44,9 +44,16 @@ void OpenFile() {
 }
 }  // anonymous namespace
 
+bool PerfMapEnabled() {
+    // Omnidroid patch 0094: read once. Without it every registration took the mutex and read the
+    // environment again (the file never opened), for every block emitted.
+    static const bool enabled = std::getenv("PERF_BUILDID_DIR") != nullptr;
+    return enabled;
+}
+
 namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name) {
-    if (start == end) {
+    if (start == end || !PerfMapEnabled()) {
         // Nothing to register
         return;
     }
@@ -82,6 +89,10 @@ void PerfMapClear() {
 #else
 
 namespace Dynarmic::Backend::X64 {
+
+bool PerfMapEnabled() {
+    return false;
+}
 
 namespace detail {
 void PerfMapRegister(const void*, const void*, std::string_view) {}

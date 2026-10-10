@@ -1,0 +1,63 @@
+diff --git a/src/dynarmic/backend/x64/emit_x64.cpp b/src/dynarmic/backend/x64/emit_x64.cpp
+index 2f293423..f505fc9c 100644
+--- a/src/dynarmic/backend/x64/emit_x64.cpp
++++ b/src/dynarmic/backend/x64/emit_x64.cpp
+@@ -501,7 +501,9 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
+ }
+ 
+ EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
+-    PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
++    if (PerfMapEnabled()) {  // patch 0094: the name (a formatted string) only for a perf map
++        PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
++    }
+     Patch(descriptor, entrypoint);
+ 
+     ASSERT(size <= std::numeric_limits<u32>::max());
+diff --git a/src/dynarmic/backend/x64/perf_map.cpp b/src/dynarmic/backend/x64/perf_map.cpp
+index 88691dbf..f1e9022b 100644
+--- a/src/dynarmic/backend/x64/perf_map.cpp
++++ b/src/dynarmic/backend/x64/perf_map.cpp
+@@ -44,9 +44,16 @@ void OpenFile() {
+ }
+ }  // anonymous namespace
+ 
++bool PerfMapEnabled() {
++    // Omnidroid patch 0094: read once. Without it every registration took the mutex and read the
++    // environment again (the file never opened), for every block emitted.
++    static const bool enabled = std::getenv("PERF_BUILDID_DIR") != nullptr;
++    return enabled;
++}
++
+ namespace detail {
+ void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name) {
+-    if (start == end) {
++    if (start == end || !PerfMapEnabled()) {
+         // Nothing to register
+         return;
+     }
+@@ -83,6 +90,10 @@ void PerfMapClear() {
+ 
+ namespace Dynarmic::Backend::X64 {
+ 
++bool PerfMapEnabled() {
++    return false;
++}
++
+ namespace detail {
+ void PerfMapRegister(const void*, const void*, std::string_view) {}
+ }  // namespace detail
+diff --git a/src/dynarmic/backend/x64/perf_map.h b/src/dynarmic/backend/x64/perf_map.h
+index 7d739ae6..0b018c9b 100644
+--- a/src/dynarmic/backend/x64/perf_map.h
++++ b/src/dynarmic/backend/x64/perf_map.h
+@@ -15,6 +15,10 @@ namespace detail {
+ void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name);
+ }  // namespace detail
+ 
++/// Omnidroid patch 0094: whether code is registered in a perf map at all (Linux, with
++/// `PERF_BUILDID_DIR` set when first asked) -- so a caller builds a block's name only then.
++bool PerfMapEnabled();
++
+ template<typename T>
+ void PerfMapRegister(T start, const void* end, std::string_view friendly_name) {
+     detail::PerfMapRegister(mcl::bit_cast<const void*>(start), end, friendly_name);

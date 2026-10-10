@@ -15,6 +15,10 @@ namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name);
 }  // namespace detail
 
+/// Omnidroid patch 0094: whether code is registered in a perf map at all (Linux, with
+/// `PERF_BUILDID_DIR` set when first asked) -- so a caller builds a block's name only then.
+bool PerfMapEnabled();
+
 template<typename T>
 void PerfMapRegister(T start, const void* end, std::string_view friendly_name) {
     detail::PerfMapRegister(mcl::bit_cast<const void*>(start), end, friendly_name);

@@ -994,3 +994,17 @@ every user of `Value` has them. `GetInst` is inline in `value.h`. The same code,
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0092): frontend **4.03/4.05/4.02/4.01 -> 3.85/3.86/3.87/3.86 us/block (-4%)**, emit
 **9.53/9.66/9.56/9.53 -> 9.29/9.35/9.34/9.33 (-2.5%)**.
+
+### 0094 — x64: a block's perf-map name only when there is a perf map
+
+`RegisterBlock` passed `LocationDescriptorToFriendlyName(descriptor)` -- a `fmt::format`ted
+`std::string` -- to `PerfMapRegister` for every block emitted, on every host. On Windows and macOS
+`PerfMapRegister` does nothing; on Linux it took a global mutex and read `PERF_BUILDID_DIR` from the
+environment again each time (the map file is only opened when it is set, so without it every call
+looked again). `PerfMapEnabled()` reads the variable once (false off Linux), `PerfMapRegister`
+returns before the mutex without it, and `RegisterBlock` builds the name only with it. The same
+bytes; a perf map is written as before when `PERF_BUILDID_DIR` is set at the first registration.
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460 Linux, 4 interleaved runs
+against 0093): emit **9.23/9.26/9.37/9.27 -> 8.82/8.79/8.72/8.72 us/block (-5.6%)**. On Windows
+only the formatting (and its allocation) was wasted.

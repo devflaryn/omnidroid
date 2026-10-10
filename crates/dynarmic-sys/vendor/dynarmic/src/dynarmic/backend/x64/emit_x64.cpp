@@ -501,7 +501,9 @@ Xbyak::Label EmitX64::EmitCond(IR::Cond cond) {
 }
 
 EmitX64::BlockDescriptor EmitX64::RegisterBlock(const IR::LocationDescriptor& descriptor, CodePtr entrypoint, size_t size) {
-    PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+    if (PerfMapEnabled()) {  // patch 0094: the name (a formatted string) only for a perf map
+        PerfMapRegister(entrypoint, code.getCurr(), LocationDescriptorToFriendlyName(descriptor));
+    }
     Patch(descriptor, entrypoint);
 
     ASSERT(size <= std::numeric_limits<u32>::max());
