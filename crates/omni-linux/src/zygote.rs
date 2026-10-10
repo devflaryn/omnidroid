@@ -261,6 +261,13 @@ fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env
     for e in env {
         cmd.arg("--env").arg(e);
     }
+    // `OMNI_APP_GUEST_ENV=NAME=VALUE;...`: more of every app's own environment -- an allocator's
+    // options, say (`MIMALLOC_PURGE_DELAY`: the game frees with 54k MADV_DONTNEEDs a minute, s30).
+    if let Ok(extra) = std::env::var("OMNI_APP_GUEST_ENV") {
+        for kv in extra.split(';').map(str::trim).filter(|kv| kv.contains('=')) {
+            cmd.arg("--env").arg(kv);
+        }
+    }
     // One CLOCK_MONOTONIC for the instance: SurfaceFlinger's vsync times are the app's frame times.
     cmd.env("OMNI_MONOTONIC_ORIGIN", crate::sys::monotonic_origin());
     cmd.args(["--", "/system/bin/app_process64"]);
