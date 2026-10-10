@@ -388,6 +388,13 @@ fn traced(name: &str) -> bool {
 }
 
 /// How long `exec_start` waits for its service, at most.
+/// `OMNI_INIT_PARALLEL=1` (off by default): `class_start` starts the classes' services side by
+/// side instead of one after another (to be measured: `[init] boot commands ... class_start ...`).
+fn parallel_class_start() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_INIT_PARALLEL").as_deref() == Ok("1"))
+}
+
 const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long `wait_for_prop` waits, at most. AOSP init waits forever; a boot here that never
@@ -469,6 +476,7 @@ impl Init {
     /// What started.
     pub fn boot(&self, classes: &[&str]) -> Vec<String> {
         let mut started = Vec::new();
+        let t = std::time::Instant::now();
         for c in &self.boot_commands {
             match c {
                 Command::Start(n) => {
@@ -523,7 +531,16 @@ impl Init {
                 }
             }
         }
-        started.extend(self.class_start(classes));
+        let commands_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        let classes_started = self.class_start(classes);
+        eprintln!(
+            "[init] boot commands {commands_ms} ms; class_start {} ms ({} services{})",
+            t.elapsed().as_millis(),
+            classes_started.len(),
+            if parallel_class_start() { ", in parallel" } else { "" }
+        );
+        started.extend(classes_started);
         started
     }
 
@@ -619,7 +636,27 @@ impl Init {
             .map(|s| s.name.clone())
             .collect();
         names.sort();
-        names.into_iter().filter(|n| self.start_service(n)).collect()
+        if !parallel_class_start() {
+            return names.into_iter().filter(|n| self.start_service(n)).collect();
+        }
+        // Each service a host process of its own making (a guest space, a code cache, its program
+        // loaded): started side by side, the class's start takes the longest of them, not the sum.
+        // Services find each other through servicemanager and wait for what they need, as they do
+        // when init starts them one after another.
+        let started = parking_lot::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for n in &names {
+                let started = &started;
+                scope.spawn(move || {
+                    if self.start_service(n) {
+                        started.lock().push(n.clone());
+                    }
+                });
+            }
+        });
+        let mut started = started.into_inner();
+        started.sort();
+        started
     }
 
     /// Start a service by name, unless it is running (or cannot run here). Whether it started.
