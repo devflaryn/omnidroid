@@ -6,6 +6,7 @@
 #include "dynarmic/ir/microinstruction.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include <mcl/assert.hpp>
 
@@ -627,16 +628,31 @@ Type Inst::GetType() const {
     return GetTypeOf(op);
 }
 
-Value Inst::GetArg(size_t index) const {
+void Inst::BadGetArg(size_t index) const {
+    // Omnidroid patch 0086: `GetArg`'s checks failed (it is inline now); these say how.
     ASSERT_MSG(index < GetNumArgsOf(op), "Inst::GetArg: index {} >= number of arguments of {} ({})", index, op, GetNumArgsOf(op));
     ASSERT_MSG(!args[index].IsEmpty() || GetArgTypeOf(op, index) == IR::Type::Opaque, "Inst::GetArg: index {} is empty", index, args[index].GetType());
-
-    return args[index];
+    UNREACHABLE();
 }
+
+namespace {
+/// Omnidroid patch 0086: `SetArg`'s argument type check -- a walk to the value's defining opcode
+/// for every argument every pass sets -- runs with the IR verification (`OMNI_JIT_VERIFY=1`,
+/// patch 0077): it asserts and changes nothing. The index check stays.
+bool VerifyArgTypes() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_VERIFY");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+}  // namespace
 
 void Inst::SetArg(size_t index, Value value) {
     ASSERT_MSG(index < GetNumArgsOf(op), "Inst::SetArg: index {} >= number of arguments of {} ({})", index, op, GetNumArgsOf(op));
-    ASSERT_MSG(AreTypesCompatible(value.GetType(), GetArgTypeOf(op, index)), "Inst::SetArg: type {} of argument {} not compatible with operation {} ({})", value.GetType(), index, op, GetArgTypeOf(op, index));
+    if (VerifyArgTypes()) {
+        ASSERT_MSG(AreTypesCompatible(value.GetType(), GetArgTypeOf(op, index)), "Inst::SetArg: type {} of argument {} not compatible with operation {} ({})", value.GetType(), index, op, GetArgTypeOf(op, index));
+    }
 
     if (!args[index].IsImmediate()) {
         UndoUse(args[index]);

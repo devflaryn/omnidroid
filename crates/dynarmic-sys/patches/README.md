@@ -890,3 +890,18 @@ jump displacement 0x2000 apart).
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1` -- the live switches a device sets,
 now in that test too -- i5-4460, 3 interleaved runs): emit **11.06/11.06/11.11 -> 10.51/10.50/10.57
 us/block (-5%)**; the frontend unchanged.
+
+### 0086 — IR: `Inst::GetArg` inline; `SetArg`'s type check with the verification (`OMNI_JIT_VERIFY=1`)
+
+`Inst::GetArg` was a call into `microinstruction.cpp` for every argument any pass or emitter reads
+(2.5% of emission's samples, self), and `SetArg` (2.7%) checked the new argument's type against
+the opcode's on every call -- `Value::GetType` walks to the defining instruction's opcode and its
+type table. mcl's asserts are on in release builds. `GetArg` is inline now, with the same two
+checks (index, not empty) and their messages out of line; `SetArg`'s type check runs with the IR
+verification (0077's `OMNI_JIT_VERIFY=1`), its index check always. Nothing else changes: the same
+bytes (`compare_emit_dumps.py`, the same 11 blocks as between two runs of one build), and with
+`OMNI_JIT_VERIFY=1` the corpus passes every check.
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0084): frontend **4.80/4.80/4.80/4.80 -> 4.58/4.64/4.68/4.60 us/block (-4%)**, emit
+**10.54/10.57/10.51/10.55 -> 10.17/10.27/10.34/10.26 (-3%)**.

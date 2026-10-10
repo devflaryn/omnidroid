@@ -134,7 +134,14 @@ public:
     /// Get the number of arguments this instruction has.
     size_t NumArgs() const { return GetNumArgsOf(op); }  // patch 0077: inline
 
-    Value GetArg(size_t index) const;
+    /// Omnidroid patch 0086: inline -- a call per argument read by every pass and by the emitter
+    /// (2.5% of emission's samples) -- with the same checks, their messages out of line.
+    Value GetArg(size_t index) const {
+        if (index >= GetNumArgsOf(op) || (args[index].IsEmpty() && GetArgTypeOf(op, index) != Type::Opaque)) [[unlikely]] {
+            BadGetArg(index);
+        }
+        return args[index];
+    }
     void SetArg(size_t index, Value value);
 
     void Invalidate();
@@ -153,6 +160,7 @@ public:
     void SetHostLocHint(std::uint8_t loc) const { host_loc_hint = loc; }
 
 private:
+    [[noreturn]] void BadGetArg(size_t index) const;  // patch 0086
     void Use(const Value& value);
     void UndoUse(const Value& value);
 
