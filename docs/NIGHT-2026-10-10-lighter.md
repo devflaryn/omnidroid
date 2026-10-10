@@ -315,3 +315,15 @@ and the JIT patches stay).
   faults back. s18 tries one trim only (`OMNI_WS_TRIM_ONCE=1`).
 - What is left of init's boot commands: `wait_for_prop apexd.status activated` 1.86 s, bpfloader 0.39
   s, init_user0 0.27 s, linkerconfig 2 x 0.19 s.
+
+## Session s14 (06:40-07:02): one sysroot per host process, side by side (`s14-sysroot.csv`, the s13 build)
+
+| arm | fps | all ms | private commit | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|
+| shared (default) | 59.50 / 59.39 | 39.75 / 40.27 | **3.832 / 3.851** | **4.1 / 4.1** | 21.1 / 21.2 | 46.8 / 47.0 | 59.4 / 61.0 | **73.8 / 73.0** |
+| per open (`OMNI_SYSROOT_SHARED=0`) | 59.25 / 59.58 | 40.09 / 37.71 | 3.932 / 3.975 | 5.2 / 5.1 | 21.9 / 22.2 | 47.6 / 48.4 | 61.7 / 58.4 | 75.6 / 75.5 |
+
+**The shared sysroot: system_server -1.05 s, the world -2.2 s, private commit -110 MB (2/2).** Of the
+old build's 9.9 s before system_server (s11: boot commands 7.6 s, class_start 2.3 s sequential), the
+rest went to class_start side by side (-2.2 s), `exec_start`s ~175 -> ~100 ms each (-0.8 s), and
+init's waits (apexd's activation is guest code: decompressing the APEXes), with the cheaper JIT.
