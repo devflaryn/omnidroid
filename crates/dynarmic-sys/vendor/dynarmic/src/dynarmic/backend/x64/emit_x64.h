@@ -137,7 +137,7 @@ struct LabelPoolAllocator {
     }
 
     T* allocate(std::size_t n) {
-        static_assert(sizeof(T) >= sizeof(void*) && alignof(T) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
+        static_assert(sizeof(T) >= sizeof(void*) && alignof(T) <= alignof(std::max_align_t));
         FreeList& list = List();
         if (n == 1 && list.head) {
             void* p = list.head;
