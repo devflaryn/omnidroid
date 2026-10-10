@@ -74,6 +74,7 @@ dynarmic/
                and ../patches/0086-ir-get-arg-inline-set-arg-type-check-with-verification.patch
                and ../patches/0087-ir-opcode-return-types-and-predicates-from-tables.patch
                and ../patches/0089-x64-shared-labels-from-a-per-thread-free-list.patch
+               and ../patches/0090-x64-a-block-s-codegen-census-added-once.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

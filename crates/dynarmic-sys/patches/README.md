@@ -941,3 +941,15 @@ end); the same `shared_ptr`s otherwise. The same bytes (`compare_emit_dumps.py`)
 
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0087): emit **10.31/10.10/10.09/10.01 -> 9.75/9.81/9.81/9.80 us/block (-3.3%)**.
+
+### 0090 — x64: a block's codegen census added once
+
+Patch 0060's census (`codegen_census`, read only by the code-size tests) was counted with an atomic
+add per part per IR instruction -- two or three `lock xadd`s an instruction, ~100 a block, on cache
+lines every emitting thread of the process shares. `Emit` counts a block on the stack now and adds
+it to the census once, when the block is done (`CensusTally`): the same totals after every block.
+The same bytes; `compact_code.rs` (which reads the census) passes.
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, one thread, 4 interleaved
+runs against 0089): emit **9.87/9.92/9.77/9.85 -> 9.70/9.76/9.75/9.73 us/block (-1.2%)**. More where
+threads emit side by side (a boot's system host), which this benchmark does not do.

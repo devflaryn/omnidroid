@@ -70,9 +70,20 @@ void SetEmitObserver(EmitObserver observer, void* ctx) {
 }
 
 namespace {
-void CodegenCount(CodegenPart part, std::uint64_t n) {
-    codegen_census[static_cast<std::size_t>(part)].fetch_add(n, std::memory_order_relaxed);
-}
+// Omnidroid patch 0090: a block's census is counted on the stack and added to `codegen_census` once,
+// at the end of its emission -- it was two or three atomic adds per IR instruction, on cache lines
+// every emitting thread shares (most of `Emit`'s own time). The same totals once a block is done.
+struct CensusTally {
+    std::array<std::uint64_t, static_cast<std::size_t>(CodegenPart::Count)> n{};
+    void operator()(CodegenPart part, std::uint64_t k) { n[static_cast<std::size_t>(part)] += k; }
+    ~CensusTally() {
+        for (std::size_t i = 0; i < n.size(); i++) {
+            if (n[i] != 0) {
+                codegen_census[i].fetch_add(n[i], std::memory_order_relaxed);
+            }
+        }
+    }
+};
 
 CodegenPart PartOf(const IR::Inst& inst) {
     switch (inst.GetOpcode()) {
@@ -153,6 +164,7 @@ A64EmitX64::A64EmitX64(BlockOfCode& code, A64::UserConfig conf, A64::Jit* jit_in
 A64EmitX64::~A64EmitX64() = default;
 
 A64EmitX64::BlockDescriptor A64EmitX64::Emit(IR::Block& block) {
+    CensusTally CodegenCount;  // patch 0090
     if (conf.very_verbose_debugging_output) {
         std::puts(IR::DumpBlock(block).c_str());
     }
