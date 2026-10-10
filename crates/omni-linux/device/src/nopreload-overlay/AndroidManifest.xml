@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- A static overlay of the framework that empties the resources a zygote preloads (see
-     res/values/arrays.xml). Its own file, so that a run can leave it out (`OMNI_APP_PRELOAD_RES=1`). -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    package="com.omnidroid.overlay.nopreload">
-    <application android:hasCode="false" />
-    <overlay android:targetPackage="android" android:isStatic="true" android:priority="999" />
-</manifest>

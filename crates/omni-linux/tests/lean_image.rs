@@ -78,17 +78,6 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
     let with_hardware = open(Some("lean-hw"));
     assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE) && !with_hardware.has(IME));
 
-    // The overlay that empties the zygote's preloaded resources: in every image by default, out with
-    // `OMNI_APP_PRELOAD_RES=1` (the device's own overlay stays either way).
-    const NO_PRELOAD: &[u8] = b"/vendor/overlay/omni-nopreload-overlay.apk";
-    const DEVICE_OVERLAY: &[u8] = b"/vendor/overlay/omni-device-overlay.apk";
-    assert!(lean.has(NO_PRELOAD) && kiosk.has(NO_PRELOAD) && full.has(NO_PRELOAD), "the no-preload overlay by default");
-    std::env::set_var("OMNI_APP_PRELOAD_RES", "1");
-    let preloading = open(None);
-    std::env::remove_var("OMNI_APP_PRELOAD_RES");
-    assert!(!preloading.has(NO_PRELOAD) && preloading.has(DEVICE_OVERLAY), "OMNI_APP_PRELOAD_RES=1: the image's lists");
-    assert!(open(None).has(NO_PRELOAD), "and back");
-
     // The idle apps (`device::IDLE_APPS_LEFT_OUT`, `OMNI_DEVICE_IDLE_APPS=out`): in the image by
     // default (the setup disables them once the device is up); with `out`, gone from lean and
     // kiosk -- each listed path one the image has, so a renamed APEX app cannot slip through --

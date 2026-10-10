@@ -612,3 +612,22 @@ options or these `MADV_DONTNEED`s are not its delayed purges. Dropped; the switc
 many forgotten as s32's crashing runs (142k against ~151k). With the deterministic test (SIGSEGV
 before, passes after), the crash is fixed. Snapshots on four E-cores: the world in 110-133 s against
 ~140 s without (s17), sign-in 64-80 s against ~95 s.
+
+## Session s37 (13:09-13:30, stopped): the no-preload overlay -- reverted
+
+A static overlay emptying `preloaded_drawables` / `preloaded_color_state_lists` (c16b28e), so each
+app's WrapperInit would skip `ZygoteInit.preloadResources`' decoding. It reaches almost no app: each
+app process builds its system resources itself and libidmap2 lets only root and system write
+`/data/resource-cache`, so under an app's uid **every static overlay is skipped** ("uid 10097 does not
+have write access ..."; the device overlay and the emulator RROs too -- as before tonight). In s37's
+first run 3 of 20 processes (system uid) skipped the preload, 17 still preloaded the 63 drawables.
+Most of PreloadResources is `Resources.getSystem()` anyway (C5 on Linux: ~1.0 s of 1.1-1.7 s with
+nothing preloaded), which every app needs. The session was stopped (time up) after one run; no gain
+shown, **reverted**. Kept from it: the shared Sysroot keyed by `device::left_out()` (330439e, a real
+fix: lean_image failed).
+
+## End of the night (13:30)
+
+Stopped at the owner's word; the branch merged to main. Queued and not run: s38 (system code aging at
+3 min), s20 (allocation trace), s36 (boot syscalls/profile), s21 (eight E-core profile), s23-s25
+(snapshot compression, fast-dispatch size, snapshot memory).
