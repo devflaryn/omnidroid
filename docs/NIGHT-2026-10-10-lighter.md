@@ -418,16 +418,14 @@ where the game's time goes. **Stays opt-in.**
   sat in `make_init_dirs`, which every process's first spawn runs, so every fixture test made a 237
   MB copy (`/tmp` on the Linux box filled with them; `shared_map`'s two tests 6.88 -> 0.32 s once it
   moved). Now `Init::start` does it -- a boot's, before apexd can start.
-- **Roblox's asset pool is private commit here, file pages on a device.** The game maps
-  `cache/wob/wob-<n>` 1 GiB `MAP_SHARED` over a file it has just made and unlinked, and grows the file
-  with `ftruncate` as it fills (the directory is empty while the game runs; `[mem]` named the mapping
-  with 570 MiB committed, s3/s10 traces). A shared mapping's part past its file's end was anonymous
-  memory -- the whole 1 GiB if the file was empty when mapped (inferred; s27's `[mm] shared ...` line
-  says) -- and never became the file's.
-  Now that part is a view of a host file of its own (sparse, its name removed once mapped:
-  `mm::tail_backing`, `OMNI_SHARED_TAIL=0` the old way). A new fixture (`sharedtail`) holds its writes
-  across the growth, a fork, an in-page offset and a fixed address -- and with the old anonymous tail
-  **a forked child's writes never reached the parent**, which the new one fixes. s27 measures it.
+- **Not Roblox's asset pool (withdrawn).** An earlier `[mem]` trace named a 1 GiB range with 570 MiB
+  committed `cache/wob/wob-<n>`, and the wob directory is empty while the game runs, so it looked
+  like a pool mapped `MAP_SHARED` over an unlinked file and grown past its end -- anonymous memory
+  here, a file's pages on a device. A shared mapping's part past its file's end was made a sparse
+  host file's view (2199afc, with a fixture) -- and s27's traces showed the 570 MiB is Roblox's
+  second 1 GiB **mimalloc arena** (`[anon:mimalloc]`, 571/587 MiB in both arms); the wob name was a
+  stale one at that address, and no shared mapping ran 16 MiB past its file. The game's commit fell
+  36 MB: reverted (a72c946). (`wob` is Roblox's WriteOnlyBuffer.)
 
 ## Session s26 (09:05-09:24): s17's crash again, with the crash report (`s26-crash-e4.csv`, s22's build)
 
@@ -466,5 +464,4 @@ So every host process now opts out at start (`omni_platform::process::prefer_spe
 `OMNI_HIGH_QOS=0` leaves it to the host). This is not only the benchmark's: a session behind another
 window, a standby, a headless instance on a hybrid CPU were all exposed to it. s27's pair says only
 that the tail costs nothing measurable (31.3 vs 31.1 fps); the game's commit fell 36 MB, not the
-~570 MB hoped for -- so the pool is not mapped the way inferred (no `[mm] shared` line came: no one
-shared mapping ran 16 MiB past its file). s29 repeats the A/B on high QoS.
+~570 MB hoped for: the 570 MiB is a mimalloc arena (above). Reverted.
