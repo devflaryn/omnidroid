@@ -108,6 +108,32 @@ fn error_response(id: Json, err: &RpcError) -> String {
 ///
 /// Propagates an I/O error from reading or writing the streams. A malformed or failing *request* is
 /// answered with a JSON-RPC error, not returned as an error here.
+/// One JSON-RPC message (a request, a notification, or a batch of them) handled: the text to
+/// answer, or `None` when nothing is answered (notifications only). Every transport -- stdio, HTTP
+/// -- goes through here.
+pub fn handle_message(text: &str, dispatch: &mut impl Dispatch) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        // A batch: each member handled, the answers in an array (none: nothing).
+        let Ok(Json::Array(items)) = json::parse(trimmed) else {
+            return Some(error_response(Json::Null, &RpcError { code: code::PARSE_ERROR, message: "not a JSON-RPC batch".into() }));
+        };
+        let answers: Vec<String> = items.iter().filter_map(|m| handle_message(&m.to_string(), dispatch)).collect();
+        return (!answers.is_empty()).then(|| format!("[{}]", answers.join(",")));
+    }
+    match parse_request(trimmed) {
+        Ok(req) => {
+            let outcome = dispatch.handle(&req.method, &req.params);
+            let id = req.id?;
+            Some(match outcome {
+                Ok(result) => response(id, result),
+                Err(err) => error_response(id, &err),
+            })
+        }
+        Err(err) => Some(error_response(Json::Null, &err)),
+    }
+}
+
 pub fn serve(
     mut reader: impl BufRead,
     mut writer: impl Write,

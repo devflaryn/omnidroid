@@ -23,6 +23,8 @@ omni-platform = { workspace = true }
 omni-warm = { workspace = true }
 # The root request's hash (`root::key`), to tell whether a warm device has the root profile asked for.
 omni-linux = { workspace = true }
+# The HTTP transport's shared server (`http::serve`).
+parking_lot = { workspace = true }
 
 [lib]
 name = "omni_mcp"

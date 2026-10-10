@@ -19,8 +19,9 @@
 //! holds the configuration and the live/lab state.
 
 pub use omni_warm as device;
+pub mod http;
 pub mod json;
 pub mod mcp;
 pub mod server;
 
-pub use server::{Config, Server};
+pub use server::{Config, Live, Server};

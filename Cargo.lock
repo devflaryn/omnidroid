@@ -494,6 +494,7 @@ dependencies = [
  "omni-platform",
  "omni-rebuild",
  "omni-warm",
+ "parking_lot",
 ]
 
 [[package]]

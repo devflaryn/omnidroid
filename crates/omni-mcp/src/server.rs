@@ -114,8 +114,25 @@ struct Instance {
     display: Option<i64>,
 }
 
+/// **Live tools served by someone else**: the omnidroid app's pool answers the instance and
+/// device tools itself (its own devices and windows), and this server keeps the lab's. With one,
+/// the tools named in [`LIVE_TOOLS`] are the backend's, and nothing here boots or warms a device.
+pub trait Live: Send {
+    /// The backend's tools: each `{name, description, inputSchema}`.
+    fn tools(&self) -> Vec<Json>;
+    /// A call of one of them; `None` for a tool it does not have.
+    fn call(&mut self, name: &str, arguments: &Json) -> Option<Result<Json, RpcError>>;
+}
+
+/// The tools a [`Live`] backend replaces.
+pub const LIVE_TOOLS: &[&str] = &[
+    "start_instance", "stop_instance", "list_instances", "install_apk", "launch_app", "screenshot", "shell", "uninstall_apk", "stop_app", "device_status", "stop_device",
+];
+
 /// The MCP server.
 pub struct Server {
+    /// The app's live backend, if this server is the app's (`Server::with_live`).
+    live: Option<Box<dyn Live>>,
     config: Config,
     instances: BTreeMap<String, Instance>,
     next_instance: u64,
@@ -208,6 +225,7 @@ impl Server {
     #[must_use]
     pub fn new(config: Config) -> Self {
         Self {
+            live: None,
             config,
             instances: BTreeMap::new(),
             next_instance: 1,
@@ -216,6 +234,15 @@ impl Server {
             next_corpus: 1,
             standby_child: None,
         }
+    }
+
+    /// A server whose instance and device tools are `live`'s (the omnidroid app's pool); the lab's
+    /// stay this server's.
+    #[must_use]
+    pub fn with_live(config: Config, live: Box<dyn Live>) -> Self {
+        let mut server = Self::new(config);
+        server.live = Some(live);
+        server
     }
 
     /// The launcher's command for a session in `dir`: the APK, the launcher options (a plugin's),
@@ -1326,16 +1353,35 @@ impl Dispatch for Server {
                 ),
             ])),
             "notifications/initialized" | "initialized" => {
-                self.ensure_standby();
-                self.ensure_warm();
+                if self.live.is_none() {
+                    self.ensure_standby();
+                    self.ensure_warm();
+                }
                 Ok(Json::Null)
             }
             "ping" => Ok(json::obj([])),
-            "tools/list" => Ok(Self::tool_list()),
+            "tools/list" => Ok(match &self.live {
+                None => Self::tool_list(),
+                Some(live) => {
+                    let mut tools = live.tools();
+                    if let Some(Json::Array(own)) = Self::tool_list().get("tools") {
+                        tools.extend(own.iter().filter(|t| t.get("name").and_then(Json::as_str).is_some_and(|n| !LIVE_TOOLS.contains(&n))).cloned());
+                    }
+                    json::obj([("tools", Json::Array(tools))])
+                }
+            }),
             "tools/call" => {
                 let name = params.get("name").and_then(Json::as_str).ok_or_else(|| RpcError::params("tools/call needs `name`"))?;
                 let empty = Json::Object(Default::default());
                 let arguments = params.get("arguments").unwrap_or(&empty);
+                if let Some(live) = &mut self.live {
+                    if let Some(answer) = live.call(name, arguments) {
+                        return answer.map(text_result);
+                    }
+                    if LIVE_TOOLS.contains(&name) {
+                        return Err(RpcError { code: crate::mcp::code::METHOD_NOT_FOUND, message: format!("no tool named {name}") });
+                    }
+                }
                 self.call_tool(name, arguments)
             }
             other => Err(RpcError { code: crate::mcp::code::METHOD_NOT_FOUND, message: format!("no method {other}") }),
@@ -1755,6 +1801,29 @@ mod tests {
         assert!(server.labs.contains_key("candidate"), "candidate session retained");
         // Loading a named session must not populate the default one.
         assert!(!server.labs.contains_key(DEFAULT_LAB), "named loads do not touch the default");
+    }
+
+    #[test]
+    fn a_live_backend_answers_the_instance_tools_and_the_lab_stays() {
+        use crate::mcp::Dispatch;
+        struct Pool;
+        impl Live for Pool {
+            fn tools(&self) -> Vec<Json> {
+                vec![json::obj([("name", json::s("start_instance")), ("description", json::s("the pool's")), ("inputSchema", json::obj([("type", json::s("object"))]))])]
+            }
+            fn call(&mut self, name: &str, _arguments: &Json) -> Option<Result<Json, RpcError>> {
+                (name == "start_instance").then(|| Ok(json::s("from the pool")))
+            }
+        }
+        let mut server = Server::with_live(Config::from_env(), Box::new(Pool));
+        let list = server.handle("tools/list", &Json::Null).unwrap();
+        let tools = list.get("tools").unwrap().as_array().unwrap();
+        let names: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
+        assert_eq!(names.iter().filter(|n| **n == "start_instance").count(), 1, "the pool's, once");
+        assert!(names.contains(&"lab_load") && !names.contains(&"stop_device"), "{names:?}");
+        let call = |s: &mut Server, name: &str| s.handle("tools/call", &json::obj([("name", json::s(name)), ("arguments", json::obj([]))]));
+        assert!(call(&mut server, "start_instance").unwrap().to_string().contains("from the pool"));
+        assert!(call(&mut server, "stop_device").is_err(), "a live tool the pool does not have is not this server's");
     }
 
     #[test]
