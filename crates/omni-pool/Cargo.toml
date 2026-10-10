@@ -1,0 +1,18 @@
+[package]
+name = "omni-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "A pool of warm Android devices and the app instances on them: where each launch goes, which device boots, which idles out."
+
+# Host-side orchestration only: the devices are `omnidroid aosp --warm` processes driven through
+# their control channels (omni-warm). No OS crate and no `cfg(target_os)` here (Global Constraint 4).
+[dependencies]
+omni-apk = { workspace = true }
+omni-warm = { workspace = true }
+omni-platform = { workspace = true }
+parking_lot = { workspace = true }

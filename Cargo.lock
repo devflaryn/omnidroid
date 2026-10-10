@@ -526,6 +526,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "omni-pool"
+version = "0.1.0"
+dependencies = [
+ "omni-apk",
+ "omni-platform",
+ "omni-warm",
+ "parking_lot",
+]
+
+[[package]]
 name = "omni-rebuild"
 version = "0.1.0"
 dependencies = [

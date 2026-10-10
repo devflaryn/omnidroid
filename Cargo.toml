@@ -37,6 +37,9 @@ omni-mcp = { path = "crates/omni-mcp" }
 # The warm device (one idle Android per host, apps installed and started on it): omni-mcp and the
 # omnidroid launcher both drive it.
 omni-warm = { path = "crates/omni-warm" }
+# The pool of warm devices and the app instances on them (where a launch goes, which device boots,
+# which idles out): the omnidroid app and its MCP server drive it.
+omni-pool = { path = "crates/omni-pool" }
 # The RE workbench's build helper (C3): arm64 toolchain detection + candidate compile. A top-level
 # tool crate like omni-debug/omni-mcp; only omni-mcp depends on it.
 omni-rebuild = { path = "crates/omni-rebuild" }

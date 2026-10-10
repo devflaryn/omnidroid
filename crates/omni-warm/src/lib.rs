@@ -49,7 +49,9 @@ pub enum Found {
 }
 
 impl Device {
-    fn ctl(&self) -> PathBuf {
+    /// Its control channel's directory (`<dir>.ctl`).
+    #[must_use]
+    pub fn ctl(&self) -> PathBuf {
         self.dir.with_extension("ctl")
     }
 
