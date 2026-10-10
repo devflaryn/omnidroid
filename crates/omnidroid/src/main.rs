@@ -214,6 +214,23 @@ fn app_launch(rest: &[String]) -> Result<Option<(PathBuf, u32)>, String> {
 
 fn main() -> ExitCode {
     let (command, rest) = command_and_rest(std::env::args().skip(1));
+    if command.as_deref() == Some("serve") {
+        let port = match rest.as_slice() {
+            [] => None,
+            [flag, p] if flag == "--port" => match p.parse() {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    eprintln!("omnidroid: --port wants a number, not `{p}`");
+                    return ExitCode::from(2);
+                }
+            },
+            _ => {
+                eprintln!("omnidroid: usage: omnidroid serve [--port <n>]");
+                return ExitCode::from(2);
+            }
+        };
+        return app::serve(port);
+    }
     if command.as_deref() == Some("app") {
         return match app_launch(&rest) {
             Ok(first) => app::run(first),

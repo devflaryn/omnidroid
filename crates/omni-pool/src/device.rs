@@ -84,6 +84,19 @@ pub fn boot(exe: &Path, dir: &Path, config: &Config) -> Result<Child, String> {
         .env("OMNI_SCREENSHOT_MS", "1000")
         .env("OMNI_R_SETPROPS", setprops)
         .env("OMNI_AOSP_WARM", "0");
+    // Several apps start on one device, often while another device boots: Android's timeouts scaled
+    // as an emulator's are (`ro.hw_timeout_multiplier`, `omni_linux::props`), else an app's start is
+    // killed as an ANR ("failed to complete startup") while system_server holds a core (2026-10-10).
+    if std::env::var_os("OMNI_HW_TIMEOUT_MULTIPLIER").is_none() {
+        cmd.env("OMNI_HW_TIMEOUT_MULTIPLIER", "5");
+    }
+    // No spare app process (`omni_linux::zygote`'s, ~3-4 s off a cold start): an app whose startup
+    // broadcast reaches the spare before its application is bound crashes there ("Unable to
+    // instantiate receiver ... Instrumentation.onException on a null object", Super Mechs,
+    // 2026-10-10) -- and a pool starts many apps.
+    if std::env::var_os("OMNI_APP_SPARE").is_none() {
+        cmd.env("OMNI_APP_SPARE", "0");
+    }
     if config.device_ram_mb > 0 {
         cmd.env("OMNI_DEVICE_RAM_MB", config.device_ram_mb.to_string());
     }
@@ -204,10 +217,16 @@ pub fn start(dev: &Device, package: &str, launcher: &str, user: u32, display: i3
         root(dev, &format!("am start-user -w --display {display} {user}"))?;
     }
     let out = root(dev, &format!("input keyevent KEYCODE_WAKEUP; am start -W --display {display} --user {user} -n {package}/{launcher}"))?;
-    if out.contains("Error") {
+    if !started(&out) {
         return Err(format!("am start: {}", out.trim()));
     }
     Ok(out)
+}
+
+/// Whether `am start -W` says the Activity was displayed: `Status: ok` and `Complete`, no error.
+#[must_use]
+pub fn started(out: &str) -> bool {
+    out.contains("Complete") && !out.contains("Error") && out.lines().filter_map(|l| l.trim().strip_prefix("Status: ")).all(|s| s == "ok")
 }
 
 /// Stop the app of an instance: force-stopped for its user, and a user other than 0 stopped (it
@@ -292,6 +311,14 @@ mod tests {
         assert!(omni_warm::numbered(&a.file_name().unwrap().to_string_lossy(), omni_warm::PREFIX));
         assert_eq!(marker(&a), a.with_extension("pool"));
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_start_counts_only_when_android_displayed_it() {
+        assert!(started("Starting: Intent { cmp=a/.M }\nStatus: ok\nLaunchState: COLD\nTotalTime: 7416\nWaitTime: 7513\nComplete\n"));
+        assert!(!started("Starting: Intent { cmp=a/.M }\nStatus: timeout\nComplete\n"), "never displayed");
+        assert!(!started("Error type 3\nError: Activity class {a/a.M} does not exist.\n"));
+        assert!(!started("Starting: Intent { cmp=a/.M }\n"), "no answer");
     }
 
     #[test]

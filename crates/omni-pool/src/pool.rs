@@ -142,6 +142,8 @@ pub struct Pool {
     /// Where devices live (`omni_warm::root`).
     root: PathBuf,
     log: Mutex<VecDeque<String>>,
+    /// Lines ever logged.
+    logged: std::sync::atomic::AtomicU64,
     started: Instant,
     stopping: std::sync::atomic::AtomicBool,
 }
@@ -158,6 +160,7 @@ impl Pool {
             exe,
             root: omni_warm::root(),
             log: Mutex::new(VecDeque::new()),
+            logged: std::sync::atomic::AtomicU64::new(0),
             started: Instant::now(),
             stopping: std::sync::atomic::AtomicBool::new(false),
         });
@@ -172,6 +175,7 @@ impl Pool {
         let secs = self.started.elapsed().as_secs();
         let mut log = self.log.lock();
         log.push_back(format!("{:02}:{:02}:{:02} {}", secs / 3600, secs / 60 % 60, secs % 60, line.into()));
+        self.logged.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while log.len() > LOG_LINES {
             log.pop_front();
         }
@@ -181,6 +185,16 @@ impl Pool {
     #[must_use]
     pub fn log(&self) -> Vec<String> {
         self.log.lock().iter().cloned().collect()
+    }
+
+    /// The lines logged after the first `seen` ever logged (those still kept), and how many have
+    /// been logged in all -- the next call's `seen`.
+    #[must_use]
+    pub fn log_since(&self, seen: u64) -> (Vec<String>, u64) {
+        let log = self.log.lock();
+        let total = self.logged.load(std::sync::atomic::Ordering::Relaxed);
+        let new = usize::try_from(total.saturating_sub(seen)).unwrap_or(usize::MAX).min(log.len());
+        (log.iter().skip(log.len() - new).cloned().collect(), total)
     }
 
     /// The settings now.
@@ -337,6 +351,11 @@ impl Pool {
     }
 
     fn boot(&self, id: DeviceId) {
+        // Nothing boots once the app is quitting (a launch or the ticker racing its shutdown).
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            self.device_gone(id, "not booted: the app is quitting");
+            return;
+        }
         let (dir, config) = {
             let s = self.state.lock();
             let Some(d) = s.devices.get(&id) else { return };
@@ -628,6 +647,9 @@ impl Pool {
     }
 
     fn tick(self: &Arc<Self>, n: u64) {
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         // Boots and deaths.
         let mut came = Vec::new();
         let mut gone = Vec::new();

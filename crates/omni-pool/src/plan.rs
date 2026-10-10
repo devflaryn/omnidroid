@@ -77,26 +77,26 @@ pub struct IdleView {
     pub idle_for: Option<Duration>,
 }
 
-/// The devices to close now: those idle `idle_minutes` or longer (never, when 0), longest idle
-/// first, as long as `keep_warm` idle devices stay.
+/// The devices to close now: those idle (no app) `idle_minutes` or longer (never, when 0),
+/// longest idle first, as long as `keep_warm` devices stay up in all -- busy or not. With one
+/// device busy and one idle past the timeout, the idle one goes; a lone idle device stays.
 #[must_use]
 pub fn to_close(devices: &[IdleView], idle_minutes: u64, keep_warm: u32) -> Vec<DeviceId> {
     if idle_minutes == 0 {
         return Vec::new();
     }
-    let idle: Vec<&IdleView> = devices.iter().filter(|d| d.ready && d.running == 0).collect();
-    let spare = idle.len().saturating_sub(keep_warm as usize);
-    let mut overdue: Vec<&IdleView> = idle.into_iter().filter(|d| d.idle_for.is_some_and(|t| t >= Duration::from_secs(idle_minutes * 60))).collect();
+    let spare = devices.len().saturating_sub(keep_warm as usize);
+    let mut overdue: Vec<&IdleView> = devices.iter().filter(|d| d.ready && d.running == 0 && d.idle_for.is_some_and(|t| t >= Duration::from_secs(idle_minutes * 60))).collect();
     overdue.sort_by(|a, b| b.idle_for.cmp(&a.idle_for).then(a.id.cmp(&b.id)));
     overdue.into_iter().take(spare).map(|d| d.id).collect()
 }
 
-/// How many devices to boot now so that `keep_warm` idle ones are up or coming (none past
-/// `max_devices`, when it is not 0). Booting ones count as coming.
+/// How many devices to boot now so that `keep_warm` are up or coming, busy or not (none past
+/// `max_devices`, when it is not 0): the app warms one as it opens, and a busy device is not a
+/// reason to warm another -- the next launch of another package goes into it.
 #[must_use]
 pub fn to_warm(devices: &[IdleView], keep_warm: u32, max_devices: u32) -> u32 {
-    let coming = devices.iter().filter(|d| !d.ready || d.running == 0).count() as u32;
-    let want = keep_warm.saturating_sub(coming);
+    let want = keep_warm.saturating_sub(devices.len() as u32);
     if max_devices == 0 {
         want
     } else {
@@ -182,19 +182,20 @@ mod tests {
     #[test]
     fn idle_devices_close_after_the_timeout_but_one_stays_warm() {
         let pool = [idle(1, Some(9), 0), idle(2, Some(6), 0), idle(3, None, 2)];
-        assert_eq!(to_close(&pool, 5, 1), [1], "the longest idle goes, one idle stays");
-        assert_eq!(to_close(&pool, 5, 0), [1, 2]);
+        assert_eq!(to_close(&pool, 5, 1), [1, 2], "a busy device is the one kept: both idle ones go");
+        assert_eq!(to_close(&[idle(1, Some(9), 0), idle(2, Some(6), 0)], 5, 1), [1], "the longest idle goes, one stays");
         assert_eq!(to_close(&pool, 10, 0), Vec::<DeviceId>::new(), "not yet");
         assert_eq!(to_close(&pool, 0, 0), Vec::<DeviceId>::new(), "0: never");
         assert_eq!(to_close(&[idle(1, Some(60), 0)], 5, 1), Vec::<DeviceId>::new(), "the last one stays");
+        assert_eq!(to_close(&[idle(1, Some(60), 0)], 5, 0), [1], "keep_warm 0: even the last");
     }
 
     #[test]
-    fn a_device_is_warmed_when_none_is_idle() {
+    fn a_device_is_warmed_when_there_is_none() {
         assert_eq!(to_warm(&[], 1, 0), 1, "the app opens");
-        assert_eq!(to_warm(&[idle(1, None, 3)], 1, 0), 1, "the only device is busy");
-        assert_eq!(to_warm(&[idle(1, Some(1), 0)], 1, 0), 0);
+        assert_eq!(to_warm(&[idle(1, None, 3)], 1, 0), 0, "a busy device takes the next package");
         assert_eq!(to_warm(&[IdleView { id: 1, ready: false, running: 0, idle_for: None }], 1, 0), 0, "one is booting");
-        assert_eq!(to_warm(&[idle(1, None, 3)], 1, 1), 0, "the limit");
+        assert_eq!(to_warm(&[], 2, 1), 1, "the limit");
+        assert_eq!(to_warm(&[], 0, 0), 0);
     }
 }

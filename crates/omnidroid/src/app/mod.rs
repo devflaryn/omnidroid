@@ -74,3 +74,53 @@ pub fn run(first: Option<(PathBuf, u32)>) -> ExitCode {
     pool.shutdown(stop);
     ExitCode::SUCCESS
 }
+
+/// **The app without its screen** (`omnidroid serve [--port <n>]`): the pool and its MCP server
+/// (on, whatever the settings say), the log on stdout, until stdin closes -- for a host with no
+/// terminal to show it on, and for tests.
+#[must_use]
+pub fn serve(port: Option<u16>) -> ExitCode {
+    let path = Config::path();
+    let (config, problems) = path.as_deref().map(Config::load).unwrap_or_default();
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("omnidroid: where this program is unknown");
+        return ExitCode::FAILURE;
+    };
+    let pool = Pool::start(config.clone(), path, exe);
+    for p in problems {
+        pool.say(format!("settings: {p}"));
+    }
+    let server = match mcp::McpServer::start(Arc::clone(&pool), port.unwrap_or(config.mcp_port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("omnidroid: MCP: {e}");
+            pool.shutdown(false);
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("omnidroid serve: MCP on {} (until stdin closes)", server.url());
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let mut sink = String::new();
+            while std::io::stdin().read_line(&mut sink).is_ok_and(|n| n > 0) {
+                sink.clear();
+            }
+            done.store(true, std::sync::atomic::Ordering::Release);
+        });
+    }
+    let mut seen = 0;
+    while !done.load(std::sync::atomic::Ordering::Acquire) {
+        let (lines, total) = pool.log_since(seen);
+        for line in lines {
+            println!("{line}");
+        }
+        seen = total;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    server.stop();
+    pool.shutdown(pool.config().stop_on_exit);
+    println!("omnidroid serve: stopped");
+    ExitCode::SUCCESS
+}
