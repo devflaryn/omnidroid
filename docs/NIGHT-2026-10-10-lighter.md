@@ -522,3 +522,63 @@ then 650-830 calls and 100-200 MiB a minute in the world -- each a decommit unde
 exclusively, the next touch a fault (~2 us) and a commit. s32 times them; s33 tries them under the
 lock shared (`OMNI_DISCARD_SHARED=1`, 9388919). madv_free stays off. (A fresh device on this build:
 boot_completed 19.4-20.0 s, 21.2 earlier tonight.)
+
+## Session s31 (10:56-11:24): SELinux labels kept on a saved device (`s31-labels.csv`, build f273e9e)
+
+A new saved device (`golden-l1010b`, made by `mk`), then booted with the labels kept (`kept`, the
+default since c871dae) and lost (`OMNI_KEEP_LABELS=0`), full CPU.
+
+| arm | fps | recursive restorecons | PackageManager start | AppDataPrepare | boot_completed | onGameLoaded |
+|---|---|---|---|---|---|---|
+| mk | 59.36 | 0 | 1,750 ms | 1,275 ms | 16.2 | 48.2 |
+| kept | 59.22 | 0 | 1,958 ms | 1,236 ms | 16.2 | 51.0 |
+| lost | 59.55 | 266 | 2,075 ms | 2,292 ms | 17.7 | 50.9 |
+| lost | 58.11 | 266 | 1,988 ms | 2,182 ms | 16.2 | 50.8 |
+| kept | 59.51 | 0 | 1,892 ms | 1,255 ms | 16.3 | 49.0 |
+
+**Labels kept: 266 recursive restorecons gone, AppDataPrepare -1.0 s** (1.24-1.28 s against
+2.18-2.29), boot_completed 16.2-16.3 against 16.2-17.7. The world time is noise at this size (48-51 s
+both ways). Every run hit the package cache (f273e9e's image mtimes: `cached: 170`, the system scan
+1,167 ms against s19's 1,844, PackageManager 1.75-2.08 s against 2.76). Against s19 (the saved device
+before both): **boot_completed 17.5 -> 16.2 s**. Kept.
+
+## Session s32 (11:26-11:52): the e4 snapshot crash, caught (`s32-crash-e4.csv`, build b0ce1c7 + 0100)
+
+| arm (`F0000`, s26's snapshots) | status | fps | boot_completed | onGameLoaded |
+|---|---|---|---|---|
+| e4snap | ok | 31.35 | 43.1 | 139.8 |
+| e4snap | **crash** (+253.0 s) | -- | 34.2 | -- |
+| e4snap | ok | 30.00 | 35.7 | 133.9 |
+| e4snap | **crash** (+252.6 s) | -- | 35.4 | -- |
+
+Both crashes reported by the kept filter: `[host-crash] exception 0xc0000005 at omni-linux-run.exe+0x638bc1
+writing 0x2345237e1b4` and `... writing 0x25fe890b25c` -- the same instruction, in the host, not in
+generated code. `llvm-symbolizer` on the build's PDB: **`EmitX64::ForgetOutgoingSlots`,
+emit_x64.cpp:656, `LinkAt(link.next).prev = link.prev`** -- a write through a link record already
+trimmed (serial below `link_base`, the index wrapping 2^32 records on). In both, minutes after the
+game's "settled: ~151k restored blocks never entered forgotten".
+
+The cause (dynarmic **0101**, 56d6f8c): `ForgetUnverifiedBlocks` handed the block's head of incoming
+links to `link_heads` from a copy read *before* `ForgetOutgoingSlots` -- a loop links to itself, so
+forgetting its own links moves its own head, and a dead record went on heading the list. The location
+translated again threaded its new links through it; the restored region's eviction trimmed it; the
+next unlink wrote out of the vector. The eviction and invalidation paths read the head live and were
+right. New test `a_restored_loop_forgotten_unverified_leaves_no_dead_head` (60k loops restored,
+forgotten, run, the restored regions evicted, all invalidated, run): **SIGSEGV in
+`ForgetOutgoingSlots` <- `ForgetRegionBlocks` <- `EvictOldest` before the fix, passes after**
+(Linux; shared_cache suite 23 passed). The four E-cores only made it likelier: more regions evicted.
+s35 runs this config again on the fixed build.
+
+## Session s33 (11:52-12:18): a guest discard under the layout lock shared, eight E-cores (`s33-discard-e8.csv`, s32's build)
+
+| arm (`FF0000`) | fps | CPU ms/frame | boot_completed | onGameLoaded | game's heaviest minute of discards |
+|---|---|---|---|---|---|
+| e8excl | 31.99 | 53.93 | 39.5 | 128.7 | 19,863 calls, 7.7 GB, 853 ms |
+| e8shared | 31.00 | 53.22 | 36.6 | 117.1 | 17,456 calls, 6.2 GB, 661 ms |
+| e8shared | 29.81 | 55.51 | 39.9 | 120.4 | 16,803 calls, 3.4 GB, 649 ms |
+| e8excl | 27.15 | 58.69 | 39.9 | 123.9 | 10,283 calls, 5.3 GB, 837 ms |
+
+The discards take **0.65-0.85 s of the game's busiest minute -- ~1% of one core**; at that size the
+lock they hold cannot be what limits it. fps is noise (30.4 against 29.6 means), the world -7.5 s
+with the lock shared on two pairs -- under the bar. Stays opt-in. (Note: every fps under ~32 tonight
+is an E-core arm, the weak-PC stand-in -- full-CPU runs stay at 58-60.)
