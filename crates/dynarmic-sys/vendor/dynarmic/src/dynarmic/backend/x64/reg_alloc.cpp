@@ -692,10 +692,45 @@ void RegAlloc::MoveOutOfTheWay(HostLoc reg) {
     }
 }
 
+namespace {
+/// Omnidroid patch 0082: `OMNI_JIT_SPILL_REGS=0` spills to the stack as before.
+bool SpillToRegisters() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_SPILL_REGS");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+}  // namespace
+
 void RegAlloc::SpillRegister(HostLoc loc) {
     ASSERT_MSG(HostLocIsRegister(loc), "Only registers can be spilled");
     ASSERT_MSG(!LocInfo(loc).IsEmpty(), "There is no need to spill unoccupied registers");
     ASSERT_MSG(!LocInfo(loc).IsLocked(), "Registers that have been allocated must not be spilt");
+
+    // Omnidroid patch 0082: an empty callee-saved register of the same kind, if the allocator may
+    // use one, before a stack slot. A value moved out of the way while it still has uses -- a
+    // scratch use of a value read again later, a register an instruction needs -- went to the
+    // stack: a store, then a load back on the next use (a store-to-load round trip). A
+    // callee-saved register also keeps it across a host call, as a stack slot does.
+    if (SpillToRegisters()) {
+        const bool gpr = HostLocIsGPR(loc);
+        const std::span<const HostLoc> order = gpr ? gpr_order : xmm_order;
+        for (const HostLoc candidate : ABI_ALL_CALLEE_SAVE) {
+            if (candidate == loc || HostLocIsGPR(candidate) != gpr || HostLocIsXMM(candidate) == gpr) {
+                continue;
+            }
+            if (std::find(order.begin(), order.end(), candidate) == order.end()) {
+                continue;  // not the allocator's to use (the fastmem base, the page table, ...)
+            }
+            const HostLocInfo& info = std::as_const(*this).LocInfo(candidate);
+            if (!info.IsEmpty() || info.IsLocked()) {
+                continue;
+            }
+            Move(candidate, loc);
+            return;
+        }
+    }
 
     const HostLoc new_loc = FindFreeSpill();
     Move(new_loc, loc);

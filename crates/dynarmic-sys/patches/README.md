@@ -843,3 +843,20 @@ first blocks of every function of libc, libart, libhwui, libandroid_runtime and 
 libroblox's code, registers seeded per start, all 31 registers and the PC hashed after every block,
 ~385k block runs): identical hashes on and off; the wrong first form changed libart's and
 libroblox's. dynarmic-sys suite: as before (Linux: the snapshot tests' known -10).
+
+### 0082 — x64: a value moved out of the way goes to a free callee-saved register (`OMNI_JIT_SPILL_REGS`, on unless `0`)
+
+x64 register allocator. `SpillRegister` always moved a value to a stack slot. It runs whenever a
+value is moved out of a register it still has uses after -- a scratch use of a value read again later
+(`UseScratchImpl`), a register an instruction needs -- so a Luau handler (`libroblox+0x5f58b8c`, 13
+guest instructions) emitted `mov [rsp+0x10],r14d ... mov r14d,[rsp+0x10]` twice, with registers free:
+a store and a load back on the next use. Now an empty, unlocked callee-saved register of the same kind
+that the allocator may use (in its own GPR/XMM order, so not the fastmem base or the page table) is
+taken first, and the stack only when there is none; a callee-saved register keeps the value across a
+host call as the stack slot did. The same handler: `mov ebx,r14d ... rorx r10d,ebx,0x10`, no stack
+access (500 -> 486 bytes).
+
+MEASURED (i5-4460): code -1% (libc 391.5 -> 387.7 B/block, libart 467.7 -> 464.4), first translation
+emit 12.04 -> 12.24 us/block (within noise). Guest-visible differential (`tests/differential.rs`, five
+libraries with libroblox, ~385k block runs): identical hashes on and off. dynarmic-sys suite: as
+before.
