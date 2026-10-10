@@ -35,6 +35,14 @@ struct TranslationOptions {
     /// If this is false, we treat the instruction as a NOP.
     /// If this is true, we emit an ExceptionRaised instruction.
     bool hook_hint_instructions = true;
+
+    /// Omnidroid patch 0098: `IC IVAU` raises its callback and the block goes on, instead of ending
+    /// there and returning to the dispatcher (a guest's `__clear_cache` was a return to the
+    /// dispatcher per 64-byte line); `ISB` raises `SynchronizeBatched` before it ends its block, on
+    /// a halt check. The embedder collects the lines and invalidates them at the `ISB` -- which the
+    /// architecture requires before the new code may run -- or whenever it is next outside the
+    /// guest.
+    bool batch_ic_ivau = false;
 };
 
 /**

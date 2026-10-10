@@ -576,6 +576,10 @@ uint32_t od_set_live_fp_optimizations(uint32_t mask);
  * what they were translated with: clear the cache to have them again. Returns the value in force
  * (1 or 0); a no-op returning 0 on arm64. `od_precise_get_set` reads it. */
 uint32_t od_set_precise_get_set(uint32_t on);
+/* Patch 0098: `IC IVAU` batched until `ISB` for blocks translated from now on (the embedder's
+ * instruction-cache callback collects the lines and invalidates them on `SynchronizeBatched`, op 3,
+ * or when it is next outside the guest); returns the switch (1 or 0), 0 on arm64. */
+uint32_t od_set_batch_ic_ivau(uint32_t on);
 uint32_t od_precise_get_set(void);
 
 /* Patch 0039 (x64 only): non-zero keeps element 0 of a vector -- every scalar floating-point

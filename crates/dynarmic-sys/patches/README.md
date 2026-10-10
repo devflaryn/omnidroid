@@ -1058,3 +1058,25 @@ buffer with a constant size -- a move -- and leaves the rest to `Bytes`.
 MEASURED (`the_speed_of_snapshot_install`, i5-4460, 3 interleaved runs against 0096): **488/487/486
 -> 476/479/472 ns a block (-2.3%)**. The snapshot test passes lazily and not (Linux, first cache
 freed first).
+
+### 0098 — A64: `IC IVAU` batched until `ISB` (a live switch, off by default)
+
+A guest that writes code (the game's Luau native code at its start and its world's load: 174k and
+45k lines invalidated in one 5 s period each, s13) cleans it with `__clear_cache`: `DC CVAU` over
+the range, `DSB ISH`, `IC IVAU` over each 64-byte line, `DSB ISH`, `ISB`. Each `IC IVAU` ended its
+block on a halt check and returned to the dispatcher; the embedder's callback queued the line's
+invalidation, which halted the jit, returned from `Run` and took the shared code cache's lock -- once
+per line.
+
+With `live_batch_ic_ivau` on (`od_set_batch_ic_ivau`, read at translation, part of the code shape a
+snapshot is checked against): `TranslationOptions::batch_ic_ivau` makes `IC IVAU` raise its callback
+and the block go on, and `ISB` raise `InstructionCacheOperation::SynchronizeBatched` (new, op 3)
+before ending its block on a halt check. The embedder collects the lines and invalidates them at
+that operation -- the architecture requires an `ISB` between `IC IVAU` and running the new code --
+and whenever the thread is next outside the jit (omni-cpu: after every `od_jit_run`, and before an
+`IC IALLU`). Off, nothing changes.
+
+Tested (`omni-cpu/tests/icache_batch.rs`, the switch on): code rewritten then synchronised runs new
+in the same run, on another thread, and when the thread left without an `ISB`; a clear-cache loop
+over 200 lines invalidates each. MEASURED (`the_cost_of_a_clear_cache_loop`, i5-4460, 960 lines):
+**218 -> 15.4 ns a line** (14x).

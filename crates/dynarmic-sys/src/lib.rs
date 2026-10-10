@@ -120,6 +120,11 @@ pub mod exception {
     pub const NO_EXECUTE_FAULT: u32 = 9;
 }
 
+/// Patch 0098: the instruction-cache callback's operation at an `ISB` with `IC IVAU` batched
+/// ([`od_set_batch_ic_ivau`]): invalidate the lines collected since the last one. (0, 1, 2 are
+/// `IC IVAU`, `IC IALLU`, `IC IALLUIS`.)
+pub const OD_ICACHE_SYNCHRONIZE_BATCHED: u32 = 3;
+
 /// Single-step completed.
 pub const OD_HALT_STEP: u32 = 0x0000_0001;
 /// Execution stopped to service a code-cache invalidation.
@@ -1053,6 +1058,12 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_precise_get_set(on: u32) -> u32;
+
+    /// Patch 0098: `IC IVAU` batched until `ISB` for blocks translated from now on -- the
+    /// instruction-cache callback is then called with [`OD_ICACHE_SYNCHRONIZE_BATCHED`] at an `ISB`,
+    /// and must invalidate the lines it collected (and should whenever the guest leaves the jit).
+    /// Returns the switch (1 or 0); 0 on arm64.
+    pub fn od_set_batch_ic_ivau(on: u32) -> u32;
 
     /// Patch 0037: the switch [`od_set_precise_get_set`] sets (1 or 0; 0 on arm64).
     ///

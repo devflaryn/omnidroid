@@ -82,6 +82,7 @@ dynarmic/
                and ../patches/0095-x64-a-snapshot-installs-faster.patch
                and ../patches/0096-x64-fastmem-sites-in-order-not-sorted-again.patch
                and ../patches/0097-x64-a-snapshot-s-fields-read-in-place.patch
+               and ../patches/0098-a64-ic-ivau-batched-until-isb.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

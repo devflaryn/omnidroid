@@ -43,6 +43,9 @@ inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
 /// the pass). Process-wide, read at translation: a block translated before the switch keeps what
 /// it was translated with.
 extern std::atomic<std::uint32_t> live_precise_get_set;
+/// Omnidroid patch 0098: `IC IVAU` batched until `ISB` (`A64::TranslationOptions::batch_ic_ivau`), for
+/// blocks translated from now on.
+extern std::atomic<std::uint32_t> live_batch_ic_ivau;
 
 /// Omnidroid patch 0042: non-zero emits the hit paths of the return-stack buffer and the
 /// fast-dispatch table inside each `RET`/`BR`/`BLR` block, from the target PC still in a register,

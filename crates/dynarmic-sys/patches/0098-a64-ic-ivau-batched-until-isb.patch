@@ -1,0 +1,123 @@
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.cpp b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+index 0f8d86f9..b1cc5ceb 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.cpp
++++ b/src/dynarmic/backend/x64/a64_emit_x64.cpp
+@@ -41,6 +41,7 @@ using namespace Xbyak::util;
+ 
+ std::atomic<std::uint32_t> live_fp_optimizations{0};
+ std::atomic<std::uint32_t> live_precise_get_set{1};
++std::atomic<std::uint32_t> live_batch_ic_ivau{0};  // patch 0098
+ std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
+ std::atomic<std::uint32_t> live_shrink_tables{0};
+ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CodegenPart::Count)> codegen_census{};
+diff --git a/src/dynarmic/backend/x64/a64_emit_x64.h b/src/dynarmic/backend/x64/a64_emit_x64.h
+index c009be87..d23eae1e 100644
+--- a/src/dynarmic/backend/x64/a64_emit_x64.h
++++ b/src/dynarmic/backend/x64/a64_emit_x64.h
+@@ -43,6 +43,9 @@ inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
+ /// the pass). Process-wide, read at translation: a block translated before the switch keeps what
+ /// it was translated with.
+ extern std::atomic<std::uint32_t> live_precise_get_set;
++/// Omnidroid patch 0098: `IC IVAU` batched until `ISB` (`A64::TranslationOptions::batch_ic_ivau`), for
++/// blocks translated from now on.
++extern std::atomic<std::uint32_t> live_batch_ic_ivau;
+ 
+ /// Omnidroid patch 0042: non-zero emits the hit paths of the return-stack buffer and the
+ /// fast-dispatch table inside each `RET`/`BR`/`BLR` block, from the target PC still in a register,
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index f1c7ab05..e80aa0d3 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -78,8 +78,12 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
+ /// The translator's pipeline, as upstream's GetBlock runs it, for one location.
+ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const UserConfig& conf, const Optimization::PolyfillOptions& polyfill_options) {
+     const auto get_code = [&conf](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
+-    IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
+-                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
++    // Patch 0098: `IC IVAU` batched until `ISB` while the switch is on.
++    A64::TranslationOptions options;
++    options.define_unpredictable_behaviour = conf.define_unpredictable_behaviour;
++    options.wall_clock_cntpct = conf.wall_clock_cntpct;
++    options.batch_ic_ivau = live_batch_ic_ivau.load(std::memory_order_relaxed) != 0;
++    IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code, options);
+     Optimization::PolyfillPass(ir_block, polyfill_options);
+     Optimization::A64CallbackConfigPass(ir_block, conf);
+     Optimization::NamingPass(ir_block);
+@@ -1240,6 +1244,7 @@ u64 SharedCodeCache::Impl::CodeShape() const {
+     f.Value(conf.global_monitor == nullptr);
+     f.Value(live_fp_optimizations.load(std::memory_order_relaxed));
+     f.Value(live_precise_get_set.load(std::memory_order_relaxed));
++    f.Value(live_batch_ic_ivau.load(std::memory_order_relaxed));  // patch 0098
+     f.Value(live_fast_dispatch_inline.load(std::memory_order_relaxed));
+     f.Value(live_scalar_fp_in_xmm.load(std::memory_order_relaxed));
+     f.Value(live_fastmem_mask_by_and.load(std::memory_order_relaxed));
+diff --git a/src/dynarmic/frontend/A64/translate/a64_translate.h b/src/dynarmic/frontend/A64/translate/a64_translate.h
+index 2f62ac6e..a3db676e 100644
+--- a/src/dynarmic/frontend/A64/translate/a64_translate.h
++++ b/src/dynarmic/frontend/A64/translate/a64_translate.h
+@@ -35,6 +35,14 @@ struct TranslationOptions {
+     /// If this is false, we treat the instruction as a NOP.
+     /// If this is true, we emit an ExceptionRaised instruction.
+     bool hook_hint_instructions = true;
++
++    /// Omnidroid patch 0098: `IC IVAU` raises its callback and the block goes on, instead of ending
++    /// there and returning to the dispatcher (a guest's `__clear_cache` was a return to the
++    /// dispatcher per 64-byte line); `ISB` raises `SynchronizeBatched` before it ends its block, on
++    /// a halt check. The embedder collects the lines and invalidates them at the `ISB` -- which the
++    /// architecture requires before the new code may run -- or whenever it is next outside the
++    /// guest.
++    bool batch_ic_ivau = false;
+ };
+ 
+ /**
+diff --git a/src/dynarmic/frontend/A64/translate/impl/sys_ic.cpp b/src/dynarmic/frontend/A64/translate/impl/sys_ic.cpp
+index 3c91168c..62e34196 100644
+--- a/src/dynarmic/frontend/A64/translate/impl/sys_ic.cpp
++++ b/src/dynarmic/frontend/A64/translate/impl/sys_ic.cpp
+@@ -23,6 +23,9 @@ bool TranslatorVisitor::IC_IALLUIS() {
+ 
+ bool TranslatorVisitor::IC_IVAU(Reg Rt) {
+     ir.InstructionCacheOperationRaised(InstructionCacheOperation::InvalidateByVAToPoU, X(64, Rt));
++    if (options.batch_ic_ivau) {
++        return true;  // Omnidroid patch 0098: the line is collected; the block goes on
++    }
+     ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+     ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
+     return false;
+diff --git a/src/dynarmic/frontend/A64/translate/impl/system.cpp b/src/dynarmic/frontend/A64/translate/impl/system.cpp
+index 9f1dbd14..a02e2126 100644
+--- a/src/dynarmic/frontend/A64/translate/impl/system.cpp
++++ b/src/dynarmic/frontend/A64/translate/impl/system.cpp
+@@ -91,6 +91,15 @@ bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
+ }
+ 
+ bool TranslatorVisitor::ISB(Imm<4> /*CRm*/) {
++    if (options.batch_ic_ivau) {
++        // Omnidroid patch 0098: the lines `IC IVAU` collected are invalidated now; the block ends on
++        // a halt check, which the invalidation's halt takes.
++        ir.InstructionCacheOperationRaised(InstructionCacheOperation::SynchronizeBatched, ir.Imm64(0));
++        ir.InstructionSynchronizationBarrier();
++        ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
++        ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
++        return false;
++    }
+     ir.InstructionSynchronizationBarrier();
+     ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+     ir.SetTerm(IR::Term::ReturnToDispatch{});
+diff --git a/src/dynarmic/interface/A64/config.h b/src/dynarmic/interface/A64/config.h
+index a8e3967a..ba346d2b 100644
+--- a/src/dynarmic/interface/A64/config.h
++++ b/src/dynarmic/interface/A64/config.h
+@@ -80,7 +80,11 @@ enum class InstructionCacheOperation {
+     /// IC IALLU
+     InvalidateAllToPoU,
+     /// IC IALLUIS
+-    InvalidateAllToPoUInnerSharable
++    InvalidateAllToPoUInnerSharable,
++    /// Omnidroid patch 0098: an `ISB` with `IC IVAU` batched (`TranslationOptions::batch_ic_ivau`):
++    /// the lines the `IC IVAU`s named since the last one must be invalidated now. The block ends
++    /// right after it, on a halt check.
++    SynchronizeBatched,
+ };
+ 
+ struct UserCallbacks {

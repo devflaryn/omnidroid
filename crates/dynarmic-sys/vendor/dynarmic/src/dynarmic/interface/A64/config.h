@@ -80,7 +80,11 @@ enum class InstructionCacheOperation {
     /// IC IALLU
     InvalidateAllToPoU,
     /// IC IALLUIS
-    InvalidateAllToPoUInnerSharable
+    InvalidateAllToPoUInnerSharable,
+    /// Omnidroid patch 0098: an `ISB` with `IC IVAU` batched (`TranslationOptions::batch_ic_ivau`):
+    /// the lines the `IC IVAU`s named since the last one must be invalidated now. The block ends
+    /// right after it, on a halt check.
+    SynchronizeBatched,
 };
 
 struct UserCallbacks {

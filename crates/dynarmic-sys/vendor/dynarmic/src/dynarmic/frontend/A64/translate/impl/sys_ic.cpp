@@ -23,6 +23,9 @@ bool TranslatorVisitor::IC_IALLUIS() {
 
 bool TranslatorVisitor::IC_IVAU(Reg Rt) {
     ir.InstructionCacheOperationRaised(InstructionCacheOperation::InvalidateByVAToPoU, X(64, Rt));
+    if (options.batch_ic_ivau) {
+        return true;  // Omnidroid patch 0098: the line is collected; the block goes on
+    }
     ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
     ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
     return false;

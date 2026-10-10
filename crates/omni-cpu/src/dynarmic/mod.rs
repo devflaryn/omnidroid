@@ -478,6 +478,20 @@ pub fn set_compact_code(bits: u32) -> u32 {
     unsafe { dynarmic_sys::od_set_compact_code(bits) }
 }
 
+/// **`IC IVAU` batched until `ISB`** (dynarmic patch 0098, x64), process-wide, for blocks translated
+/// from now on: a guest's `IC IVAU` no longer ends its block and returns to the dispatcher (and, with
+/// a shared cache, takes the cache's lock) once per 64-byte line -- `__clear_cache` over a 4 KiB
+/// function was 64 of each. The lines are collected and invalidated together at the next `ISB`,
+/// which the architecture requires between `IC IVAU` and running the new code, or when the thread
+/// is next outside the guest (any exit from `run`). Off by default; `OMNI_JIT_IC_BATCH=1` (through
+/// omni-linux) turns it on. Returns what is in force (`false` on arm64).
+pub fn set_batch_ic_ivau(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    let kept = unsafe { dynarmic_sys::od_set_batch_ic_ivau(u32::from(on)) } != 0;
+    callbacks::IC_BATCH.store(kept, std::sync::atomic::Ordering::Relaxed);
+    kept
+}
+
 /// **Whether hot `libc.so` functions run a native host implementation** (patch: HLE), process-wide.
 /// With it on, a guest call to a registered [`DynarmicBackend::add_hle`] entry (`memcpy`,
 /// `memmove`, `memset`) runs host code -- args `X0`-`X2`, result `X0`, honouring guest faults --
@@ -2077,6 +2091,9 @@ pub(crate) struct CpuCtx {
     pub(crate) shared_plants: Option<Arc<Planted>>,
     /// This space's other contexts' jits, for a guest `IC IVAU` to reach (none with a shared cache).
     pub(crate) peers: Option<Arc<Peers>>,
+    /// Patch 0098 ([`set_batch_ic_ivau`]): the lines `IC IVAU` named and not invalidated yet, as
+    /// `[start, end)` ranges, adjacent lines merged.
+    pub(crate) ic_pending: Vec<(u64, u64)>,
     pub(crate) plants_here: std::collections::HashMap<GuestAddr, u32>,
     pub(crate) ticks_remaining: u64,
     pub(crate) ticks_used: u64,
@@ -2205,6 +2222,7 @@ impl DynarmicCpu {
             seen_blocks: None,
             shared_plants: None,
             peers: shared.code_cache.is_none().then(|| Arc::clone(&shared.peers)),
+            ic_pending: Vec::new(),
             plants_here: std::collections::HashMap::new(),
             ticks_remaining: 0,
             ticks_used: 0,
@@ -2652,6 +2670,9 @@ impl GuestCpu for DynarmicCpu {
             // whatever else identity mapping exposes, and the containment for that is the
             // one-process-per-instance boundary in `ARCHITECTURE.md` section 7.
             let halt_reason = unsafe { od_jit_run(self.jit) };
+            // Patch 0098: lines a batched `IC IVAU` named and no `ISB` took yet are invalidated as
+            // soon as the thread is outside the guest (now, not executing: at once).
+            self.with_ctx(callbacks::flush_ic_pending);
 
             let used = self.with_ctx(|ctx| ctx.ticks_used);
             budget.charge(used);

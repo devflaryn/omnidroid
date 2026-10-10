@@ -32,6 +32,8 @@ namespace Dynarmic::Backend::X64 {
 extern std::atomic<std::uint32_t> live_fp_optimizations;
 /* Patch 0037's switch, likewise. */
 extern std::atomic<std::uint32_t> live_precise_get_set;
+/* Patch 0098's switch, likewise. */
+extern std::atomic<std::uint32_t> live_batch_ic_ivau;
 /* Patch 0042's switch, likewise. */
 extern std::atomic<std::uint32_t> live_fast_dispatch_inline;
 /* Patch 0066's switch, likewise. */
@@ -1054,6 +1056,16 @@ uint32_t od_set_live_fp_optimizations(uint32_t mask) {
 uint32_t od_set_precise_get_set(uint32_t on) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     Dynarmic::Backend::X64::live_precise_get_set.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_set_batch_ic_ivau(uint32_t on) {
+#if !defined(__aarch64__) && !defined(_M_ARM64)
+    Dynarmic::Backend::X64::live_batch_ic_ivau.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
     return on != 0 ? 1u : 0u;
 #else
     (void)on;

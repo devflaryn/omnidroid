@@ -78,8 +78,12 @@ static Optimization::PolyfillOptions GenPolyfillOptions(const BlockOfCode& code)
 /// The translator's pipeline, as upstream's GetBlock runs it, for one location.
 static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const UserConfig& conf, const Optimization::PolyfillOptions& polyfill_options) {
     const auto get_code = [&conf](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
-    IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code,
-                                        {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+    // Patch 0098: `IC IVAU` batched until `ISB` while the switch is on.
+    A64::TranslationOptions options;
+    options.define_unpredictable_behaviour = conf.define_unpredictable_behaviour;
+    options.wall_clock_cntpct = conf.wall_clock_cntpct;
+    options.batch_ic_ivau = live_batch_ic_ivau.load(std::memory_order_relaxed) != 0;
+    IR::Block ir_block = A64::Translate(A64::LocationDescriptor{current_location}, get_code, options);
     Optimization::PolyfillPass(ir_block, polyfill_options);
     Optimization::A64CallbackConfigPass(ir_block, conf);
     Optimization::NamingPass(ir_block);
@@ -1240,6 +1244,7 @@ u64 SharedCodeCache::Impl::CodeShape() const {
     f.Value(conf.global_monitor == nullptr);
     f.Value(live_fp_optimizations.load(std::memory_order_relaxed));
     f.Value(live_precise_get_set.load(std::memory_order_relaxed));
+    f.Value(live_batch_ic_ivau.load(std::memory_order_relaxed));  // patch 0098
     f.Value(live_fast_dispatch_inline.load(std::memory_order_relaxed));
     f.Value(live_scalar_fp_in_xmm.load(std::memory_order_relaxed));
     f.Value(live_fastmem_mask_by_and.load(std::memory_order_relaxed));

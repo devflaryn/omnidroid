@@ -91,6 +91,15 @@ bool TranslatorVisitor::DMB(Imm<4> /*CRm*/) {
 }
 
 bool TranslatorVisitor::ISB(Imm<4> /*CRm*/) {
+    if (options.batch_ic_ivau) {
+        // Omnidroid patch 0098: the lines `IC IVAU` collected are invalidated now; the block ends on
+        // a halt check, which the invalidation's halt takes.
+        ir.InstructionCacheOperationRaised(InstructionCacheOperation::SynchronizeBatched, ir.Imm64(0));
+        ir.InstructionSynchronizationBarrier();
+        ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
+        ir.SetTerm(IR::Term::CheckHalt{IR::Term::ReturnToDispatch{}});
+        return false;
+    }
     ir.InstructionSynchronizationBarrier();
     ir.SetPC(ir.Imm64(ir.current_location->PC() + 4));
     ir.SetTerm(IR::Term::ReturnToDispatch{});

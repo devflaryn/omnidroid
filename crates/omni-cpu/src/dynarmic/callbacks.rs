@@ -860,6 +860,39 @@ unsafe extern "C" fn cb_exception_raised(ctx: *mut c_void, pc: u64, kind: u32) {
     }
 }
 
+/// Patch 0098: `IC IVAU` batched until `ISB` ([`crate::dynarmic::set_batch_ic_ivau`]).
+pub(crate) static IC_BATCH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Patch 0098: past this many separate ranges the pending lines are invalidated at once (a guest
+/// flushing scattered lines without an `ISB` for a long time).
+const IC_PENDING_MAX: usize = 64;
+
+/// Patch 0098: invalidate the lines batched `IC IVAU`s named, on every thread of the space as an
+/// unbatched one does. From a callback (the jit executing) the invalidation is queued and halts it.
+pub(crate) fn flush_ic_pending(c: &mut CpuCtx) {
+    if c.ic_pending.is_empty() || c.jit.is_null() {
+        return;
+    }
+    let ranges = std::mem::take(&mut c.ic_pending);
+    let invalidate = |jit: *mut c_void| {
+        for &(start, end) in &ranges {
+            // SAFETY: the jit is live (its context is); `od_jit_invalidate_range` is safe from a
+            // callback and from outside one.
+            unsafe { dynarmic_sys::od_jit_invalidate_range(jit, start, end - start) };
+        }
+    };
+    match &c.peers {
+        Some(peers) => {
+            for &jit in peers.0.lock().iter() {
+                invalidate(jit as *mut c_void);
+            }
+        }
+        None => invalidate(c.jit),
+    }
+    c.ic_pending = ranges;
+    c.ic_pending.clear();
+}
+
 /// `IC IVAU` / `IC IALLU` / `IC IALLUIS`: the guest telling us it wrote code.
 ///
 /// Without this a guest that patches itself — every JIT the engine embeds — executes stale
@@ -873,6 +906,31 @@ unsafe extern "C" fn cb_icache_op(ctx: *mut c_void, op: u32, vaddr: u64) {
             if c.jit.is_null() {
                 return;
             }
+            // Patch 0098: batched, a line is collected (merged into the last range when they
+            // touch) and the block goes on; the `ISB` after it (`OD_ICACHE_SYNCHRONIZE_BATCHED`)
+            // invalidates them, and so does the thread's next exit from `run`.
+            if op == dynarmic_sys::OD_ICACHE_SYNCHRONIZE_BATCHED {
+                flush_ic_pending(c);
+                return;
+            }
+            if op == 0 && IC_BATCH.load(Ordering::Relaxed) {
+                let (start, end) = (vaddr & !63, (vaddr & !63) + 64);
+                match c.ic_pending.last_mut() {
+                    Some(last) if start <= last.1 && end >= last.0 => {
+                        last.0 = last.0.min(start);
+                        last.1 = last.1.max(end);
+                    }
+                    _ => {
+                        if c.ic_pending.len() >= IC_PENDING_MAX {
+                            flush_ic_pending(c);
+                        }
+                        c.ic_pending.push((start, end));
+                    }
+                }
+                return;
+            }
+            // Anything else invalidates now; what was batched goes first.
+            flush_ic_pending(c);
             // `op` 0 is `IC IVAU` (one cache line); anything else is an all-instruction-cache
             // operation. dynarmic's own A64 frontend raises this from a `CheckHalt{ReturnToDispatch}`
             // terminal, so invalidating from here is safe.

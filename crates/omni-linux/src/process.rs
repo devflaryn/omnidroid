@@ -174,6 +174,13 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_TABLE_SHRINK").is_none() {
             let _ = omni_cpu::dynarmic::set_shrink_tables(true);
         }
+        // `IC IVAU` batched until `ISB` (dynarmic patch 0098): opt-in, `OMNI_JIT_IC_BATCH=1`. The game
+        // writes code at its start and its world's load (174k and 45k lines invalidated, s13), each
+        // line a return to the dispatcher and the shared cache's lock.
+        if std::env::var("OMNI_JIT_IC_BATCH").as_deref() == Ok("1") {
+            let on = omni_cpu::dynarmic::set_batch_ic_ivau(true);
+            eprintln!("JIT SWITCH: IC IVAU batched until ISB (OMNI_JIT_IC_BATCH=1): {}", if on { "on" } else { "not available" });
+        }
     });
 }
 
