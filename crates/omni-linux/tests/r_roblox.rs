@@ -55,9 +55,11 @@ fn histogram(png: &Path) -> Option<(f64, usize)> {
 /// binds again at boot), the loopback namespace, and the run's own files in `/data/local/tmp`.
 const NOT_SAVED: &[&str] = &[".omni-binds", ".omni-loopback", "data/local/tmp"];
 
-/// Copy the device at `from` into `to` (made), less `NOT_SAVED`: the bytes copied.
+/// Copy the device at `from` into `to` (made), less `NOT_SAVED`: the bytes copied. The directories
+/// are made first, then the files copied by four threads, the largest first (a saved Roblox device
+/// is ~840 files, 14 of them 627 of its 778 MB: one thread per big file instead of one after another).
 fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
-    fn walk(from: &Path, to: &Path, rel: &Path, bytes: &mut u64) -> std::io::Result<()> {
+    fn walk(from: &Path, to: &Path, rel: &Path, files: &mut Vec<(u64, std::path::PathBuf)>) -> std::io::Result<()> {
         std::fs::create_dir_all(to.join(rel))?;
         for e in std::fs::read_dir(from.join(rel))? {
             let e = e?;
@@ -66,17 +68,41 @@ fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
                 continue;
             }
             if e.file_type()?.is_dir() {
-                walk(from, to, &r, bytes)?;
+                walk(from, to, &r, files)?;
             } else {
-                *bytes += std::fs::copy(e.path(), to.join(&r))?;
+                files.push((e.metadata().map_or(0, |m| m.len()), r));
             }
         }
         Ok(())
     }
-    let mut bytes = 0;
-    walk(from, to, Path::new(""), &mut bytes)?;
+    let mut files = Vec::new();
+    walk(from, to, Path::new(""), &mut files)?;
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let bytes = std::sync::atomic::AtomicU64::new(0);
+    let failed = parking_lot::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some((_, r)) = files.get(i) else { return };
+                match std::fs::copy(from.join(r), to.join(r)) {
+                    Ok(n) => {
+                        bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        failed.lock().get_or_insert(e);
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = failed.into_inner() {
+        return Err(e);
+    }
     std::fs::create_dir_all(to.join("data/local/tmp"))?;
-    Ok(bytes)
+    Ok(bytes.into_inner())
 }
 
 /// Save the device at `kept` (its boot ended) as `g`, whole or not at all: copied beside, then
@@ -736,4 +762,40 @@ module=emu-hide
         "and a different golden key"
     );
     assert_eq!(plain, golden_dir(&root, &apk, None, true, "tr-TR"), "the unrooted key stays byte-identical");
+}
+
+#[test]
+fn a_device_copy_has_every_file_but_the_run_s_own() {
+    let root = std::env::temp_dir().join(format!("omni-copy-device-{}", std::process::id()));
+    let (from, to) = (root.join("from"), root.join("to"));
+    let _ = std::fs::remove_dir_all(&root);
+    let files: &[(&str, usize)] = &[
+        ("data/app/x/base.apk", 3 << 20),
+        ("data/app/x/lib/arm64/libgame.so", 1 << 20),
+        ("data/data/pkg/files/a", 10),
+        ("data/data/pkg/files/deep/er/b", 0),
+        ("data/local/tmp/run-only", 5),
+        (".omni-binds", 7),
+        ("system-file", 4096),
+    ];
+    for (rel, len) in files {
+        let path = from.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, (0..*len).map(|i| (i * 31 + rel.len()) as u8).collect::<Vec<u8>>()).unwrap();
+    }
+    std::fs::create_dir_all(from.join("data/empty-dir")).unwrap();
+    let bytes = copy_device(&from, &to).expect("copied");
+    let mut want = 0u64;
+    for (rel, len) in files {
+        let skipped = NOT_SAVED.iter().any(|n| Path::new(rel).starts_with(n));
+        assert_eq!(to.join(rel).exists(), !skipped, "{rel}");
+        if !skipped {
+            assert_eq!(std::fs::read(to.join(rel)).unwrap(), std::fs::read(from.join(rel)).unwrap(), "{rel}");
+            want += *len as u64;
+        }
+    }
+    assert_eq!(bytes, want);
+    assert!(to.join("data/empty-dir").is_dir(), "empty directories are kept");
+    assert!(to.join("data/local/tmp").is_dir(), "the run's directory is made again, empty");
+    let _ = std::fs::remove_dir_all(&root);
 }
