@@ -780,7 +780,9 @@ fn sys_madvise(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
         || (a[2] == MADV_FREE && MADV_FREE_DISCARDS.load(std::sync::atomic::Ordering::Relaxed));
     if discards {
         let len = p.mm.span(addr, a[1]).ok_or(EINVAL)?;
+        let t = madvise_stats::start();
         p.mm.discard(addr, len)?;
+        madvise_stats::timed(a[2], t);
     }
     Ok(0)
 }
@@ -985,6 +987,8 @@ mod madvise_stats {
     const ADVICE: usize = 32;
     static CALLS: [AtomicU64; ADVICE] = [const { AtomicU64::new(0) }; ADVICE];
     static BYTES: [AtomicU64; ADVICE] = [const { AtomicU64::new(0) }; ADVICE];
+    /// Nanoseconds spent carrying the advice out (a discard: the layout lock held exclusively).
+    static NANOS: [AtomicU64; ADVICE] = [const { AtomicU64::new(0) }; ADVICE];
 
     fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
@@ -994,8 +998,8 @@ mod madvise_stats {
                 std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
                 let rows: Vec<String> = (0..ADVICE)
                     .filter_map(|i| {
-                        let (c, b) = (CALLS[i].swap(0, Relaxed), BYTES[i].swap(0, Relaxed));
-                        (c > 0).then(|| format!("advice {i}: {c}x {} MiB", b >> 20))
+                        let (c, b, ns) = (CALLS[i].swap(0, Relaxed), BYTES[i].swap(0, Relaxed), NANOS[i].swap(0, Relaxed));
+                        (c > 0).then(|| format!("advice {i}: {c}x {} MiB in {} ms", b >> 20, ns / 1_000_000))
                     })
                     .collect();
                 if !rows.is_empty() {
@@ -1012,5 +1016,17 @@ mod madvise_stats {
             CALLS[i].fetch_add(1, Relaxed);
             BYTES[i].fetch_add(len, Relaxed);
         }
+    }
+
+    /// When counting: the time from `since` on, for `advice`.
+    pub(super) fn timed(advice: u64, since: Option<std::time::Instant>) {
+        if let Some(t) = since {
+            NANOS[(advice as usize).min(ADVICE - 1)].fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    /// An instant to time a call from, when counting.
+    pub(super) fn start() -> Option<std::time::Instant> {
+        on().then(std::time::Instant::now)
     }
 }
