@@ -143,6 +143,12 @@ Also: every rebuild of the host binary refuses every snapshot (host addresses ar
   need the saved files made read-only first. Not done: it changes the MCP's main path.
 - **Old saved devices set aside** in `%TEMP%\omni-golden` (`...-gutted-<date>`) still take disk
   space; they are yours to delete.
+- **`r_roblox`'s plant-first says `[r] cookie planted: failed` on every run** (every log since
+  plant-first became the default, 2026-10-09 22:51; `ok` on 10-04 was the old dance). The `--then`
+  shell runs as uid 2000 (`omni-linux-run`, `Process::spawn_as(config, 2000)`), and `chown_node`
+  lets only root change an owner, so `chown -R $uid:$uid app_webview` fails. The store is copied
+  first, so the app reads it and signs in anyway (`DID_LOG_IN` in every run tonight), but the files
+  stay the shell's. `omnidroid aosp`'s `warm::plant` has the same command; not changed here.
 
 ## Session s7 (02:04-03:00): the game's live code budget (`s7-live.csv`)
 
@@ -378,3 +384,17 @@ crashed (6 of 6, s15 + s17); with snapshots at full CPU (s12, s16: 3 runs, 90-11
 So: a snapshot-specific race that slow cores expose. **Snapshots are not to be made a default until
 it is found** (the recommendation in the morning report is withdrawn). The next build reports a
 host crash's instruction (`[host-crash]`, 2b34552); s26 reproduces it there.
+
+## Session s18 (08:17-08:40): trimming once against every 120 s (`s18-trimonce.csv`, the s13 build)
+
+| arm | fps | CPU ms/frame (all) | commit GB | game WS private GB | available GB | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| periodic | 59.09 | 44.44 | 3.826 | 0.768 | 10.846 | 45.4 | 69.4 |
+| once (`OMNI_WS_TRIM_ONCE=1`) | 58.94 | 42.93 | 3.880 | 0.918 | 10.610 | 48.6 | 74.7 |
+| once | 59.46 | 36.41 | 3.865 | 0.886 | 10.700 | 47.0 | 72.0 |
+| periodic | 59.52 | 38.30 | 3.866 | 0.744 | 10.824 | 45.8 | 70.3 |
+
+Trimming once leaves the game's working set ~145 MB larger and ~180 MB less memory available
+(2/2); its CPU is 39.7 against 41.4 ms a frame, a difference smaller than the one between the two
+pairs (44 vs 38 ms). s13's hint of a cost of the periodic trim is not borne out. **Periodic stays
+the default.**

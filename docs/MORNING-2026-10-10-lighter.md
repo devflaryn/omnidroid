@@ -45,8 +45,9 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
    game's 1.4 M-block snapshot took 1.3 s at its process start.
 5. **RAM: most of what omnidroid held resident was cold** -- every host process trims its working
    set every 120 s, an idle one after 30 s: **~1.7-1.9 GB more available memory** (twice in s10,
-   twice in s13), Task Manager's figure 3.0 -> ~0.7 GB. s13 hints at a small CPU cost of the
-   periodic trim (2/2, +1-2.5 ms a frame); s18 tries trimming once instead. `OMNI_WS_TRIM=0` /
+   twice in s13), Task Manager's figure 3.0 -> ~0.7 GB. Trimming only once instead (s18)
+   keeps ~180 MB less available for no measurable CPU (39.7 vs 41.4 ms a frame, inside the noise), so
+   the periodic trim stays. `OMNI_WS_TRIM=0` /
    `OMNI_WS_TRIM_IDLE=0` turn them off.
 6. **Boot**: init's services started side by side (2.37 -> 0.42 s); no fixed 1.5 s sleep before
    system_server; fault thunks 94% smaller (0078) and code aging's floor 6 MiB (-90..-110 MB).
@@ -66,7 +67,7 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   zone, forgetting and 512 MiB of live code by default). s17 measures them on 4 E-cores. **Not ready for a default: on four E-cores (s17) both snapshot runs crashed the game's host**
   (an access violation while the cache retired regions; never without snapshots, 6 of 6; never at
   full CPU). Being chased (s26, with the new `[host-crash]` report).
-- The idle apps left out of the image on 4 E-cores (s15), trimming once vs every 120 s (s18), the
+- The idle apps left out of the image on 4 E-cores (s15: no gain), the
   saved-device path you actually boot (s19), and who holds the system host's 13-16 MiB blocks (380
   MiB of its 1.03 GB commit; s20).
 
