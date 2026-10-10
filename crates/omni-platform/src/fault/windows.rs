@@ -450,9 +450,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             // can end the process before the top-level filter runs (s26: the game's host died
             // 0xC0000005 with no `[host-crash]` line -- something replaced the filter, or ended
             // the process first).
-            // Not a guest's own fault on address -1 (its handler, further on, takes those: 76
+            // Not a guest's own fault on address -1 or the null page (its handler, further on, takes those: 76
             // in one boot, s19).
-            if CRASH_STDERR.load(Ordering::Relaxed) != 0 && fault.address != usize::MAX && DECLINED_SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            if CRASH_STDERR.load(Ordering::Relaxed) != 0 && fault.address >= 0x1_0000 && fault.address != usize::MAX && DECLINED_SAID.fetch_add(1, Ordering::Relaxed) < 4 {
                 // SAFETY: the OS's exception pointers, valid for this call.
                 unsafe { report(b"\n[host-fault] declined: exception ", info) };
             }
