@@ -117,6 +117,48 @@ mod macos;
 #[cfg(target_os = "macos")]
 use macos as backend;
 
+/// Ask the host's filesystem to compress what is written into `dir` from now on: on Windows the
+/// NTFS compression attribute of the directory (`FSCTL_SET_COMPRESSION`), which files made in it
+/// inherit -- reads and memory maps of them stay as they were, the filesystem decompressing. Whether
+/// it was set; `false` elsewhere, and on a filesystem without compression (FAT, exFAT, ReFS).
+#[must_use]
+pub fn compress_dir(dir: &std::path::Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{COMPRESSION_FORMAT_DEFAULT, FILE_FLAG_BACKUP_SEMANTICS};
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        // winioctl.h: CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 16, METHOD_BUFFERED, FILE_READ_DATA | FILE_WRITE_DATA).
+        const FSCTL_SET_COMPRESSION: u32 = 0x0009_C040;
+        // A directory opens only with backup semantics; the control needs read and write data access.
+        let Ok(handle) = std::fs::OpenOptions::new().read(true).write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(dir) else {
+            return false;
+        };
+        let format: u16 = COMPRESSION_FORMAT_DEFAULT;
+        let mut returned = 0u32;
+        // SAFETY: the handle is open for this call; the input is the two-byte format the control
+        // reads, no output buffer, and `returned` is a live u32; no OVERLAPPED (a synchronous handle).
+        unsafe {
+            DeviceIoControl(
+                handle.as_raw_handle(),
+                FSCTL_SET_COMPRESSION,
+                (&raw const format).cast(),
+                2,
+                std::ptr::null_mut(),
+                0,
+                &raw mut returned,
+                std::ptr::null_mut(),
+            ) != 0
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
 /// The host path an open file is at now (after any rename), for another host process to open the
 /// same file: Windows `GetFinalPathNameByHandleW`, Linux `/proc/self/fd`, macOS `F_GETPATH`.
 ///

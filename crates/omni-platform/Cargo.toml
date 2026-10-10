@@ -46,6 +46,9 @@ windows-sys = { workspace = true, features = [
     # `process::env_is_set_raw`: `GetEnvironmentVariableA`, which a global allocator can call where
     # `std::env` (which allocates) cannot be.
     "Win32_System_Environment",
+    # `fs::compress_dir`: `DeviceIoControl(FSCTL_SET_COMPRESSION)` on a directory (the JIT's
+    # translation snapshots, which compress to about a third).
+    "Win32_System_IO",
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",

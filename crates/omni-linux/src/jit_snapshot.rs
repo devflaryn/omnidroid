@@ -215,6 +215,12 @@ pub fn dir() -> Option<&'static PathBuf> {
     DIR.get_or_init(|| {
         let d = PathBuf::from(std::env::var_os("OMNI_JIT_SNAPSHOT").filter(|v| !v.is_empty())?);
         std::fs::create_dir_all(&d).ok()?;
+        // The snapshots compress to about a third (zstd -1 33%, gzip -1 34% on a 90 MB one; s12's
+        // directory was 2.2 GB): on Windows the directory is made an NTFS-compressed one, which
+        // the files saved in it inherit (`OMNI_JIT_SNAPSHOT_COMPRESS=0`: not).
+        if std::env::var("OMNI_JIT_SNAPSHOT_COMPRESS").as_deref() != Ok("0") && omni_platform::fs::compress_dir(&d) {
+            eprintln!("[jit-snapshot] {}: compressed by the filesystem", d.display());
+        }
         Some(d)
     })
     .as_ref()
