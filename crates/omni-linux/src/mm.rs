@@ -442,6 +442,18 @@ impl Mm {
         if let Some((host, guest, file_len)) = shared {
             self.refuse_unshareable(p, t, &req, fixed)?;
             let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
+            // Past the file's end the mapping is anonymous memory, private commit, and stays so when
+            // the file grows (a pool mapped first and grown with ftruncate) -- said, for a large one.
+            if len - in_file >= 16 << 20 {
+                eprintln!(
+                    "[mm] shared {} +{} MiB at offset {:#x}: {} MiB of it past the file's end ({} bytes), anonymous",
+                    String::from_utf8_lossy(&guest),
+                    len >> 20,
+                    req.offset,
+                    (len - in_file) >> 20,
+                    file_len
+                );
+            }
             let at = if in_file > 0 {
                 let backing = omni_mem::Backing::share(host, &String::from_utf8_lossy(&guest)).map_err(|_| {
                     p.refusals.record("mmap: MAP_SHARED of a file the host cannot share".into(), t.pc, t.lr);
@@ -466,6 +478,18 @@ impl Mm {
         };
         // The part of the request the file covers, in whole pages; the rest is anonymous zeros.
         let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
+        if !sysroot && installed.is_none() && len >= 64 << 20 {
+            // A large private mapping of an app's own file: a copy, private commit -- said.
+            eprintln!(
+                "[mm] private {} +{} MiB at offset {:#x} (file {} bytes, {}shared, prot {:#x}): a copy",
+                String::from_utf8_lossy(&guest),
+                len >> 20,
+                req.offset,
+                file_len,
+                if req.flags & MAP_SHARED != 0 { "" } else { "not " },
+                req.prot
+            );
+        }
         let backing = if in_file == 0 || !self.viewable(req.offset, req.addr, fixed) {
             None
         } else if sysroot {
