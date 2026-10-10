@@ -84,6 +84,60 @@ pub fn mounts(sysroot: &Sysroot) -> Vec<ApexMount> {
     out
 }
 
+/// **The compressed APEXes, decompressed before the first boot** (`OMNI_APEX_PREDECOMPRESS=0`: not).
+/// On a new device `apexd` decompresses every `.capex` into `/data/apex/decompressed` -- 22 files in
+/// the guest's own code, ~1.8 s of init's wait for `apexd.status` on the i7 (s13), more on a slower
+/// machine. What it writes is the capex's `original_apex` entry as it is; finding one already there
+/// that is that APEX (its key, version and root digest), it logs "Skipping decompression". Here each
+/// is taken out of its capex once into a host cache named by the capex's content (beside the
+/// temporary directory's `omni-apex-decompressed`), and linked -- or, where links are not possible,
+/// copied -- into the new instance, root's and read-only, as `apexd` leaves them. The cache's file
+/// is read-only too, so a link is never written through. One that `apexd` rejected would be
+/// decompressed by it as before.
+pub fn predecompress(sysroot: &Sysroot, instance: &std::path::Path, owners: &crate::owners::Owners) {
+    if std::env::var("OMNI_APEX_PREDECOMPRESS").as_deref() == Ok("0") {
+        return;
+    }
+    let cache = std::env::temp_dir().join("omni-apex-decompressed");
+    let dest_dir = instance.join("data").join("apex").join("decompressed");
+    let mut placed = 0;
+    for m in mounts(sysroot).into_iter().filter(|m| m.file.ends_with(".capex")) {
+        let Some(capex) = sysroot.host_path(m.file.as_bytes()) else { continue };
+        let Some(key) = capex.file_name().map(|n| n.to_string_lossy().into_owned()) else { continue };
+        let cached = cache.join(format!("{key}.apex"));
+        if !cached.exists() {
+            let Ok(bytes) = omni_apk::Apk::open(&capex).and_then(|a| a.read_named("original_apex")) else { continue };
+            let _ = std::fs::create_dir_all(&cache);
+            let partial = cache.join(format!("{key}.{}", std::process::id()));
+            if std::fs::write(&partial, &bytes).is_err() {
+                let _ = std::fs::remove_file(&partial);
+                continue;
+            }
+            if let Ok(meta) = std::fs::metadata(&partial) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(true);
+                let _ = std::fs::set_permissions(&partial, perms);
+            }
+            if std::fs::rename(&partial, &cached).is_err() {
+                let _ = std::fs::remove_file(&partial);  // another process made it first
+            }
+        }
+        let dest = dest_dir.join(format!("{}@{}.decompressed.apex", m.name, m.version));
+        if dest.exists() {
+            continue;
+        }
+        let _ = std::fs::create_dir_all(&dest_dir);
+        if std::fs::hard_link(&cached, &dest).is_err() && std::fs::copy(&cached, &dest).is_err() {
+            continue;
+        }
+        owners.set(&dest, crate::owners::Owner { uid: 0, gid: 0, mode: 0o644 });
+        placed += 1;
+    }
+    if placed > 0 {
+        eprintln!("[apex] {placed} compressed APEXes placed decompressed (OMNI_APEX_PREDECOMPRESS=0: apexd decompresses them)");
+    }
+}
+
 /// The XML `apexd` writes: every flattened APEX, active, from its partition.
 #[must_use]
 pub fn apex_info_list(sysroot: &Sysroot) -> Vec<u8> {

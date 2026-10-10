@@ -111,10 +111,24 @@ fn get(p: &Process, key: Key, a: [u64; 6]) -> SysResult {
         }
         // An image path: the image's label and capability.
         None if image_attr(p, &key, &name).is_some() => image_attr(p, &key, &name).expect("checked"),
+        // A file of an instance whose label must outlive the host process that set it.
+        None if name == SELINUX && persistent_label(&key).is_some() => persistent_label(&key).expect("checked").to_vec(),
         None if name == SELINUX => UNLABELED.to_vec(),
         None => return Err(ENODATA),
     };
     reply(p, a[2], a[3], &value)
+}
+
+/// **Labels kept by the place, not the process.** Attributes live in this host process's memory, so
+/// what `apexd`'s `restorecon` set on a decompressed APEX is gone at the next boot of a saved device,
+/// and `apexd` then found every one "unlabeled", called it invalid and decompressed all 22 again, at
+/// every boot. A file in an instance's `/data/apex/decompressed` that nothing labelled reads as what
+/// `file_contexts` gives it (`/data/apex/decompressed/(.*)?  u:object_r:staging_data_file:s0`), as
+/// it would on a device's persistent filesystem -- `crate::apex::predecompress`'s files included.
+fn persistent_label(key: &Key) -> Option<&'static [u8]> {
+    let Key::Host(host) = key else { return None };
+    let mut up = host.parent()?.components().rev().map(|c| c.as_os_str());
+    (up.next()? == "decompressed" && up.next()? == "apex" && up.next()? == "data").then_some(b"u:object_r:staging_data_file:s0\0")
 }
 
 /// An image path's `security.selinux` or `security.capability`.
@@ -212,4 +226,19 @@ pub fn install(table: &mut Table) {
     table.set(nr::REMOVEXATTR, sys_removexattr);
     table.set(nr::LREMOVEXATTR, sys_lremovexattr);
     table.set(nr::FREMOVEXATTR, sys_fremovexattr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_decompressed_apex_keeps_its_label_and_nothing_else_does() {
+        let at = |p: &str| persistent_label(&Key::Host(PathBuf::from(p)));
+        let label: &[u8] = b"u:object_r:staging_data_file:s0\0";
+        assert_eq!(at("/tmp/inst/data/apex/decompressed/com.android.art@352090000.decompressed.apex"), Some(label));
+        assert_eq!(at("/tmp/inst/data/apex/active/com.android.art.apex"), None);
+        assert_eq!(at("/tmp/inst/data/local/tmp/decompressed/x"), None);
+        assert_eq!(persistent_label(&Key::Guest(0, b"/data/apex/decompressed/x".to_vec())), None);
+    }
 }
