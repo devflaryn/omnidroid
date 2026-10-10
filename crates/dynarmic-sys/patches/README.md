@@ -1080,3 +1080,14 @@ Tested (`omni-cpu/tests/icache_batch.rs`, the switch on): code rewritten then sy
 in the same run, on another thread, and when the thread left without an `ISB`; a clear-cache loop
 over 200 lines invalidates each. MEASURED (`the_cost_of_a_clear_cache_loop`, i5-4460, 960 lines):
 **218 -> 15.4 ns a line** (14x).
+
+### 0099 — x64: a snapshot past its cap keeps its oldest regions
+
+`SaveSnapshot` refused (-3) a cache whose live code exceeded `max_bytes`, and saved all of it
+otherwise. omni-linux saved the game at up to its whole 512 MiB live budget: restored, the cache was
+full at once, and the first new translation retired its oldest regions -- the game's start and
+sign-in, before they ran (s17's second run on four E-cores: 541 MB restored, 12% of it ever
+entered). Now the regions are taken oldest first while they fit and the rest left out (a block in a
+saved region that linked into one left out is restored unlinked, as any). omni-linux's cap is three
+quarters of the live budget by default (`OMNI_JIT_SNAPSHOT_MAX_MB`; 384 of 512 MiB), so a restored
+cache has room for what is new. The snapshot test passes lazily and not (Linux, first cache freed).

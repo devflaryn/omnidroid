@@ -28,7 +28,8 @@
 //! - `OMNI_JIT_SNAPSHOT_RESAVE_PCT=<n>` (default 2; 0: any): a process saves again only once `n`%
 //!   of what it would save is new since its last save or its restore -- a save rewrites the whole
 //!   file (s12: 337 saves, 4.4 GB written in one run, system_server's ~230 MB sixteen times).
-//! - `OMNI_JIT_SNAPSHOT_MAX_MB=<MiB>` (default 512): no snapshot past that much code.
+//! - `OMNI_JIT_SNAPSHOT_MAX_MB=<MiB>` (default three quarters of the live budget, 384 of 512): the
+//!   oldest regions up to that much code are saved, the newest left out (dynarmic patch 0099).
 //! - `OMNI_JIT_SNAPSHOT_FORGET=1` (default off; dynarmic patch 0076): once a process has settled
 //!   (as for the settled save), forget the restored blocks it never entered, and their bookkeeping.
 //! - `OMNI_JIT_SNAPSHOT_LAZY=1` (default off; dynarmic patch 0075): read a snapshot's code a page at
@@ -238,8 +239,12 @@ pub fn dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
+/// The most code a snapshot keeps (`OMNI_JIT_SNAPSHOT_MAX_MB`): by default three quarters of the
+/// shared cache's live budget (384 MiB of 512), its oldest regions first (dynarmic patch 0099) -- so
+/// that a restored cache has room for what is new before it must retire what it restored.
 fn max_bytes() -> u64 {
-    std::env::var("OMNI_JIT_SNAPSHOT_MAX_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512) << 20
+    let live = std::env::var("OMNI_JIT_SHARED_CACHE_LIVE_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(512);
+    std::env::var("OMNI_JIT_SNAPSHOT_MAX_MB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(live * 3 / 4) << 20
 }
 
 fn lazy() -> bool {

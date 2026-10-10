@@ -1,0 +1,38 @@
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index e80aa0d3..e82582b8 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -1322,12 +1322,28 @@ s64 SharedCodeCache::Impl::SaveSnapshot(const char* path, const char* key, u64 m
+         per_region[region].push_back(std::move(saved));
+     }
+ 
++    // Omnidroid patch 0099: past `max_bytes`, the oldest regions that fit are saved and the newest
++    // left out -- not nothing. The oldest hold what a process runs first (the game: its start and
++    // sign-in); a snapshot as large as the cache's live budget filled it at once on restore, and the
++    // first new translation then retired its oldest regions before they ran (s17: the game's 541
++    // MB restored, 12% of it ever entered).
+     u64 total = 0;
+-    for (size_t r : live) {
+-        total += used[r];
+-    }
+-    if (total > max_bytes) {
+-        return -3;
++    {
++        std::vector<size_t> kept;
++        for (size_t r : live) {
++            if (per_region[r].empty()) {
++                continue;
++            }
++            if (total + used[r] > max_bytes) {
++                break;
++            }
++            total += used[r];
++            kept.push_back(r);
++        }
++        if (kept.empty()) {
++            return -3;
++        }
++        live = std::move(kept);
+     }
+ 
+     const auto lock_start = std::chrono::steady_clock::now();
