@@ -77,6 +77,7 @@ dynarmic/
                and ../patches/0090-x64-a-block-s-codegen-census-added-once.patch
                and ../patches/0091-ir-a64-get-set-elimination-barrier-count-and-table-predicates.patch
                and ../patches/0092-x64-select-a-register-takes-a-free-empty-first-candidate.patch
+               and ../patches/0093-ir-what-a-value-asks-of-its-instruction-inline.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

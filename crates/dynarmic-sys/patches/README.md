@@ -979,3 +979,18 @@ returned without looking at the others. Exactly the same choice, so the same byt
 
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
 0091): emit **9.61/9.64/9.78/9.65 -> 9.45/9.50/9.56/9.47 us/block (-1.8%)**.
+
+### 0093 — IR: what a `Value` asks of its instruction, inline
+
+`Value::IsImmediate` and `GetType` were inline for immediates since 0077, but for an instruction's
+value called `IsImmediateInst`/`GetTypeInst` in `value.cpp` (which call `IsIdentity`, also out of
+line), because `value.h` cannot see `Inst`: 3.2% of emission's samples between the two, for every
+argument any pass or the emitter looks at. `value.h` now includes `microinstruction.h` at its end
+(after `Value` is complete; `#pragma once` makes the cycle a no-op either way round), and
+`microinstruction.h` defines `IsIdentity`, `IsImmediateInst` and `GetTypeInst` inline after `Inst`, so
+every user of `Value` has them. `GetInst` is inline in `value.h`. The same code, so the same bytes
+(`compare_emit_dumps.py`).
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0092): frontend **4.03/4.05/4.02/4.01 -> 3.85/3.86/3.87/3.86 us/block (-4%)**, emit
+**9.53/9.66/9.56/9.53 -> 9.29/9.35/9.34/9.33 (-2.5%)**.

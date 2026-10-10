@@ -204,4 +204,23 @@ private:
     Inst* next_pseudoop = nullptr;
 };
 
+// Omnidroid patch 0093: what a `Value` asks of its instruction, inline -- out-of-line calls for every
+// argument any pass or the emitter looked at (`IsImmediate` and `GetType` of an instruction's value;
+// 3% of emission's samples). `value.h` includes this header at its end, so every user has them.
+inline bool Value::IsIdentity() const {
+    return type == Type::Opaque && inner.inst->GetOpcode() == Opcode::Identity;
+}
+
+inline bool Value::IsImmediateInst() const {
+    if (IsIdentity())
+        return inner.inst->GetArg(0).IsImmediate();
+    return false;
+}
+
+inline Type Value::GetTypeInst() const {
+    if (IsIdentity())
+        return inner.inst->GetArg(0).GetType();
+    return inner.inst->GetType();
+}
+
 }  // namespace Dynarmic::IR

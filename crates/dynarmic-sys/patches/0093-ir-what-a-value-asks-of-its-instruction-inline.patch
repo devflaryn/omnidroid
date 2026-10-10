@@ -1,0 +1,92 @@
+diff --git a/src/dynarmic/ir/microinstruction.h b/src/dynarmic/ir/microinstruction.h
+index 8005f2ca..c8c33fc9 100644
+--- a/src/dynarmic/ir/microinstruction.h
++++ b/src/dynarmic/ir/microinstruction.h
+@@ -204,4 +204,23 @@ private:
+     Inst* next_pseudoop = nullptr;
+ };
+ 
++// Omnidroid patch 0093: what a `Value` asks of its instruction, inline -- out-of-line calls for every
++// argument any pass or the emitter looked at (`IsImmediate` and `GetType` of an instruction's value;
++// 3% of emission's samples). `value.h` includes this header at its end, so every user has them.
++inline bool Value::IsIdentity() const {
++    return type == Type::Opaque && inner.inst->GetOpcode() == Opcode::Identity;
++}
++
++inline bool Value::IsImmediateInst() const {
++    if (IsIdentity())
++        return inner.inst->GetArg(0).IsImmediate();
++    return false;
++}
++
++inline Type Value::GetTypeInst() const {
++    if (IsIdentity())
++        return inner.inst->GetArg(0).GetType();
++    return inner.inst->GetType();
++}
++
+ }  // namespace Dynarmic::IR
+diff --git a/src/dynarmic/ir/value.cpp b/src/dynarmic/ir/value.cpp
+index c78de9f2..355127f8 100644
+--- a/src/dynarmic/ir/value.cpp
++++ b/src/dynarmic/ir/value.cpp
+@@ -85,24 +85,8 @@ Value Value::EmptyNZCVImmediateMarker() {
+     return result;
+ }
+ 
+-bool Value::IsIdentity() const {
+-    if (type == Type::Opaque)
+-        return inner.inst->GetOpcode() == Opcode::Identity;
+-    return false;
+-}
+ 
+ // Patch 0077: what `IsImmediate` and `GetType` were, for an instruction's value (`type` Opaque).
+-bool Value::IsImmediateInst() const {
+-    if (IsIdentity())
+-        return inner.inst->GetArg(0).IsImmediate();
+-    return false;
+-}
+-
+-Type Value::GetTypeInst() const {
+-    if (IsIdentity())
+-        return inner.inst->GetArg(0).GetType();
+-    return inner.inst->GetType();
+-}
+ 
+ A32::Reg Value::GetA32RegRef() const {
+     ASSERT(type == Type::A32Reg);
+@@ -124,10 +108,6 @@ A64::Vec Value::GetA64VecRef() const {
+     return inner.imm_a64vecref;
+ }
+ 
+-Inst* Value::GetInst() const {
+-    ASSERT(type == Type::Opaque);
+-    return inner.inst;
+-}
+ 
+ Inst* Value::GetInstRecursive() const {
+     ASSERT(type == Type::Opaque);
+diff --git a/src/dynarmic/ir/value.h b/src/dynarmic/ir/value.h
+index cfa66f6b..57dbe842 100644
+--- a/src/dynarmic/ir/value.h
++++ b/src/dynarmic/ir/value.h
+@@ -62,7 +62,10 @@ public:
+     bool IsImmediate() const { return type != Type::Opaque || IsImmediateInst(); }
+     Type GetType() const { return type != Type::Opaque ? type : GetTypeInst(); }
+ 
+-    Inst* GetInst() const;
++    Inst* GetInst() const {  // patch 0093: inline
++        ASSERT(type == Type::Opaque);
++        return inner.inst;
++    }
+     Inst* GetInstRecursive() const;
+     A32::Reg GetA32RegRef() const;
+     A32::ExtReg GetA32ExtRegRef() const;
+@@ -190,3 +193,7 @@ using NZCV = TypedValue<Type::NZCVFlags>;
+ using Table = TypedValue<Type::Table>;
+ 
+ }  // namespace Dynarmic::IR
++
++// Omnidroid patch 0093: `Inst`, and with it the inline definitions of what a `Value` asks of its
++// instruction (`IsIdentity`, `IsImmediateInst`, `GetTypeInst`), for every user of `Value`.
++#include "dynarmic/ir/microinstruction.h"

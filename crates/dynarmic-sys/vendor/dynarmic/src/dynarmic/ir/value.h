@@ -62,7 +62,10 @@ public:
     bool IsImmediate() const { return type != Type::Opaque || IsImmediateInst(); }
     Type GetType() const { return type != Type::Opaque ? type : GetTypeInst(); }
 
-    Inst* GetInst() const;
+    Inst* GetInst() const {  // patch 0093: inline
+        ASSERT(type == Type::Opaque);
+        return inner.inst;
+    }
     Inst* GetInstRecursive() const;
     A32::Reg GetA32RegRef() const;
     A32::ExtReg GetA32ExtRegRef() const;
@@ -190,3 +193,7 @@ using NZCV = TypedValue<Type::NZCVFlags>;
 using Table = TypedValue<Type::Table>;
 
 }  // namespace Dynarmic::IR
+
+// Omnidroid patch 0093: `Inst`, and with it the inline definitions of what a `Value` asks of its
+// instruction (`IsIdentity`, `IsImmediateInst`, `GetTypeInst`), for every user of `Value`.
+#include "dynarmic/ir/microinstruction.h"

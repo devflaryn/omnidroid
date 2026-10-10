@@ -85,24 +85,8 @@ Value Value::EmptyNZCVImmediateMarker() {
     return result;
 }
 
-bool Value::IsIdentity() const {
-    if (type == Type::Opaque)
-        return inner.inst->GetOpcode() == Opcode::Identity;
-    return false;
-}
 
 // Patch 0077: what `IsImmediate` and `GetType` were, for an instruction's value (`type` Opaque).
-bool Value::IsImmediateInst() const {
-    if (IsIdentity())
-        return inner.inst->GetArg(0).IsImmediate();
-    return false;
-}
-
-Type Value::GetTypeInst() const {
-    if (IsIdentity())
-        return inner.inst->GetArg(0).GetType();
-    return inner.inst->GetType();
-}
 
 A32::Reg Value::GetA32RegRef() const {
     ASSERT(type == Type::A32Reg);
@@ -124,10 +108,6 @@ A64::Vec Value::GetA64VecRef() const {
     return inner.imm_a64vecref;
 }
 
-Inst* Value::GetInst() const {
-    ASSERT(type == Type::Opaque);
-    return inner.inst;
-}
 
 Inst* Value::GetInstRecursive() const {
     ASSERT(type == Type::Opaque);
