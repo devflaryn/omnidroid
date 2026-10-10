@@ -28,6 +28,10 @@ enum InstFlag : std::uint8_t {
     kMayHaveSideEffects = 1,
     kIsMemoryRead = 2,
     kIsMemoryReadOrWrite = 4,
+    // Patch 0091: what A64's get/set elimination asks of every other instruction.
+    kCausesCPUException = 8,
+    kReadsOrWritesCPSR = 16,
+    kReadsOrWritesCoreRegister = 32,
 };
 extern const std::array<std::uint8_t, OpcodeCount> inst_flags;
 }  // namespace detail
@@ -120,6 +124,11 @@ public:
 
     /// Determines whether or not this instruction may have side-effects.
     bool MayHaveSideEffects() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kMayHaveSideEffects) != 0; }  // patch 0087
+    /// Patch 0091: `CausesCPUException()`, `ReadsFromCPSR() || WritesToCPSR()` and
+    /// `ReadsFromCoreRegister() || WritesToCoreRegister()`, from `detail::inst_flags`.
+    bool CausesCPUExceptionFlag() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kCausesCPUException) != 0; }
+    bool ReadsOrWritesCPSR() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kReadsOrWritesCPSR) != 0; }
+    bool ReadsOrWritesCoreRegister() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kReadsOrWritesCoreRegister) != 0; }
 
     /// Determines whether or not this instruction is a pseduo-instruction.
     /// Pseudo-instructions depend on their parent instructions for their semantics.

@@ -953,3 +953,17 @@ The same bytes; `compact_code.rs` (which reads the census) passes.
 MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, one thread, 4 interleaved
 runs against 0089): emit **9.87/9.92/9.77/9.85 -> 9.70/9.76/9.75/9.73 us/block (-1.2%)**. More where
 threads emit side by side (a boot's system host), which this benchmark does not do.
+
+### 0091 — IR: A64 get/set elimination counts barriers, and asks the opcode table
+
+With 0037's precise mode (on in omni-linux), every guest memory access is a point past which no
+earlier Set may be erased; the pass marked that by clearing `set_instruction_present` in all 65
+register records (31 X, 32 V, SP, NZCV) at every access. And for every instruction that is not a
+Get or Set it called five out-of-line switches over the opcode (`CausesCPUException`, `ReadsFromCPSR`,
+`WritesToCPSR`, `ReadsFromCoreRegister`, `WritesToCoreRegister`). Now each record keeps the barrier
+count of its Set, and a Set is erased only if no access has come since (`set_barrier == barrier`):
+one increment per access. The five questions are three more bits of 0087's per-opcode table. The
+same IR, so the same bytes (`compare_emit_dumps.py`); `OMNI_JIT_VERIFY=1` passes on the corpus.
+
+MEASURED (`code_size.rs::the_speed_of_emission`, `OD_PROD=1`, i5-4460, 4 interleaved runs against
+0090): frontend **4.26/4.32/4.27/4.24 -> 3.95/3.96/3.98/3.98 us/block (-7%)**; emit unchanged.

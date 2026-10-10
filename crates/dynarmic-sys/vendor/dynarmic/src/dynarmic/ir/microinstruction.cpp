@@ -629,7 +629,10 @@ struct InstFlagsMaker {
             const Inst inst{static_cast<Opcode>(i)};
             flags[i] = static_cast<std::uint8_t>((inst.MayHaveSideEffectsSlow() ? detail::kMayHaveSideEffects : 0)
                                                  | (inst.IsMemoryReadSlow() ? detail::kIsMemoryRead : 0)
-                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0));
+                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0)
+                                                 | (inst.CausesCPUException() ? detail::kCausesCPUException : 0)
+                                                 | (inst.ReadsFromCPSR() || inst.WritesToCPSR() ? detail::kReadsOrWritesCPSR : 0)
+                                                 | (inst.ReadsFromCoreRegister() || inst.WritesToCoreRegister() ? detail::kReadsOrWritesCoreRegister : 0));
         }
         return flags;
     }

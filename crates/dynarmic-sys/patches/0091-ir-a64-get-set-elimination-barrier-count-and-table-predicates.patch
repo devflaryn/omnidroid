@@ -1,0 +1,111 @@
+diff --git a/src/dynarmic/ir/microinstruction.cpp b/src/dynarmic/ir/microinstruction.cpp
+index 2c88c383..f5df6caa 100644
+--- a/src/dynarmic/ir/microinstruction.cpp
++++ b/src/dynarmic/ir/microinstruction.cpp
+@@ -629,7 +629,10 @@ struct InstFlagsMaker {
+             const Inst inst{static_cast<Opcode>(i)};
+             flags[i] = static_cast<std::uint8_t>((inst.MayHaveSideEffectsSlow() ? detail::kMayHaveSideEffects : 0)
+                                                  | (inst.IsMemoryReadSlow() ? detail::kIsMemoryRead : 0)
+-                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0));
++                                                 | (inst.IsMemoryReadOrWriteSlow() ? detail::kIsMemoryReadOrWrite : 0)
++                                                 | (inst.CausesCPUException() ? detail::kCausesCPUException : 0)
++                                                 | (inst.ReadsFromCPSR() || inst.WritesToCPSR() ? detail::kReadsOrWritesCPSR : 0)
++                                                 | (inst.ReadsFromCoreRegister() || inst.WritesToCoreRegister() ? detail::kReadsOrWritesCoreRegister : 0));
+         }
+         return flags;
+     }
+diff --git a/src/dynarmic/ir/microinstruction.h b/src/dynarmic/ir/microinstruction.h
+index ae6f05be..8005f2ca 100644
+--- a/src/dynarmic/ir/microinstruction.h
++++ b/src/dynarmic/ir/microinstruction.h
+@@ -28,6 +28,10 @@ enum InstFlag : std::uint8_t {
+     kMayHaveSideEffects = 1,
+     kIsMemoryRead = 2,
+     kIsMemoryReadOrWrite = 4,
++    // Patch 0091: what A64's get/set elimination asks of every other instruction.
++    kCausesCPUException = 8,
++    kReadsOrWritesCPSR = 16,
++    kReadsOrWritesCoreRegister = 32,
+ };
+ extern const std::array<std::uint8_t, OpcodeCount> inst_flags;
+ }  // namespace detail
+@@ -120,6 +124,11 @@ public:
+ 
+     /// Determines whether or not this instruction may have side-effects.
+     bool MayHaveSideEffects() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kMayHaveSideEffects) != 0; }  // patch 0087
++    /// Patch 0091: `CausesCPUException()`, `ReadsFromCPSR() || WritesToCPSR()` and
++    /// `ReadsFromCoreRegister() || WritesToCoreRegister()`, from `detail::inst_flags`.
++    bool CausesCPUExceptionFlag() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kCausesCPUException) != 0; }
++    bool ReadsOrWritesCPSR() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kReadsOrWritesCPSR) != 0; }
++    bool ReadsOrWritesCoreRegister() const { return (detail::inst_flags[static_cast<size_t>(op)] & detail::kReadsOrWritesCoreRegister) != 0; }
+ 
+     /// Determines whether or not this instruction is a pseduo-instruction.
+     /// Pseudo-instructions depend on their parent instructions for their semantics.
+diff --git a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+index d40556b9..23b8e602 100644
+--- a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
++++ b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+@@ -34,15 +34,20 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+         /// Patch 0081: with an X value from a W write, the W value written (W reads take it).
+         IR::Value w_value;
+         bool set_instruction_present = false;
++        /// Patch 0091: the barrier count when that Set was made; it may be erased only while no
++        /// access has come since (`barrier` unchanged) -- in place of clearing every register's
++        /// `set_instruction_present` at each access.
++        std::uint32_t set_barrier = 0;
+         Iterator last_set_instruction;
+     };
+     std::array<RegisterInfo, 31> reg_info;
+     std::array<RegisterInfo, 32> vec_info;
+     RegisterInfo sp_info;
+     RegisterInfo nzcv_info;
++    std::uint32_t barrier = 0;  // patch 0091
+ 
+-    const auto do_set = [&block](RegisterInfo& info, IR::Value value, Iterator set_inst, TrackingType tracking_type) {
+-        if (info.set_instruction_present) {
++    const auto do_set = [&block, &barrier](RegisterInfo& info, IR::Value value, Iterator set_inst, TrackingType tracking_type) {
++        if (info.set_instruction_present && info.set_barrier == barrier) {
+             info.last_set_instruction->Invalidate();
+             block.Instructions().erase(info.last_set_instruction);
+         }
+@@ -51,6 +56,7 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+         info.tracking_type = tracking_type;
+         info.w_value = {};  // patch 0081: set again by the caller for a W write
+         info.set_instruction_present = true;
++        info.set_barrier = barrier;
+         info.last_set_instruction = set_inst;
+     };
+ 
+@@ -193,7 +199,7 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+                 // supervisor call (omni-cpu serves syscalls and inline thunks there, reading and
+                 // writing guest registers, and continues), an exception, a cache operation, a host
+                 // function -- also forget what is known, as the callee may have changed it.
+-                if (inst->CausesCPUException()
++                if (inst->CausesCPUExceptionFlag()
+                     || inst->GetOpcode() == IR::Opcode::A64DataCacheOperationRaised
+                     || inst->GetOpcode() == IR::Opcode::A64InstructionCacheOperationRaised
+                     || inst->GetOpcode() == IR::Opcode::CallHostFunction) {
+@@ -202,20 +208,13 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+                     sp_info = {};
+                     nzcv_info = {};
+                 } else if (inst->IsMemoryReadOrWrite() || inst->MayHaveSideEffects()) {
+-                    for (auto& info : reg_info) {
+-                        info.set_instruction_present = false;
+-                    }
+-                    for (auto& info : vec_info) {
+-                        info.set_instruction_present = false;
+-                    }
+-                    sp_info.set_instruction_present = false;
+-                    nzcv_info.set_instruction_present = false;
++                    barrier++;  // patch 0091: no Set before this point is erased
+                 }
+             }
+-            if (inst->ReadsFromCPSR() || inst->WritesToCPSR()) {
++            if (inst->ReadsOrWritesCPSR()) {  // patch 0091: from the table
+                 nzcv_info = {};
+             }
+-            if (inst->ReadsFromCoreRegister() || inst->WritesToCoreRegister()) {
++            if (inst->ReadsOrWritesCoreRegister()) {
+                 reg_info = {};
+                 vec_info = {};
+                 sp_info = {};

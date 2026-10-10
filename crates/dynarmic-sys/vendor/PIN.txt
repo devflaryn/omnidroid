@@ -75,6 +75,7 @@ dynarmic/
                and ../patches/0087-ir-opcode-return-types-and-predicates-from-tables.patch
                and ../patches/0089-x64-shared-labels-from-a-per-thread-free-list.patch
                and ../patches/0090-x64-a-block-s-codegen-census-added-once.patch
+               and ../patches/0091-ir-a64-get-set-elimination-barrier-count-and-table-predicates.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 
