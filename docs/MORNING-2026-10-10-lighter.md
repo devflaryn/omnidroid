@@ -50,9 +50,9 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of ~150.
   `OMNI_WS_TRIM=<s>` (periodic) and `OMNI_WS_TRIM_IDLE=<s>` (idle processes only) -- s10 measures
   what really leaves RAM (the compressed store keeps part of it).
-- **Translation snapshots: ~16 s sooner into the world** (last night's WIP, now built, fixed and on
+- **Translation snapshots: 4-16 s sooner into the world (about 5 s typical)** (last night's WIP, now built, fixed and on
   this branch; opt-in). With the game's live code budget at 512 MiB its snapshot survives, and from
-  the second run on it verifies 70% of what it restores: sign-in 44.6 s, world **68.6 s vs 84.9 s**
+  the second run on it verifies up to 70% of what it restores: world at 81.6 / 68.6 / 79.6 s against 84.8-85.9 s without
   (s9). Cost: +145 MB private WS and 2.2 GB of snapshot files, rebuilt after every new host binary.
   system_server's part is still weak (8% verify; s12 names where its code moves). Yours to weigh:
   `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1 OMNI_JIT_SNAPSHOT_LIB_ZONE=1

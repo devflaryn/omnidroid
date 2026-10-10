@@ -200,7 +200,7 @@ Build d9fbf71 (+ the snapshot saved before a code trim). Every arm `OMNI_JIT_SHA
 | snap, 1st after the fill | 27.5 | 53.2 | 65.3 | 81.6 | 3.163 GB |
 | **snap, 2nd** | **27.4** | **44.6** | **54.7** | **68.6** | 3.133 GB |
 
-**The game's snapshot gets better each run:** its second run verified **907,313 of 1,300,594** restored
+**The game's snapshot gets better each run** (a third run: DID_LOG_IN 52.2, onGameLoaded 79.6 -- so -4..-16 s to the world over three runs, -5 s typical): its second run verified **907,313 of 1,300,594** restored
 blocks (70%; the first 32%), and the world was reached **~16 s sooner** (68.6 vs 84.9 s), sign-in 13 s
 sooner. Cost: +145 MB private WS, 2.2 GB of snapshot files (the game's 558 MB, system_server's 235
 MB), and every rebuild of the host binary starts them again. system_server still verifies 8% (45k of
