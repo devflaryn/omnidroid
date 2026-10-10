@@ -50,11 +50,13 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   system host had touched 187 of 1,294 MB again, the game 748 of 3,011, each helper app 2 of ~150.
   `OMNI_WS_TRIM=<s>` (periodic) and `OMNI_WS_TRIM_IDLE=<s>` (idle processes only) -- s10 measures
   what really leaves RAM (the compressed store keeps part of it).
-- **Translation snapshots** (last night's WIP, now built and on this branch, opt-in): -2..-3 s to
-  boot_completed, -4..-10 s to the world, for +100..+200 MB. With a 512 MiB live budget the game's
-  own snapshot verifies 32% (was 2.4%); system_server's is now saved before its code trim (495k
-  blocks restored, was 78k) but only 13% verify -- libraries the zone could not place at their home
-  move between boots (s12 names them).
+- **Translation snapshots: ~16 s sooner into the world** (last night's WIP, now built, fixed and on
+  this branch; opt-in). With the game's live code budget at 512 MiB its snapshot survives, and from
+  the second run on it verifies 70% of what it restores: sign-in 44.6 s, world **68.6 s vs 84.9 s**
+  (s9). Cost: +145 MB private WS and 2.2 GB of snapshot files, rebuilt after every new host binary.
+  system_server's part is still weak (8% verify; s12 names where its code moves). Yours to weigh:
+  `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1 OMNI_JIT_SNAPSHOT_LIB_ZONE=1
+  OMNI_JIT_SNAPSHOT_FORGET=1 OMNI_JIT_SHARED_CACHE_LIVE_MB=512`.
 - **init's class_start**: 47 services spawned one after another; `OMNI_INIT_PARALLEL=1` -- s10.
 
 ## For you to decide
