@@ -382,6 +382,14 @@ pub fn install_crash_report() {
     #[cfg(target_os = "windows")]
     {
         backend::install_crash_report();
+        // Kept installed: a library loaded later (a GPU driver's, a runtime's) may set its own
+        // top-level filter, and the crash then goes unreported (s26: the game's host died
+        // 0xC0000005 with no `[host-crash]` line). Every 5 s it is set again; a replacement is said
+        // once, with where its filter is.
+        let _ = std::thread::Builder::new().name("omni-crash-filter".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            backend::keep_crash_report();
+        });
     }
 }
 

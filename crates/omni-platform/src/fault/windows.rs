@@ -450,7 +450,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             // can end the process before the top-level filter runs (s26: the game's host died
             // 0xC0000005 with no `[host-crash]` line -- something replaced the filter, or ended
             // the process first).
-            if CRASH_STDERR.load(Ordering::Relaxed) != 0 && DECLINED_SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            // Not a guest's own fault on address -1 (its handler, further on, takes those: 76
+            // in one boot, s19).
+            if CRASH_STDERR.load(Ordering::Relaxed) != 0 && fault.address != usize::MAX && DECLINED_SAID.fetch_add(1, Ordering::Relaxed) < 4 {
                 // SAFETY: the OS's exception pointers, valid for this call.
                 unsafe { report(b"\n[host-fault] declined: exception ", info) };
             }
@@ -842,6 +844,61 @@ fn put_hex(buf: &mut [u8], at: &mut usize, v: u64) {
         }
     }
     put(buf, at, &digits[..n]);
+}
+
+/// See [`super::install_crash_report`]: the filter set again, and a replacement said once.
+pub(super) fn keep_crash_report() {
+    use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+    static SAID: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    // SAFETY: as in `install_crash_report`.
+    let previous = unsafe { SetUnhandledExceptionFilter(Some(crash_filter)) };
+    if let Some(other) = previous {
+        if other as usize != crash_filter as *const () as usize && !SAID.swap(true, Ordering::Relaxed) {
+            let mut buf = [0u8; 400];
+            let mut at = 0;
+            put(&mut buf, &mut at, b"[host-crash] the top-level filter had been replaced: ");
+            put_module(&mut buf, &mut at, other as usize);
+            put(&mut buf, &mut at, b"; set again\n");
+            write_stderr(&buf[..at]);
+        }
+    }
+}
+
+/// `address` as `0x...` and, if a module holds it, ` (module+offset)`.
+fn put_module(buf: &mut [u8], at: &mut usize, address: usize) {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleFileNameA, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    put_hex(buf, at, address as u64);
+    let mut module: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
+    // SAFETY: asks which loaded module holds `address`; writes `module` only.
+    let found = unsafe {
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, address as *const u16, &raw mut module)
+    } != 0;
+    if found {
+        let mut name = [0u8; 260];
+        // SAFETY: `name` holds 260 bytes; the call writes at most that.
+        let n = unsafe { GetModuleFileNameA(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let base = name[..n].iter().rposition(|&c| c == b'\\').map_or(0, |i| i + 1);
+        put(buf, at, b" (");
+        put(buf, at, &name[base..n]);
+        put(buf, at, b"+");
+        put_hex(buf, at, (address - module as usize) as u64);
+        put(buf, at, b")");
+    } else {
+        put(buf, at, b" (in no module: generated code or a stub)");
+    }
+}
+
+/// Writes `bytes` to the standard error [`install_crash_report`] saved, if it did.
+fn write_stderr(bytes: &[u8]) {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    let handle = CRASH_STDERR.load(Ordering::Relaxed);
+    if handle != 0 {
+        let mut written = 0u32;
+        // SAFETY: the saved standard error handle and a buffer of `bytes.len()` bytes.
+        unsafe { WriteFile(handle as windows_sys::Win32::Foundation::HANDLE, bytes.as_ptr(), bytes.len() as u32, &raw mut written, core::ptr::null_mut()) };
+    }
 }
 
 /// How many declined access violations [`veh`] has reported.
