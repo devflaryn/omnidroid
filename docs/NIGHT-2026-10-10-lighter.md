@@ -506,3 +506,19 @@ while another evicts, forgets, invalidates and saves; 30 s on two cores) has not
 that loaded: **the world in 110.8 s against 140.4/140.7 without snapshots on four E-cores (s17)**.
 The vectored handler's declined reports are guests' own faults (reads of 0 and -1 that dynarmic's
 handler serves) -- four a process, noise.
+
+## Session s30 (10:32-10:58): a guest MADV_FREE carried out (`s30-madvfree.csv`, build f273e9e)
+
+| arm | fps | CPU ms/frame | commit GB | game commit GB | boot_completed | DID_LOG_IN | onGameLoaded |
+|---|---|---|---|---|---|---|---|
+| hint (default) | 59.48 | 39.66 | 3.877 | 2.553 | 19.4 | 42.4 | 66.5 |
+| free (`OMNI_MADV_FREE=1`) | 59.53 | 39.56 | 3.830 | 2.508 | 20.0 | 44.6 | 70.6 |
+| free | 59.06 | 39.79 | 3.855 | 2.528 | 20.0 | 43.7 | 70.7 |
+| hint | 59.43 | 38.39 | 3.883 | 2.557 | 19.4 | 42.9 | 68.0 |
+
+-38 MB of commit, nothing else: **the game hardly uses MADV_FREE** (`[madvise]`: advice 8, ~12 calls
+and 0 MiB a minute). It frees with **MADV_DONTNEED** -- 53,883 calls over 6.7 GB in its first minute,
+then 650-830 calls and 100-200 MiB a minute in the world -- each a decommit under the layout lock held
+exclusively, the next touch a fault (~2 us) and a commit. s32 times them; s33 tries them under the
+lock shared (`OMNI_DISCARD_SHARED=1`, 9388919). madv_free stays off. (A fresh device on this build:
+boot_completed 19.4-20.0 s, 21.2 earlier tonight.)
