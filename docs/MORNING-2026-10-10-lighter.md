@@ -19,7 +19,7 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 | system_server starts | 12.1-12.5 s | **4.0-4.1 s** | **-8 s** |
 | boot_completed | 30.8 s | **21.2-21.3 s** | **-9.5 s** |
 | world loaded (onGameLoaded) | 87-88 s | **71.8-73.1 s** | **-15 s** |
-| ... with translation snapshots | -- | 66.7 s on the s10 build (s12) | -18 s more, opt-in |
+| ... with translation snapshots | -- | **59.7 / 67.5 s** (s16) | -10 s more, opt-in (+190 MB) |
 | 8 E-cores (weaker PC): CPU a frame | -- | **-11%** with 0081-0083 (53 vs 59.5 ms) | |
 | 8 E-cores: world loaded | 188 s | 157-164 s (s11, older build) | -25..-30 s |
 
@@ -57,14 +57,13 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
 
 ## Found, being measured (queued sessions s14-s20)
 
-- **Translation snapshots: 18 s sooner into the world, and no longer a RAM cost** (s12: world 84.5
-  -> 66.7 s, private commit -67 MB, available +164 MB with lazy pages and forgetting; small daemons
-  verify 99.9%, apps 99.7%, the game 91%). Cost: **2.2 GB of disk** (one directory per
-  configuration; rewritten after every new host binary). The directory is now made NTFS-compressed
-  (c887b87; the files compress to about a third), to be measured. s16/s17 measure them on tonight's
-  build, at full CPU and on 4 E-cores. Opt-in: `OMNI_JIT_SNAPSHOT=<dir> OMNI_JIT_SNAPSHOT_LAZY=1
-  OMNI_JIT_SNAPSHOT_LIB_ZONE=1 OMNI_JIT_SNAPSHOT_FORGET=1 OMNI_JIT_SHARED_CACHE_LIVE_MB=512`.
-  **My recommendation: on by default** -- yours to weigh against the disk.
+- **Translation snapshots: the world ~10 s sooner (6-14 s; s16, tonight's build: 59.7/67.5 s
+  against 74.1/73.2 s), sign-in 4-11 s sooner, the same fps; cost +190 MB private commit / -250 MB
+  available, and their disk** (2.2 GB uncompressed; the directory is now NTFS-compressed, c887b87,
+  and a process re-saves only when 2% of its snapshot is new -- one fill run wrote 492 saves, 5.3 GB;
+  both measured in s23). Small daemons verify 99.9%, apps 99.7%, the game 91%. One switch now:
+  **`OMNI_JIT_SNAPSHOT=1`** (the temporary directory's `omni-jit-snapshot`, with lazy pages, the library
+  zone, forgetting and 512 MiB of live code by default). s17 measures them on 4 E-cores. **My recommendation: on by default** -- yours to weigh against the disk.
 - The idle apps left out of the image on 4 E-cores (s15), trimming once vs every 120 s (s18), the
   saved-device path you actually boot (s19), and who holds the system host's 13-16 MiB blocks (380
   MiB of its 1.03 GB commit; s20).

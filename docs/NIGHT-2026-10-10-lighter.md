@@ -343,3 +343,20 @@ init's waits (apexd's activation is guest code: decompressing the APEXes), with 
 **No gain even on four cores** (the three apps it removes of the ~14 that start are small next to
 the rest); the default stays. On this build four E-cores reach the world at **145-151 s** (s8's
 older build: 179-181 s) and play at 28.5-30.6 fps.
+
+## Session s16 (07:30-08:05): snapshots on tonight's build (`s16-snap.csv`, the s13 build)
+
+`snap` = `OMNI_JIT_SNAPSHOT=<new dir> _LAZY=1 _LIB_ZONE=1 _FORGET=1`, live 512 MiB (one `fill` run first);
+`off` = no snapshots (live 256 MiB).
+
+| arm | fps | all ms | private commit | private WS | available | system_server | boot_completed | DID_LOG_IN | Joining | onGameLoaded |
+|---|---|---|---|---|---|---|---|---|---|---|
+| fill | 59.47 | 37.19 | 3.938 | 0.839 | 10.904 | 4.1 | 21.3 | 47.1 | 59.5 | 70.6 |
+| **snap** | 59.19 / 59.33 | 39.99 / 38.65 | 4.033 / 4.017 | 0.946 / 0.866 | 10.702 / 10.691 | 4.1 / 4.1 | 20.2 / 20.2 | **36.4 / 43.1** | **47.7 / 51.2** | **59.7 / 67.5** |
+| off | 59.49 / 59.42 | 39.97 / 37.67 | 3.822 / 3.835 | 0.734 / 0.743 | 10.966 / 10.917 | 4.1 / 4.1 | 21.4 / 21.4 | 47.9 / 47.1 | 60.3 / 60.1 | 74.1 / 73.2 |
+
+**Snapshots: the world 6-14 s sooner (10 s on average), sign-in 4-11 s sooner, the same fps -- and
++190 MB private commit, -250 MB available, +130 MB working set (2/2).** Correction to s12: "no RAM
+cost" compared the restoring run with a filling one, both with snapshots and the 512 MiB live
+budget; against none, there is this cost (the live budget and the restored code read in by page
+until code aging trims it -- the game's commit fell 3.27 -> 2.71 GB in s12's restore once it did).
