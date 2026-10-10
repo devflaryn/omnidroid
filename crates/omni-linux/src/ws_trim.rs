@@ -6,10 +6,14 @@
 //! a trim every 120 s): two minutes after a trim the system's host had touched 187 of its 1,294 MB
 //! again, the game 748 of 3,011, each idle helper app 2 of ~150.
 //!
-//! - `OMNI_WS_TRIM=<seconds>` (off): every period, whatever the process is doing.
-//! - `OMNI_WS_TRIM_IDLE=<seconds>` (off): once the process has used under 2% of a core for that
-//!   long (a helper app waiting in binder, a game in the background), and holds more than 8 MiB;
-//!   never in its first minute. Again after it has grown back past 8 MiB and gone idle again.
+//! - `OMNI_WS_TRIM=<seconds>` (**default 120**; `0` off): every period, whatever the process is
+//!   doing. Measured (s10, PS99): the machine's available memory 9.21 -> 11.13 GB (+1.9 GB; the
+//!   system's compressed store +1.0 GB of it), private working set 3.02 -> 0.73 GB, with fps, CPU a
+//!   frame and the vsync pacer's lateness unchanged.
+//! - `OMNI_WS_TRIM_IDLE=<seconds>` (**default 30**; `0` off): once the process has used under 2% of
+//!   a core for that long (a helper app waiting in binder, a game in the background), and holds
+//!   more than 8 MiB; never in its first minute. Again after it has grown back past 8 MiB and gone
+//!   idle again. Measured (s10): Android's five idle helper apps 205-266 -> 0-12 MB each.
 //!
 //! Each trim says what it did:
 //!
@@ -30,8 +34,10 @@ const IDLE_NOT_BEFORE: Duration = Duration::from_secs(60);
 /// How often the idle trimmer looks.
 const IDLE_LOOK: Duration = Duration::from_secs(5);
 
-fn seconds(var: &str) -> Option<u64> {
-    std::env::var(var).ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&s| s > 0)
+/// The period `var` asks for, else `default`; 0 is off.
+fn seconds(var: &str, default: u64) -> Option<u64> {
+    let s = std::env::var(var).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default);
+    (s > 0).then_some(s)
 }
 
 fn trim(why: &str) {
@@ -45,7 +51,7 @@ fn trim(why: &str) {
 
 /// Start the trimming threads `OMNI_WS_TRIM` / `OMNI_WS_TRIM_IDLE` ask for.
 pub fn start() {
-    if let Some(every) = seconds("OMNI_WS_TRIM") {
+    if let Some(every) = seconds("OMNI_WS_TRIM", 120) {
         let once = std::env::var("OMNI_WS_TRIM_ONCE").is_ok_and(|v| v.trim() == "1");
         let _ = std::thread::Builder::new().name("omni-ws-trim".into()).spawn(move || loop {
             std::thread::sleep(Duration::from_secs(every));
@@ -55,7 +61,7 @@ pub fn start() {
             }
         });
     }
-    if let Some(idle_for) = seconds("OMNI_WS_TRIM_IDLE") {
+    if let Some(idle_for) = seconds("OMNI_WS_TRIM_IDLE", 30) {
         let _ = std::thread::Builder::new().name("omni-ws-trim-idle".into()).spawn(move || {
             let started = Instant::now();
             let window = Duration::from_secs(idle_for);

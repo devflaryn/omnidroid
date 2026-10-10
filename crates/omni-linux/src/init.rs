@@ -388,11 +388,13 @@ fn traced(name: &str) -> bool {
 }
 
 /// How long `exec_start` waits for its service, at most.
-/// `OMNI_INIT_PARALLEL=1` (off by default): `class_start` starts the classes' services side by
-/// side instead of one after another (to be measured: `[init] boot commands ... class_start ...`).
+/// `class_start` starts the classes' services side by side instead of one after another: each is
+/// a spawn of ~90 ms (a guest space, a code cache, its program loaded), and the 25 of a boot took
+/// 2.3 s in a row, 0.42 s side by side, system_server's start 10.3 -> 8.4 s (2026-10-10 s10).
+/// `OMNI_INIT_PARALLEL=0`: one after another, as before.
 fn parallel_class_start() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OMNI_INIT_PARALLEL").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("OMNI_INIT_PARALLEL").as_deref() != Ok("0"))
 }
 
 const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
