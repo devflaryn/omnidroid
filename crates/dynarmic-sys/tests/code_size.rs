@@ -622,3 +622,72 @@ fn the_speed_of_snapshot_install() {
     let each: Vec<f64> = times.iter().map(|x| (x * 10.0).round() / 10.0).collect();
     println!("snapshot of {saved} blocks: install {:.1} ns/block (median of {loads}; each {each:?})", sorted[sorted.len() / 2]);
 }
+
+/// **Emission side by side**: the corpus of [`the_speed_of_emission`] translated by
+/// `OMNI_EMIT_THREADS` threads at once (default 4), each on a cache of its own -- as a boot's system
+/// host translates its many processes -- against one thread alone. Per block, the frontend and the
+/// emitter's own time; a cost that grows with the threads beyond what the cores share (caches,
+/// memory) is contention inside the JIT (a lock, a shared counter, the allocator).
+///
+/// ```text
+/// OMNI_SYSROOT=<sysroot/aosp-35> OD_TEST_SHARED_CACHE=1 \
+///   cargo test -p dynarmic-sys --release --test code_size -- --ignored --nocapture side_by_side
+/// ```
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_speed_of_emission_side_by_side() {
+    if !harness::every_vm_on_a_shared_cache() {
+        println!("needs OD_TEST_SHARED_CACHE=1: skipped");
+        return;
+    }
+    if std::env::var("OD_PROD").as_deref() == Ok("1") {
+        // SAFETY: process-wide switches, set before anything is translated.
+        unsafe {
+            dynarmic_sys::od_set_fast_dispatch_inline(1);
+            dynarmic_sys::od_set_scalar_fp_in_xmm(1);
+            dynarmic_sys::od_set_compact_code(1);
+            dynarmic_sys::od_set_tbi_unmasked(1);
+            dynarmic_sys::od_set_precise_get_set(1);
+        }
+    }
+    let threads: usize = std::env::var("OMNI_EMIT_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let libs = [
+        "/apex/com.android.runtime/lib64/bionic/libc.so",
+        "/apex/com.android.art/lib64/libart.so",
+        "/system/lib64/libhwui.so",
+        "/system/lib64/libandroid_runtime.so",
+    ];
+    // One pass of the four libraries: (frontend ns, emit ns, blocks).
+    let pass = || {
+        let (mut t, mut e, mut b) = (0u64, 0u64, 0u64);
+        for lib in libs {
+            let r = translate_library_with(lib, 4, optimization::ALL_SAFE)?;
+            t += r.stats.translate_ns;
+            e += r.stats.emit_ns;
+            b += r.stats.blocks_emitted;
+        }
+        Some((t, e, b))
+    };
+    let Some(_) = pass() else {
+        println!("no sysroot (OMNI_SYSROOT): skipped");
+        return;
+    };
+    let alone = (0..3).map(|_| pass().unwrap()).collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let together: Vec<(u64, u64, u64)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| (0..3).map(|_| pass().unwrap()).collect::<Vec<_>>())).collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap()).collect()
+    });
+    let wall = started.elapsed();
+    let per = |v: &[(u64, u64, u64)]| {
+        let (t, e, b) = v.iter().fold((0u64, 0u64, 0u64), |a, x| (a.0 + x.0, a.1 + x.1, a.2 + x.2));
+        (t as f64 / 1e3 / b as f64, e as f64 / 1e3 / b as f64, b)
+    };
+    let (ta, ea, _) = per(&alone);
+    let (tt, et, bt) = per(&together);
+    println!(
+        "alone: frontend {ta:.2} us/block, emit {ea:.2}; {threads} threads side by side: frontend {tt:.2}, emit {et:.2} ({bt} blocks in {:.2} s wall, {:.2} us/block of wall)",
+        wall.as_secs_f64(),
+        wall.as_secs_f64() * 1e6 / bt as f64
+    );
+}
