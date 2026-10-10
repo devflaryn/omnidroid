@@ -90,7 +90,12 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
     const bool precise = conf.check_halt_on_memory_access && live_precise_get_set.load(std::memory_order_relaxed) != 0;
     const Optimization::DeadCodeEliminationOptions dce{.keep_memory_reads = conf.check_halt_on_memory_access};
     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && (!conf.check_halt_on_memory_access || precise)) {
-        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise});
+        // Patch 0081: `OMNI_JIT_GETSET_WIDTH=0` turns the width forwarding off.
+        static const bool width = [] {
+            const char* v = std::getenv("OMNI_JIT_GETSET_WIDTH");
+            return v == nullptr || v[0] != '0';
+        }();
+        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise, .forward_width_changes = width});
         Optimization::DeadCodeElimination(ir_block, dce);
     }
     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {

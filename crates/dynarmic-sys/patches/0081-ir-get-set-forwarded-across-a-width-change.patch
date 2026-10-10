@@ -1,0 +1,101 @@
+diff --git a/src/dynarmic/backend/x64/a64_interface.cpp b/src/dynarmic/backend/x64/a64_interface.cpp
+index e2d5557d..eb45b859 100644
+--- a/src/dynarmic/backend/x64/a64_interface.cpp
++++ b/src/dynarmic/backend/x64/a64_interface.cpp
+@@ -90,7 +90,12 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
+     const bool precise = conf.check_halt_on_memory_access && live_precise_get_set.load(std::memory_order_relaxed) != 0;
+     const Optimization::DeadCodeEliminationOptions dce{.keep_memory_reads = conf.check_halt_on_memory_access};
+     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && (!conf.check_halt_on_memory_access || precise)) {
+-        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise});
++        // Patch 0081: `OMNI_JIT_GETSET_WIDTH=0` turns the width forwarding off.
++        static const bool width = [] {
++            const char* v = std::getenv("OMNI_JIT_GETSET_WIDTH");
++            return v == nullptr || v[0] != '0';
++        }();
++        Optimization::A64GetSetElimination(ir_block, {.precise_at_memory_aborts = precise, .forward_width_changes = width});
+         Optimization::DeadCodeElimination(ir_block, dce);
+     }
+     if (conf.HasOptimization(OptimizationFlag::ConstProp)) {
+diff --git a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+index bc97aaeb..d40556b9 100644
+--- a/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
++++ b/src/dynarmic/ir/opt/a64_get_set_elimination_pass.cpp
+@@ -31,6 +31,8 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+     struct RegisterInfo {
+         IR::Value register_value;
+         TrackingType tracking_type;
++        /// Patch 0081: with an X value from a W write, the W value written (W reads take it).
++        IR::Value w_value;
+         bool set_instruction_present = false;
+         Iterator last_set_instruction;
+     };
+@@ -47,11 +49,12 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+ 
+         info.register_value = value;
+         info.tracking_type = tracking_type;
++        info.w_value = {};  // patch 0081: set again by the caller for a W write
+         info.set_instruction_present = true;
+         info.last_set_instruction = set_inst;
+     };
+ 
+-    const auto do_get = [](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
++    const auto do_get = [&block, &opt](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
+         const auto do_nothing = [&] {
+             info = {};
+             info.register_value = IR::Value(&*get_inst);
+@@ -68,6 +71,19 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+             return;
+         }
+ 
++        // Omnidroid patch 0081: a W read of an X value is its low word (whether the X value was
++        // written or read). Not the other way: an X read after a W *read* has unknown upper bits;
++        // a W write is turned into an X one below, so its X reads match above.
++        if (opt.forward_width_changes && info.tracking_type == TrackingType::X && tracking_type == TrackingType::W) {
++            if (!info.w_value.IsEmpty()) {
++                get_inst->ReplaceUsesWith(info.w_value);
++                return;
++            }
++            const auto low = block.PrependNewInst(get_inst, IR::Opcode::LeastSignificantWord, {info.register_value});
++            get_inst->ReplaceUsesWith(IR::Value(&*low));
++            return;
++        }
++
+         do_nothing();
+     };
+ 
+@@ -108,6 +124,19 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
+         }
+         case IR::Opcode::A64SetW: {
+             const size_t index = A64::RegNumber(inst->GetArg(0).GetA64RegRef());
++            const IR::Value written = inst->GetArg(1);
++            if (opt.forward_width_changes && !written.IsImmediate()) {
++                // Patch 0081: `SetX (ZeroExtendWordToLong v)` in its place, tracked as the X value
++                // (and `v` for W reads). The emitted store is the same: the value zero-extended,
++                // all 64 bits of the register.
++                const A64::Reg reg_ref = inst->GetArg(0).GetA64RegRef();
++                const auto wide = block.PrependNewInst(inst, IR::Opcode::ZeroExtendWordToLong, {written});
++                const auto set_x = block.PrependNewInst(inst, IR::Opcode::A64SetX, {IR::Value(reg_ref), IR::Value(&*wide)});
++                inst->Invalidate();
++                do_set(reg_info.at(index), IR::Value(&*wide), set_x, TrackingType::X);
++                reg_info.at(index).w_value = written;
++                break;
++            }
+             do_set(reg_info.at(index), inst->GetArg(1), inst, TrackingType::W);
+             break;
+         }
+diff --git a/src/dynarmic/ir/opt/passes.h b/src/dynarmic/ir/opt/passes.h
+index 8b03de4e..07e411ad 100644
+--- a/src/dynarmic/ir/opt/passes.h
++++ b/src/dynarmic/ir/opt/passes.h
+@@ -45,6 +45,11 @@ struct A64GetSetEliminationOptions {
+     /// data access, under `check_halt_on_memory_access`): no Set before it is erased by a Set
+     /// after it. Reads are still forwarded across it.
+     bool precise_at_memory_aborts = false;
++    /// Omnidroid patch 0081: a general register's value forwarded to a read of the other width. A W
++    /// write (`SetW v`) becomes `SetX (ZeroExtendWordToLong v)` -- what writing Wn means: Xn's upper
++    /// half zeroed -- so a later X read takes that value, and a later W read takes `v`; a W read after
++    /// an X write takes the X value's low word. Instead of storing the register and loading it back.
++    bool forward_width_changes = false;
+ };
+ 
+ void PolyfillPass(IR::Block& block, const PolyfillOptions& opt);

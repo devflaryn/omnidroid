@@ -45,6 +45,11 @@ struct A64GetSetEliminationOptions {
     /// data access, under `check_halt_on_memory_access`): no Set before it is erased by a Set
     /// after it. Reads are still forwarded across it.
     bool precise_at_memory_aborts = false;
+    /// Omnidroid patch 0081: a general register's value forwarded to a read of the other width. A W
+    /// write (`SetW v`) becomes `SetX (ZeroExtendWordToLong v)` -- what writing Wn means: Xn's upper
+    /// half zeroed -- so a later X read takes that value, and a later W read takes `v`; a W read after
+    /// an X write takes the X value's low word. Instead of storing the register and loading it back.
+    bool forward_width_changes = false;
 };
 
 void PolyfillPass(IR::Block& block, const PolyfillOptions& opt);

@@ -31,6 +31,8 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
     struct RegisterInfo {
         IR::Value register_value;
         TrackingType tracking_type;
+        /// Patch 0081: with an X value from a W write, the W value written (W reads take it).
+        IR::Value w_value;
         bool set_instruction_present = false;
         Iterator last_set_instruction;
     };
@@ -47,11 +49,12 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
 
         info.register_value = value;
         info.tracking_type = tracking_type;
+        info.w_value = {};  // patch 0081: set again by the caller for a W write
         info.set_instruction_present = true;
         info.last_set_instruction = set_inst;
     };
 
-    const auto do_get = [](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
+    const auto do_get = [&block, &opt](RegisterInfo& info, Iterator get_inst, TrackingType tracking_type) {
         const auto do_nothing = [&] {
             info = {};
             info.register_value = IR::Value(&*get_inst);
@@ -65,6 +68,19 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
 
         if (info.tracking_type == tracking_type) {
             get_inst->ReplaceUsesWith(info.register_value);
+            return;
+        }
+
+        // Omnidroid patch 0081: a W read of an X value is its low word (whether the X value was
+        // written or read). Not the other way: an X read after a W *read* has unknown upper bits;
+        // a W write is turned into an X one below, so its X reads match above.
+        if (opt.forward_width_changes && info.tracking_type == TrackingType::X && tracking_type == TrackingType::W) {
+            if (!info.w_value.IsEmpty()) {
+                get_inst->ReplaceUsesWith(info.w_value);
+                return;
+            }
+            const auto low = block.PrependNewInst(get_inst, IR::Opcode::LeastSignificantWord, {info.register_value});
+            get_inst->ReplaceUsesWith(IR::Value(&*low));
             return;
         }
 
@@ -108,6 +124,19 @@ void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
         }
         case IR::Opcode::A64SetW: {
             const size_t index = A64::RegNumber(inst->GetArg(0).GetA64RegRef());
+            const IR::Value written = inst->GetArg(1);
+            if (opt.forward_width_changes && !written.IsImmediate()) {
+                // Patch 0081: `SetX (ZeroExtendWordToLong v)` in its place, tracked as the X value
+                // (and `v` for W reads). The emitted store is the same: the value zero-extended,
+                // all 64 bits of the register.
+                const A64::Reg reg_ref = inst->GetArg(0).GetA64RegRef();
+                const auto wide = block.PrependNewInst(inst, IR::Opcode::ZeroExtendWordToLong, {written});
+                const auto set_x = block.PrependNewInst(inst, IR::Opcode::A64SetX, {IR::Value(reg_ref), IR::Value(&*wide)});
+                inst->Invalidate();
+                do_set(reg_info.at(index), IR::Value(&*wide), set_x, TrackingType::X);
+                reg_info.at(index).w_value = written;
+                break;
+            }
             do_set(reg_info.at(index), inst->GetArg(1), inst, TrackingType::W);
             break;
         }

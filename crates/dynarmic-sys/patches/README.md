@@ -821,3 +821,25 @@ the location up once; the "not yet defined" assert runs with the IR verification
 
 MEASURED (`the_speed_of_emission`, i5-4460): **emit 13.1 -> 11.9 us/block (-9%)**; byte-identical
 (`tools/compare_emit_dumps.py`).
+
+### 0081 — IR: a register read forwarded across a width change (`OMNI_JIT_GETSET_WIDTH`, on unless `0`)
+
+Both backends' IR pass (enabled by the x64 translate path; arm64 passes the old options).
+`A64GetSetElimination` forwarded a register's known value only to a read of the same width, so `ldrb
+w8, [x26, #4]!; ldr x8, [x21, x8, lsl #3]` -- Luau's bytecode dispatch, the hottest loop of the
+game's engine worker (`libroblox+0x5f58ae0`, 5.5% of its samples) -- stored X8 and loaded it back two
+instructions later, a store-to-load round trip on the dependency chain into the next load, at every
+Lua instruction. Now a W write `SetW v` is emitted as `SetX (ZeroExtendWordToLong v)` (what writing Wn
+means; the same 64-bit store) and tracked as that X value, with `v` kept for W reads; a W read of an
+X value is its low word (`LeastSignificantWord`). An X read after a W *read* still loads (its upper
+half is unknown). A first form that inserted the extension at the read instead had the register
+allocator spill the W value (`SetW` zero-extends its argument in place) and forwarded X reads after
+W reads -- wrong; the differential below caught it.
+
+MEASURED: the dispatch block `mov [r15+0x40],rax; ...; mov rax,[r15+0x40]` -> `mov [r15+0x40],rax;
+...; shl rax,3` (188 -> 184 bytes; its neighbours -2..-3%). First translation +2% (frontend 4.78 ->
+4.90 us/block, emit unchanged). **Guest-visible differential** (a scratch test, not committed: the
+first blocks of every function of libc, libart, libhwui, libandroid_runtime and every KiB of
+libroblox's code, registers seeded per start, all 31 registers and the PC hashed after every block,
+~385k block runs): identical hashes on and off; the wrong first form changed libart's and
+libroblox's. dynarmic-sys suite: as before (Linux: the snapshot tests' known -10).
