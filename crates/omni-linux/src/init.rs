@@ -477,12 +477,17 @@ impl Init {
     pub fn boot(&self, classes: &[&str]) -> Vec<String> {
         let mut started = Vec::new();
         let t = std::time::Instant::now();
+        // Time spent starting services (each a spawn: a guest space, a code cache, a program loaded).
+        let (mut start_ms, mut starts) = (0u128, 0usize);
         for c in &self.boot_commands {
             match c {
                 Command::Start(n) => {
+                    let ts = std::time::Instant::now();
                     if self.start_service(n) {
                         started.push(n.clone());
+                        starts += 1;
                     }
+                    start_ms += ts.elapsed().as_millis();
                 }
                 Command::ExecStart(n) => {
                     let t = std::time::Instant::now();
@@ -508,25 +513,31 @@ impl Init {
                     }
                 }
                 Command::PerformApexConfig { bootstrap } => {
+                    let t = std::time::Instant::now();
                     if !bootstrap {
                         self.create_apex_data_dirs();
                     }
                     let status = self.exec(&["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], 0);
-                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
-                        eprintln!("[init] perform_apex_config{}: linkerconfig {status:?}", if *bootstrap { " --bootstrap" } else { "" });
+                    let ms = t.elapsed().as_millis();
+                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || ms >= 50 || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] perform_apex_config{}: linkerconfig {status:?} in {ms} ms", if *bootstrap { " --bootstrap" } else { "" });
                     }
                 }
                 Command::InitUser0 => {
+                    let t = std::time::Instant::now();
                     let status = self.exec(&["/system/bin/vdc", "--wait", "cryptfs", "init_user0"], 0);
-                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
-                        eprintln!("[init] init_user0: {status:?}");
+                    let ms = t.elapsed().as_millis();
+                    if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || ms >= 50 || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] init_user0: {status:?} in {ms} ms");
                     }
                 }
                 Command::WaitForProp(name, value) => {
                     let Some(props) = self.properties() else { continue };
+                    let t = std::time::Instant::now();
                     let ok = props.wait_for(name, value, WAIT_FOR_PROP_TIMEOUT);
-                    if !ok || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
-                        eprintln!("[init] wait_for_prop {name} {value}: {}", if ok { "done" } else { "timed out" });
+                    let ms = t.elapsed().as_millis();
+                    if !ok || ms >= 50 || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                        eprintln!("[init] wait_for_prop {name} {value}: {} in {ms} ms", if ok { "done" } else { "timed out" });
                     }
                 }
             }
@@ -535,7 +546,7 @@ impl Init {
         let t = std::time::Instant::now();
         let classes_started = self.class_start(classes);
         eprintln!(
-            "[init] boot commands {commands_ms} ms; class_start {} ms ({} services{})",
+            "[init] boot commands {commands_ms} ms ({start_ms} ms of it starting {starts} services); class_start {} ms ({} services{})",
             t.elapsed().as_millis(),
             classes_started.len(),
             if parallel_class_start() { ", in parallel" } else { "" }
