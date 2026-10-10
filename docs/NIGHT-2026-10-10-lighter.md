@@ -63,6 +63,7 @@ On eight E-cores only 1.84 cores are busy at 33.8 fps: the frame is a cross-thre
 | 7 | dynarmic **0079**: Xbyak's label manager without heap nodes (tsl robin map/set, flat waiting list) | `the_speed_of_emission`, byte-identical | emit **15.7 -> 13.1 us/block (-16.5%)**, i5-4460 | yes (device check s5) |
 | 8 | dynarmic **0080**: a value's host location from a checked hint, not a search | same | emit **13.1 -> 11.9 us/block (-9%)** | yes (device check s5) |
 | 9 | system_server and the HALs after servicemanager is ready, not a fixed 1.5 s sleep (`OMNI_INIT_FIXED_WAIT=1` = old) | s6 `s6-boot.csv`, ABCCBA, 2 pairs; `[t]` milestones | servicemanager was ready "after 0 ms": **system_server 12.5/12.1 -> 10.4/10.4 s, boot_completed 30.8/30.8 -> 29.5/29.5, DID_LOG_IN 59.2/61.0 -> 58.6/58.6, onGameLoaded 87.3/88.0 -> 84.7/85.7** | **yes** |
+| 11 | the game's live code 512 MiB (`OMNI_JIT_SHARED_CACHE_LIVE_MB=512`, default 256) | s7, 2 pairs | 2 regions retired during the start instead of ~18; onGameLoaded and private WS unchanged | no (neutral; with snapshots: s9) |
 | 10 | the place's link at once after sign-in (`OMNI_R_LINK_DELAY=0`, default 3) | s6, 2 runs | Joining 71.8/63.6 vs 70.6/67.7: the sign-in-to-Joining gap swings 5-14 s run to run (matchmaking, network) | no (inconclusive; default unchanged) |
 
 **Why the in-world worker got cheaper with faster translation:** the game keeps translating in the
@@ -134,10 +135,35 @@ Also: every rebuild of the host binary refuses every snapshot (host addresses ar
 
 `live512` = `OMNI_JIT_SHARED_CACHE_LIVE_MB=512` (default 256). With it the game retires **2 regions
 during its start instead of ~18**; its code-aging pass at ~3 min then retires ~29 and memory comes
-back to the same place. First pair: DID_LOG_IN 57.6 vs 58.2 s, onGameLoaded 83.7 vs 84.3, private WS
-2.995 vs 2.965 GB -- on 24 threads the start's re-translation is absorbed in parallel.
+back to the same place. Two pairs: DID_LOG_IN 57.6 / 61.4 vs 58.2 / 60.0 s, onGameLoaded 83.7 / 89.5 vs
+84.3 / 88.6, private WS 2.995 / 2.977 vs 2.965 / 3.027 GB: **neutral** on 24 threads, where the start's
+re-translation is absorbed in parallel. Default stays 256 MiB; retested with snapshots (s9), where the
+restored set needs the room.
 
 **The snapshot arms of s7 are invalid** (an error of the session's design): a snapshot file is keyed
 by the process, not by the cache's configuration, so `snap512` and `snap` overwrote each other's
 files in one directory and each refused the other's (`app_process64 not installed (error -10)`).
 A snapshot comparison needs one directory per configuration.
+
+## Session s8 (02:51-): the working set, trimmed (`s8-trim.csv`)
+
+`wstrim` = `OMNI_WS_TRIM=120`: every host process empties its working set every 120 s
+(`K32EmptyWorkingSet`). What each kept, and what it had touched again two minutes later:
+
+| host process | before | after the trim | 2 min later |
+|---|---|---|---|
+| system host | 1,294 MB | 29 MB | **187 MB** |
+| game | 3,011 MB | 185 MB | **748 MB** |
+| each idle app host (4) | 139-161 MB | 0 | **2 MB** |
+
+| arm | fps | all ms/frame | private WS | system host | onGameLoaded |
+|---|---|---|---|---|---|
+| base | 59.03 | 45.40 | 2.982 GB | 0.819 GB | 86.7 s |
+| wstrim | 59.47 | 39.82 | **0.735 GB** | **0.138 GB** | 83.7 s |
+
+No hitch in the 5 s fps windows around the game's trim (59.92 / 59.71 / 60.11). Most of the memory
+omnidroid holds resident is **cold**: the system host touches ~190 MB in two minutes, the game ~750
+MB, the helper apps nearly nothing. What this frees for the machine is less than the private
+working set says -- trimmed pages go to the system's compressed store (or the page file) -- so the
+harness now also records available physical memory and the compressed store's working set
+(`avail_gb`, `mc_gb`); the next sessions measure the real RAM freed.

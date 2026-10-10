@@ -112,7 +112,7 @@ function Result($status, $extra) {
   $row = [ordered]@{ tag = $tag; arm = $Arm; status = $status; when = (Get-Date -Format o); warp = $warp }
   if ($extra) { foreach ($k in $extra.Keys) { $row[$k] = $extra[$k] } }
   $obj = [pscustomobject]$row
-  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads,loaded_s,cores,affinity,warp,t_ss,t_boot,t_login,t_join,t_loaded,log"
+  $cols = "tag,arm,status,when,fps,top_ms,top2_ms,app_ms,all_ms,priv_gb,app_priv_gb,procs,top_name,join_s,ws_gb,wspriv_gb,sys_wspriv_gb,threads,sys_threads,loaded_s,cores,affinity,warp,t_ss,t_boot,t_login,t_join,t_loaded,log,avail_gb,mc_gb"
   if (-not (Test-Path $Csv)) { Set-Content -Path $Csv -Value $cols -Encoding utf8 }
   $line = ($cols.Split(",") | ForEach-Object { $v = $obj.$_; if ($null -eq $v) { "" } else { [string]$v } }) -join ","
   Add-Content -Path $Csv -Value $line -Encoding utf8
@@ -149,6 +149,10 @@ $s0 = Snap
 $priv = New-Object System.Collections.ArrayList; $appPriv = New-Object System.Collections.ArrayList; $procs = 0
 $ws = New-Object System.Collections.ArrayList; $wsPriv = New-Object System.Collections.ArrayList; $sysWsPriv = New-Object System.Collections.ArrayList
 $sysThreads = New-Object System.Collections.ArrayList; $threadsAll = New-Object System.Collections.ArrayList
+# The machine's side: physical memory available, and the working set of the system's compressed
+# store ("Memory Compression") -- where trimmed private pages go -- so a smaller private working
+# set can be told apart from memory that only moved.
+$avail = New-Object System.Collections.ArrayList; $mcws = New-Object System.Collections.ArrayList
 $wEnd = (Get-Date).AddSeconds($WindowSec)
 while ((Get-Date) -lt $wEnd) {
   Start-Sleep 15
@@ -163,6 +167,9 @@ while ((Get-Date) -lt $wEnd) {
   $sysP = $g | Sort-Object { $_.Threads.Count } -Descending | Select-Object -First 1
   if ($sysP) { [void]$sysThreads.Add($sysP.Threads.Count); $sw = $wmi | Where-Object { $_.IDProcess -eq $sysP.Id } | Select-Object -First 1; if ($sw) { [void]$sysWsPriv.Add([double]$sw.WorkingSetPrivate) } }
   [void]$threadsAll.Add((($g | ForEach-Object { $_.Threads.Count }) | Measure-Object -Sum).Sum)
+  try { [void]$avail.Add([double](Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory).AvailableMBytes) } catch {}
+  $mcp = Get-Process -Name "Memory Compression" -ErrorAction SilentlyContinue
+  if ($mcp) { [void]$mcws.Add([double]$mcp.WorkingSet64) }
 }
 $s1 = Snap
 # Milestones, from the log's own clock (`[t] +N.Ns` ticks, about one a second): when system_server's
@@ -227,4 +234,6 @@ Result ($(if ($kicked) { "kicked" } else { "ok" })) ([ordered]@{
   t_join = $ms.t_join
   t_loaded = $ms.t_loaded
   log = Split-Path -Leaf $log
+  avail_gb = "{0:N3}" -f ((Med $avail) / 1024)
+  mc_gb = "{0:N3}" -f ((Med $mcws) / 1GB)
 })
