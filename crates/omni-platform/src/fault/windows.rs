@@ -797,3 +797,103 @@ mod tests {
         );
     }
 }
+
+/// The standard error handle [`install_crash_report`] saved, for the filter to write through.
+static CRASH_STDERR: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`super::install_crash_report`].
+pub(super) fn install_crash_report() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter;
+    CRASH_STDERR.store(std::io::stderr().as_raw_handle() as usize, Ordering::Relaxed);
+    // SAFETY: installs a process-wide filter; `crash_filter` follows the filter's contract.
+    unsafe { SetUnhandledExceptionFilter(Some(crash_filter)) };
+}
+
+/// Appends `s` to `buf` at `*at`, as much as fits.
+fn put(buf: &mut [u8], at: &mut usize, s: &[u8]) {
+    let n = s.len().min(buf.len() - *at);
+    buf[*at..*at + n].copy_from_slice(&s[..n]);
+    *at += n;
+}
+
+/// Appends `v` in hexadecimal (`0x...`).
+fn put_hex(buf: &mut [u8], at: &mut usize, v: u64) {
+    let mut digits = [0u8; 18];
+    digits[0] = b'0';
+    digits[1] = b'x';
+    let mut n = 2;
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let d = ((v >> (shift * 4)) & 0xf) as u8;
+        if d != 0 || started || shift == 0 {
+            started = true;
+            digits[n] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+            n += 1;
+        }
+    }
+    put(buf, at, &digits[..n]);
+}
+
+unsafe extern "system" fn crash_filter(info: *const EXCEPTION_POINTERS) -> i32 {
+    use windows_sys::Win32::Storage::FileSystem::WriteFile;
+    use windows_sys::Win32::System::LibraryLoader::{
+        GetModuleFileNameA, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    let mut buf = [0u8; 512];
+    let mut at = 0;
+    put(&mut buf, &mut at, b"\n[host-crash] exception ");
+    if !info.is_null() {
+        // SAFETY: the OS hands the filter valid exception pointers for the call.
+        let record = unsafe { (*info).ExceptionRecord };
+        if !record.is_null() {
+            // SAFETY: as above.
+            let (code, address, count, params) = unsafe {
+                ((*record).ExceptionCode as u32, (*record).ExceptionAddress as usize, (*record).NumberParameters, (*record).ExceptionInformation)
+            };
+            put_hex(&mut buf, &mut at, u64::from(code));
+            put(&mut buf, &mut at, b" at ");
+            put_hex(&mut buf, &mut at, address as u64);
+            let mut module: windows_sys::Win32::Foundation::HMODULE = core::ptr::null_mut();
+            // SAFETY: asks which loaded module holds `address`; writes `module` only.
+            let found = unsafe {
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, address as *const u16, &raw mut module)
+            } != 0;
+            if found {
+                let mut name = [0u8; 260];
+                // SAFETY: `name` holds 260 bytes; the call writes at most that.
+                let n = unsafe { GetModuleFileNameA(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+                let base = name[..n].iter().rposition(|&c| c == b'\\').map_or(0, |i| i + 1);
+                put(&mut buf, &mut at, b" (");
+                put(&mut buf, &mut at, &name[base..n]);
+                put(&mut buf, &mut at, b"+");
+                put_hex(&mut buf, &mut at, (address - module as usize) as u64);
+                put(&mut buf, &mut at, b")");
+            } else {
+                put(&mut buf, &mut at, b" (in no module: generated code or a stub)");
+            }
+            if code == EXCEPTION_ACCESS_VIOLATION as u32 && count >= 2 {
+                put(&mut buf, &mut at, match params[0] {
+                    0 => b" reading ".as_slice(),
+                    1 => b" writing ".as_slice(),
+                    8 => b" executing ".as_slice(),
+                    _ => b" accessing ".as_slice(),
+                });
+                put_hex(&mut buf, &mut at, params[1] as u64);
+            }
+        }
+    }
+    put(&mut buf, &mut at, b", thread ");
+    // SAFETY: no arguments.
+    put_hex(&mut buf, &mut at, u64::from(unsafe { GetCurrentThreadId() }));
+    put(&mut buf, &mut at, b"\n");
+    let handle = CRASH_STDERR.load(Ordering::Relaxed);
+    if handle != 0 {
+        let mut written = 0u32;
+        // SAFETY: the saved standard error handle and a buffer of `at` bytes.
+        unsafe { WriteFile(handle as windows_sys::Win32::Foundation::HANDLE, buf.as_ptr(), at as u32, &raw mut written, core::ptr::null_mut()) };
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}

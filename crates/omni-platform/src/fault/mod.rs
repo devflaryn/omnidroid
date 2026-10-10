@@ -370,6 +370,21 @@ pub fn prepare_thread() -> FaultResult<()> {
     }
 }
 
+/// **A crash that is not the guest's, reported** (Windows): a top-level exception filter that, when
+/// the process is about to die of an exception nothing handled -- an access violation in host code,
+/// which the fault handlers rightly decline -- writes one line to standard error before it does:
+/// the exception, the instruction (module and offset, or a raw address in generated code), the
+/// access and its address, and the thread. Without it such a process ended with nothing but its
+/// exit status (`0xC0000005`, the game's host process in s17's first run, 2026-10-10). The filter
+/// allocates nothing and the process dies as before. A no-op elsewhere (a fatal signal is reported
+/// by the runtime there).
+pub fn install_crash_report() {
+    #[cfg(target_os = "windows")]
+    {
+        backend::install_crash_report();
+    }
+}
+
 /// Dispatch counters. See [`FaultStats`].
 pub fn stats() -> FaultStats {
     backend::stats()

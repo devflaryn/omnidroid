@@ -41,6 +41,8 @@ fn main() -> ExitCode {
     omni_linux::code_trim::start();
     omni_linux::lever::start();
     omni_linux::proccpu::start();
+    // A crash of this host process itself (not the guest's) says where it was (Windows).
+    omni_platform::fault::install_crash_report();
     omni_linux::jit_time::start();
     omni_linux::ws_trim::start();
     omni_linux::zero_reclaim::start();
