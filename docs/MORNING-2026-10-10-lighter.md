@@ -70,16 +70,18 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   and a process re-saves only when 2% of its snapshot is new -- one fill run wrote 492 saves, 5.3 GB;
   both measured in s23). Small daemons verify 99.9%, apps 99.7%, the game 91%. One switch now:
   **`OMNI_JIT_SNAPSHOT=1`** (the temporary directory's `omni-jit-snapshot`, with lazy pages, the library
-  zone, forgetting and 512 MiB of live code by default). **Not ready for a default: on four E-cores
-  the game's host died of an access violation in 3 of 4 runs (s17, s26)** -- never without snapshots
-  (6 of 6), never at full CPU; s28's two runs did not (no JIT change in between). On four E-cores they
-  are worth the most: **the world in 111-115 s against 140 s**. A crash now says where in generated
-  code it was (cache, region, state: dynarmic 0100) -- s32 runs four more. A new stress test (restored
-  code run by four jits while another evicts, forgets, invalidates and saves, on two cores) has not
-  faulted.
+  zone, forgetting and 512 MiB of live code by default). **Their crash is found and fixed (dynarmic
+  0101, 56d6f8c), being confirmed (s35):** on four E-cores the game's host had died in 7 of 12 snapshot
+  runs (s17, s26, s32). s32's two crashes, caught by the kept crash filter, were the same instruction:
+  `EmitX64::ForgetOutgoingSlots`, a write through a link record already trimmed. Forgetting a restored
+  loop that was never entered left a dead record at the head of the links to it (a loop links to
+  itself; its head was read from a copy taken before its own links were forgotten); translated again
+  and its old region evicted, the next unlink wrote out of bounds. A new test reproduces it (SIGSEGV)
+  and passes with the fix. On four E-cores snapshots are worth the most: **the world in 111-140 s
+  against 140 s**.
 - **The saved device you actually boot (s19): the world in 49-53 s** (a new device ~67-72 s),
   boot_completed 17.5 s, the 767 MiB copy 0.9 s, apexd decompresses nothing. Two things it redid at
-  every boot, now fixed and being measured (s31): installd relabelling every app's data tree (labels
+  every boot, now fixed (s31: boot_completed 16.2 s, AppDataPrepare 2.2 -> 1.25 s, 266 restorecons -> 0): installd relabelling every app's data tree (labels
   were in memory only; now kept per instance, c871dae) and PackageManager parsing all 170 system
   packages (its cache never held: every file's mtime read 0; f273e9e). The cache fix helps devices
   saved before at once (their cache files are there); the labels only once a device is made again.
@@ -87,10 +89,11 @@ help: `docs/NIGHT-2026-10-10-lighter.md`.
   code caches 267, guest memory 214, the GPU driver's write-combined memory 93, large blocks ~220
   (s20 traces the Rust ones). The game's 2.5 GB: Roblox's own mimalloc arenas ~1.55 GB of guest
   memory, the driver's 336 MiB. The game frees memory with `MADV_DONTNEED` at 54k calls / 6.7 GB in
-  its first minute, each holding the address space's lock: being timed (s32).
+  its first minute, each holding the address space's lock -- timed (s33): 0.65-0.85 s of its busiest
+  minute, ~1% of a core; the lock shared changed nothing measurable (opt-in).
 
 ## For you to decide
 
-- Translation snapshots on by default -- once s17's crash on slow cores is fixed (above).
+- Translation snapshots on by default -- if s35 shows the fix holds on slow cores (above).
 - Saved devices by hard link instead of a ~780 MB copy per boot; ~3 GB of old `-gutted` saved
   devices in `%TEMP%\omni-golden` (yours to delete).
