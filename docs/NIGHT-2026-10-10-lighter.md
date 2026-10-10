@@ -450,6 +450,8 @@ s against 140.4/140.7 without snapshots (s17), sign-in 75 against 94-96 s**, and
 |---|---|---|---|---|---|---|---|
 | tail | 31.27 | 64.29 | 2.523 | 5.2 | 31.3 | 71.1 | 116.2 |
 | anon (`OMNI_SHARED_TAIL=0`) | 31.12 | 63.41 | 2.559 | 3.1 | 29.7 | 70.5 | 109.6 |
+| anon, high QoS set by hand at ~+120 s (after its load) | **58.31** | **34.13** | 2.529 | 3.0 | 30.2 | 72.3 | 118.4 |
+| tail | 29.64 | 67.19 | 2.437 | 5.1 | 36.6 | 77.0 | 117.2 |
 
 Both arms ran at half speed, unlike every run before 09:25: zygote's preload 1.41 -> 2.35-2.50 s,
 the system host's JIT 4.9 + 12.1 -> 7.6 + 17.5 s for the same blocks. The host was not busy (5%
