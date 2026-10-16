@@ -75,6 +75,21 @@ fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
+/// `--cookie`'s value, a leading `~` taken as the home directory: a path typed at the app's
+/// prompt or given over MCP reaches the plugin as typed, with no shell to expand it.
+fn cookie_arg() -> Option<String> {
+    var("OMNI_ARG_COOKIE").map(|arg| home_expanded(&arg, var("HOME").or_else(|| var("USERPROFILE")).as_deref()))
+}
+
+/// `~` or `~/...` (`~\...`) with `home` in its place; anything else, or no home, as it is.
+fn home_expanded(arg: &str, home: Option<&str>) -> String {
+    let rest = match arg.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => rest,
+        _ => return arg.to_string(),
+    };
+    home.map_or_else(|| arg.to_string(), |home| format!("{home}{rest}"))
+}
+
 /// omnidroid's app-data directory (`OMNI_APP_DATA_DIR`).
 fn app_data_dir() -> Option<PathBuf> {
     var("OMNI_APP_DATA_DIR").map(PathBuf::from)
@@ -129,7 +144,7 @@ fn session_start() -> ExitCode {
 /// `play`: the account's cookie in `OMNI_COMMAND`'s store, and its own storage.
 fn play() -> Result<Answer, String> {
     let mut answer = Answer::default();
-    let cookie = var("OMNI_ARG_COOKIE").as_deref().map(account_cookie).transpose()?;
+    let cookie = cookie_arg().as_deref().map(account_cookie).transpose()?;
     let fresh = var("OMNI_FRESH").as_deref() == Some("1");
     let place = var("OMNI_ARG_PLACE");
     if place.is_some() && fresh && cookie.is_none() {
@@ -217,7 +232,7 @@ fn aosp() -> Result<Answer, String> {
     for (key, value) in session_env(var("OMNI_R_LOCALE").is_some()) {
         answer.env(key, &value);
     }
-    if let Some(arg) = var("OMNI_ARG_COOKIE") {
+    if let Some(arg) = cookie_arg() {
         let saved = cookies_dir().map(|d| d.join(format!("{arg}.txt"))).filter(|p| p.is_file());
         let path = match (Path::new(&arg).is_file(), saved) {
             (true, _) => PathBuf::from(&arg),
@@ -486,6 +501,16 @@ mod tests {
     use super::*;
 
     const VALUE: &str = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you.|_ABC123";
+
+    #[test]
+    fn a_cookie_path_takes_a_leading_tilde_as_home() {
+        assert_eq!(home_expanded("~/Desktop/cookies/a.txt", Some("/Users/me")), "/Users/me/Desktop/cookies/a.txt");
+        assert_eq!(home_expanded("~\\cookies\\a.txt", Some("C:\\Users\\me")), "C:\\Users\\me\\cookies\\a.txt");
+        assert_eq!(home_expanded("~", Some("/Users/me")), "/Users/me");
+        assert_eq!(home_expanded("~other/a.txt", Some("/Users/me")), "~other/a.txt", "another user's home is not ours");
+        assert_eq!(home_expanded("farm4", Some("/Users/me")), "farm4", "a saved name stays a name");
+        assert_eq!(home_expanded("~/a.txt", None), "~/a.txt");
+    }
 
     #[test]
     fn a_roblox_session_names_its_link_and_markers_and_keeps_a_given_locale() {
