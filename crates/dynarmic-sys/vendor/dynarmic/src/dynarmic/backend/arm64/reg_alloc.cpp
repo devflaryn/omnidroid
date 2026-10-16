@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
+#include <cstdlib>
 #include <iterator>
 
 #include <mcl/assert.hpp>
@@ -27,6 +30,63 @@ using namespace oaknut::util;
 
 constexpr size_t spill_offset = offsetof(StackLayout, spill);
 constexpr size_t spill_slot_size = sizeof(decltype(StackLayout::spill)::value_type);
+
+namespace {
+/// Omnidroid patch 0103: the allocator's own consistency checks -- that a value is not defined
+/// twice (a search of every location that always runs to the end) and that every location is
+/// unlocked after each instruction (a walk of all 129) -- run with the IR verification
+/// (`OMNI_JIT_VERIFY=1`, patch 0077), as the x64 allocator's do (patch 0080). They assert and
+/// change nothing.
+bool VerifyAllocation() {
+    static const bool on = [] {
+        const char* v = std::getenv("OMNI_JIT_VERIFY");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+}  // namespace
+
+std::size_t RegAlloc::IndexOf(HostLoc loc) {
+    switch (loc.kind) {
+    case HostLoc::Kind::Gpr:
+        return static_cast<std::size_t>(loc.index);
+    case HostLoc::Kind::Fpr:
+        return 32 + static_cast<std::size_t>(loc.index);
+    case HostLoc::Kind::Flags:
+        return 64;
+    case HostLoc::Kind::Spill:
+        return 65 + static_cast<std::size_t>(loc.index);
+    }
+    UNREACHABLE();
+}
+
+HostLoc RegAlloc::LocationAt(std::size_t index) {
+    if (index < 32) {
+        return HostLoc{HostLoc::Kind::Gpr, static_cast<int>(index)};
+    }
+    if (index < 64) {
+        return HostLoc{HostLoc::Kind::Fpr, static_cast<int>(index - 32)};
+    }
+    if (index == 64) {
+        return HostLoc{HostLoc::Kind::Flags, 0};
+    }
+    return HostLoc{HostLoc::Kind::Spill, static_cast<int>(index - 65)};
+}
+
+void RegAlloc::Hint(const HostLocInfo& info, HostLoc loc) const {
+    const auto hint = static_cast<std::uint8_t>(IndexOf(loc));
+    for (const IR::Inst* value : info.values) {
+        value->SetHostLocHint(hint);
+    }
+}
+
+u64 RegAlloc::NextSeed() {
+    // Per thread: one shared counter's cache line went back and forth between the threads that
+    // translate side by side.
+    thread_local u64 counter = 0x2545F4914F6CDD1D ^ reinterpret_cast<u64>(&counter);
+    counter += 0x9E3779B97F4A7C15;
+    return counter | 1;
+}
 
 static bool IsValuelessType(IR::Type type) {
     switch (type) {
@@ -133,15 +193,17 @@ RegAlloc::ArgumentInfo RegAlloc::GetArgumentInfo(IR::Inst* inst) {
         const IR::Value arg = inst->GetArg(i);
         ret[i].value = arg;
         if (!arg.IsImmediate() && !IsValuelessType(arg.GetType())) {
-            ASSERT_MSG(ValueLocation(arg.GetInst()), "argument must already been defined");
-            ValueInfo(arg.GetInst()).uses_this_inst++;
+            const auto location = ValueLocation(arg.GetInst());  // patch 0103: looked up once
+            ASSERT_MSG(location, "argument must already been defined");
+            ValueInfo(*location).uses_this_inst++;
+            Touch(*location);
         }
     }
     return ret;
 }
 
 bool RegAlloc::WasValueDefined(IR::Inst* inst) const {
-    return defined_insts.count(inst) > 0;
+    return inst->BackendDefined();  // patch 0103
 }
 
 void RegAlloc::PrepareForCall(std::optional<Argument::copyable_reference> arg0, std::optional<Argument::copyable_reference> arg1, std::optional<Argument::copyable_reference> arg2, std::optional<Argument::copyable_reference> arg3) {
@@ -189,44 +251,52 @@ void RegAlloc::PrepareForCall(std::optional<Argument::copyable_reference> arg0, 
 }
 
 void RegAlloc::DefineAsExisting(IR::Inst* inst, Argument& arg) {
-    defined_insts.insert(inst);
+    inst->SetBackendDefined();
 
-    ASSERT(!ValueLocation(inst));
+    ASSERT(!VerifyAllocation() || !ValueLocation(inst));
 
     if (arg.value.IsImmediate()) {
         inst->ReplaceUsesWith(arg.value);
         return;
     }
 
-    auto& info = ValueInfo(arg.value.GetInst());
+    const auto location = ValueLocation(arg.value.GetInst());
+    ASSERT(location);
+    auto& info = ValueInfo(*location);
     info.values.push_back(inst);
     info.expected_uses += inst->UseCount();
+    inst->SetHostLocHint(static_cast<std::uint8_t>(IndexOf(*location)));
+    Touch(*location);
 }
 
 void RegAlloc::DefineAsRegister(IR::Inst* inst, oaknut::Reg reg) {
-    defined_insts.insert(inst);
+    inst->SetBackendDefined();
 
-    ASSERT(!ValueLocation(inst));
-    auto& info = reg.is_vector() ? fprs[reg.index()] : gprs[reg.index()];
+    ASSERT(!VerifyAllocation() || !ValueLocation(inst));
+    const HostLoc location{reg.is_vector() ? HostLoc::Kind::Fpr : HostLoc::Kind::Gpr, reg.index()};
+    auto& info = ValueInfo(location);
     ASSERT(info.IsCompletelyEmpty());
     info.values.push_back(inst);
     info.expected_uses += inst->UseCount();
+    inst->SetHostLocHint(static_cast<std::uint8_t>(IndexOf(location)));
+    Touch(location);
 }
 
 void RegAlloc::UpdateAllUses() {
-    for (auto& gpr : gprs) {
-        gpr.UpdateUses();
-    }
-    for (auto& fpr : fprs) {
-        fpr.UpdateUses();
-    }
-    flags.UpdateUses();
-    for (auto& spill : spills) {
-        spill.UpdateUses();
+    // Omnidroid patch 0103: only the locations this instruction touched -- an argument's use
+    // counted, a value defined or moved there -- can have anything to update: elsewhere no use was
+    // counted, and a location's values all used up was cleared by the update after its last use.
+    for (std::size_t word = 0; word < touched.size(); word++) {
+        for (std::uint64_t bits = std::exchange(touched[word], 0); bits != 0; bits &= bits - 1) {
+            ValueInfo(LocationAt(word * 64 + static_cast<std::size_t>(std::countr_zero(bits)))).UpdateUses();
+        }
     }
 }
 
 void RegAlloc::AssertAllUnlocked() const {
+    if (!VerifyAllocation()) {
+        return;  // patch 0103
+    }
     const auto is_unlocked = [](const auto& i) { return !i.locked && !i.realized; };
     ASSERT(std::all_of(gprs.begin(), gprs.end(), is_unlocked));
     ASSERT(std::all_of(fprs.begin(), fprs.end(), is_unlocked));
@@ -341,6 +411,8 @@ int RegAlloc::RealizeReadImpl(const IR::Value& value) {
 
         gprs[new_location_index] = std::exchange(ValueInfo(*current_location), {});
         gprs[new_location_index].realized = true;
+        Hint(gprs[new_location_index], HostLoc{HostLoc::Kind::Gpr, new_location_index});  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Gpr, new_location_index});
         return new_location_index;
     } else if constexpr (required_kind == HostLoc::Kind::Fpr) {
         const int new_location_index = AllocateRegister(fprs, fpr_order);
@@ -363,6 +435,8 @@ int RegAlloc::RealizeReadImpl(const IR::Value& value) {
 
         fprs[new_location_index] = std::exchange(ValueInfo(*current_location), {});
         fprs[new_location_index].realized = true;
+        Hint(fprs[new_location_index], HostLoc{HostLoc::Kind::Fpr, new_location_index});  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Fpr, new_location_index});
         return new_location_index;
     } else if constexpr (required_kind == HostLoc::Kind::Flags) {
         ASSERT_FALSE("A simple read from flags is likely a logic error.");
@@ -373,23 +447,29 @@ int RegAlloc::RealizeReadImpl(const IR::Value& value) {
 
 template<HostLoc::Kind kind>
 int RegAlloc::RealizeWriteImpl(const IR::Inst* value) {
-    defined_insts.insert(value);
+    value->SetBackendDefined();
 
-    ASSERT(!ValueLocation(value));
+    ASSERT(!VerifyAllocation() || !ValueLocation(value));
 
     if constexpr (kind == HostLoc::Kind::Gpr) {
         const int new_location_index = AllocateRegister(gprs, gpr_order);
         SpillGpr(new_location_index);
         gprs[new_location_index].SetupLocation(value);
+        value->SetHostLocHint(static_cast<std::uint8_t>(new_location_index));  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Gpr, new_location_index});
         return new_location_index;
     } else if constexpr (kind == HostLoc::Kind::Fpr) {
         const int new_location_index = AllocateRegister(fprs, fpr_order);
         SpillFpr(new_location_index);
         fprs[new_location_index].SetupLocation(value);
+        value->SetHostLocHint(static_cast<std::uint8_t>(32 + new_location_index));  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Fpr, new_location_index});
         return new_location_index;
     } else if constexpr (kind == HostLoc::Kind::Flags) {
         SpillFlags();
         flags.SetupLocation(value);
+        value->SetHostLocHint(64);  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Flags, 0});
         return 0;
     } else {
         static_assert(Common::always_false_v<mcl::mp::lift_value<kind>>);
@@ -398,7 +478,7 @@ int RegAlloc::RealizeWriteImpl(const IR::Inst* value) {
 
 template<HostLoc::Kind kind>
 int RegAlloc::RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value) {
-    defined_insts.insert(write_value);
+    write_value->SetBackendDefined();
 
     // TODO: Move elimination
 
@@ -427,18 +507,27 @@ template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Gpr>(const IR::Value&
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Fpr>(const IR::Value&, const IR::Inst*);
 template int RegAlloc::RealizeReadWriteImpl<HostLoc::Kind::Flags>(const IR::Value&, const IR::Inst*);
 
-int RegAlloc::AllocateRegister(const std::array<HostLocInfo, 32>& regs, const std::vector<int>& order) const {
+int RegAlloc::AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order) const {
     const auto empty = std::find_if(order.begin(), order.end(), [&](int i) { return regs[i].IsCompletelyEmpty(); });
     if (empty != order.end()) {
         return *empty;
     }
 
-    std::vector<int> candidates;
-    std::copy_if(order.begin(), order.end(), std::back_inserter(candidates), [&](int i) { return regs[i].MaybeAllocatable(); });
+    // Omnidroid patch 0103: on the stack, and a random pick by xorshift.
+    std::array<int, 32> candidates;
+    std::size_t count = 0;
+    for (const int i : order) {
+        if (regs[i].MaybeAllocatable()) {
+            candidates[count++] = i;
+        }
+    }
+    ASSERT_MSG(count > 0, "no register to allocate");
 
     // TODO: LRU
-    std::uniform_int_distribution<size_t> dis{0, candidates.size() - 1};
-    return candidates[dis(rand_gen)];
+    rand_state ^= rand_state << 13;
+    rand_state ^= rand_state >> 7;
+    rand_state ^= rand_state << 17;
+    return candidates[rand_state % count];
 }
 
 void RegAlloc::SpillGpr(int index) {
@@ -449,6 +538,8 @@ void RegAlloc::SpillGpr(int index) {
     const int new_location_index = FindFreeSpill();
     code.STR(oaknut::XReg{index}, SP, spill_offset + new_location_index * spill_slot_size);
     spills[new_location_index] = std::exchange(gprs[index], {});
+    Hint(spills[new_location_index], HostLoc{HostLoc::Kind::Spill, new_location_index});  // patch 0103
+    Touch(HostLoc{HostLoc::Kind::Spill, new_location_index});
 }
 
 void RegAlloc::SpillFpr(int index) {
@@ -459,10 +550,14 @@ void RegAlloc::SpillFpr(int index) {
     const int new_location_index = FindFreeSpill();
     code.STR(oaknut::QReg{index}, SP, spill_offset + new_location_index * spill_slot_size);
     spills[new_location_index] = std::exchange(fprs[index], {});
+    Hint(spills[new_location_index], HostLoc{HostLoc::Kind::Spill, new_location_index});  // patch 0103
+    Touch(HostLoc{HostLoc::Kind::Spill, new_location_index});
 }
 
 void RegAlloc::ReadWriteFlags(Argument& read, IR::Inst* write) {
-    defined_insts.insert(write);
+    if (write) {
+        write->SetBackendDefined();
+    }
 
     const auto current_location = ValueLocation(read.value.GetInst());
     ASSERT(current_location);
@@ -489,6 +584,8 @@ void RegAlloc::ReadWriteFlags(Argument& read, IR::Inst* write) {
     if (write) {
         flags.SetupLocation(write);
         flags.realized = false;
+        write->SetHostLocHint(64);  // patch 0103
+        Touch(HostLoc{HostLoc::Kind::Flags, 0});
     }
 }
 
@@ -501,6 +598,8 @@ void RegAlloc::SpillFlags() {
     SpillGpr(new_location_index);
     code.MRS(oaknut::XReg{new_location_index}, oaknut::SystemReg::NZCV);
     gprs[new_location_index] = std::exchange(flags, {});
+    Hint(gprs[new_location_index], HostLoc{HostLoc::Kind::Gpr, new_location_index});  // patch 0103
+    Touch(HostLoc{HostLoc::Kind::Gpr, new_location_index});
 }
 
 int RegAlloc::FindFreeSpill() const {
@@ -561,19 +660,30 @@ void RegAlloc::LoadCopyInto(const IR::Value& value, oaknut::QReg reg) {
 }
 
 std::optional<HostLoc> RegAlloc::ValueLocation(const IR::Inst* value) const {
-    const auto contains_value = [value](const HostLocInfo& info) { return info.Contains(value); };
-
-    if (const auto iter = std::find_if(gprs.begin(), gprs.end(), contains_value); iter != gprs.end()) {
-        return HostLoc{HostLoc::Kind::Gpr, static_cast<int>(iter - gprs.begin())};
+    const auto at = [this](std::size_t index) -> const HostLocInfo& {
+        if (index < 32) {
+            return gprs[index];
+        }
+        if (index < 64) {
+            return fprs[index - 32];
+        }
+        if (index == 64) {
+            return flags;
+        }
+        return spills[index - 65];
+    };
+    // Omnidroid patch 0103: where the value was last seen, if it is still there. A value is in one
+    // location at a time (a move takes it out of the old one), so that is where the search below
+    // would find it.
+    const std::size_t hint = value->HostLocHint();
+    if (hint < location_count && at(hint).Contains(value)) {
+        return LocationAt(hint);
     }
-    if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != fprs.end()) {
-        return HostLoc{HostLoc::Kind::Fpr, static_cast<int>(iter - fprs.begin())};
-    }
-    if (contains_value(flags)) {
-        return HostLoc{HostLoc::Kind::Flags, 0};
-    }
-    if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != spills.end()) {
-        return HostLoc{HostLoc::Kind::Spill, static_cast<int>(iter - spills.begin())};
+    for (std::size_t i = 0; i < location_count; i++) {
+        if (at(i).Contains(value)) {
+            value->SetHostLocHint(static_cast<std::uint8_t>(i));
+            return LocationAt(i);
+        }
     }
     return std::nullopt;
 }
@@ -593,21 +703,9 @@ HostLocInfo& RegAlloc::ValueInfo(HostLoc host_loc) {
 }
 
 HostLocInfo& RegAlloc::ValueInfo(const IR::Inst* value) {
-    const auto contains_value = [value](const HostLocInfo& info) { return info.Contains(value); };
-
-    if (const auto iter = std::find_if(gprs.begin(), gprs.end(), contains_value); iter != gprs.end()) {
-        return *iter;
-    }
-    if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != fprs.end()) {
-        return *iter;
-    }
-    if (contains_value(flags)) {
-        return flags;
-    }
-    if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != spills.end()) {
-        return *iter;
-    }
-    ASSERT_FALSE("RegAlloc::ValueInfo: Value not found");
+    const auto location = ValueLocation(value);  // patch 0103: the hint first
+    ASSERT_MSG(location, "RegAlloc::ValueInfo: Value not found");
+    return ValueInfo(*location);
 }
 
 }  // namespace Dynarmic::Backend::Arm64

@@ -1,6 +1,8 @@
 //! **The app's screen**: the Androids and the instances, the log, and a command line -- full-screen
-//! in the terminal (ratatui over crossterm: the Windows console and Unix terminals alike).
-use std::sync::Arc;
+//! in the terminal (ratatui over crossterm: the Windows console and Unix terminals alike). It is a
+//! window on the pool's host ([`super::host`]): what it shows is the host's, what is typed is done
+//! there, and other windows open at the same time show the same.
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -10,10 +12,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 
-use omni_pool::{DeviceInfo, DeviceState, InstanceInfo, InstanceState, Pool};
+use omni_pool::{DeviceInfo, DeviceState, InstanceInfo, InstanceState};
 
 use super::command::{self, Command};
-use super::mcp::McpServer;
+use super::host::{Client, View};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -23,8 +25,13 @@ enum Focus {
 
 /// What the screen holds between frames.
 pub struct App {
-    pub pool: Arc<Pool>,
-    pub mcp: Option<McpServer>,
+    pub client: Client,
+    /// The pool as last heard.
+    view: View,
+    /// The host stopped answering: since when.
+    lost: Option<Instant>,
+    /// The settings' `stop_on_exit` when this window quit.
+    pub stop_on_exit: bool,
     input: String,
     history: Vec<String>,
     history_at: Option<usize>,
@@ -70,8 +77,8 @@ fn instance_state(s: &InstanceState) -> (String, Color) {
 
 impl App {
     #[must_use]
-    pub fn new(pool: Arc<Pool>, mcp: Option<McpServer>) -> Self {
-        Self { pool, mcp, input: String::new(), history: Vec::new(), history_at: None, focus: Focus::Instances, devices: TableState::default(), instances: TableState::default(), quit_asked: None, quit: false }
+    pub fn new(client: Client) -> Self {
+        Self { client, view: View::default(), lost: None, stop_on_exit: true, input: String::new(), history: Vec::new(), history_at: None, focus: Focus::Instances, devices: TableState::default(), instances: TableState::default(), quit_asked: None, quit: false }
     }
 
     /// Run the screen until the person quits.
@@ -82,7 +89,8 @@ impl App {
         let mut terminal = ratatui::init();
         let result = (|| -> std::io::Result<()> {
             while !self.quit {
-                let (devices, instances) = self.pool.snapshot();
+                self.refresh();
+                let (devices, instances) = (self.view.devices.clone(), self.view.instances.clone());
                 terminal.draw(|f| self.draw(f, &devices, &instances))?;
                 if event::poll(Duration::from_millis(250))? {
                     if let Event::Key(key) = event::read()? {
@@ -95,7 +103,36 @@ impl App {
             Ok(())
         })();
         ratatui::restore();
+        self.stop_on_exit = self.view.config.stop_on_exit;
         result.map(|()| self)
+    }
+
+    /// The pool as the host has it now. A host gone silent is said once; after 10 s the window
+    /// quits (its pool is gone: the next window starts one).
+    fn refresh(&mut self) {
+        match self.client.state() {
+            Ok(view) => {
+                self.view = view;
+                if self.lost.take().is_some() {
+                    self.client.say("the pool answers again");
+                }
+            }
+            Err(e) => match self.lost {
+                None => {
+                    self.lost = Some(Instant::now());
+                    self.client.say(format!("the pool does not answer: {e}"));
+                }
+                Some(t) if t.elapsed() > Duration::from_secs(10) => self.quit = true,
+                Some(_) => {}
+            },
+        }
+    }
+
+    /// A line for the host: said in the log when it cannot be sent.
+    fn send(&mut self, line: &str) {
+        if let Err(e) = self.client.line(line) {
+            self.client.say(format!("the pool: {e}"));
+        }
     }
 
     fn key(&mut self, code: KeyCode, mods: KeyModifiers, devices: &[DeviceInfo], instances: &[InstanceInfo]) {
@@ -170,16 +207,14 @@ impl App {
         match self.focus {
             Focus::Instances => {
                 if let Some(i) = self.instances.selected().and_then(|s| instances.get(s)) {
-                    let id = i.id;
-                    if let Err(e) = self.pool.close(id) {
-                        self.pool.say(e);
-                    }
+                    let line = format!("close {}", i.id);
+                    self.send(&line);
                 }
             }
             Focus::Devices => {
                 if let Some(d) = self.devices.selected().and_then(|s| devices.get(s)) {
-                    let (pool, id) = (Arc::clone(&self.pool), d.id);
-                    std::thread::spawn(move || pool.kill(id));
+                    let line = format!("kill {}", d.id);
+                    self.send(&line);
                 }
             }
         }
@@ -187,171 +222,48 @@ impl App {
 
     fn ask_quit(&mut self, instances: &[InstanceInfo]) {
         let running = instances.iter().filter(|i| !matches!(i.state, InstanceState::Ended(_))).count();
-        let stop = self.pool.config().stop_on_exit;
-        if running == 0 || !stop || self.quit_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
+        let stop = self.view.config.stop_on_exit;
+        // Another window open keeps the pool: this one just goes.
+        let last = self.view.windows <= 1;
+        if running == 0 || !stop || !last || self.lost.is_some() || self.quit_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) {
             self.quit = true;
         } else {
             self.quit_asked = Some(Instant::now());
-            self.pool.say(format!("{running} instance{} still run: quit again (Ctrl+C or `quit`) within 10 s to stop them and every Android", if running == 1 { "" } else { "s" }));
+            self.client.say(format!("{running} instance{} still run: quit again (Ctrl+C or `quit`) within 10 s to stop them and every Android", if running == 1 { "" } else { "s" }));
         }
     }
 
     fn execute(&mut self, line: &str, instances: &[InstanceInfo]) {
-        let pool = Arc::clone(&self.pool);
         match command::parse(line) {
             Err(e) if e.is_empty() => {}
-            Err(e) => pool.say(e),
-            Ok(Command::Run(apk, n)) => {
-                if let Err(e) = pool.launch(&apk, n) {
-                    pool.say(format!("run: {e}"));
-                }
-            }
-            Ok(Command::Close(ids)) => {
-                for id in ids {
-                    if let Err(e) = pool.close(id) {
-                        pool.say(e);
-                    }
-                }
-            }
-            Ok(Command::CloseAll) => {
-                for i in instances.iter().filter(|i| !matches!(i.state, InstanceState::Ended(_))) {
-                    let _ = pool.close(i.id);
-                }
-            }
-            Ok(Command::Warm) => {
-                let id = pool.warm();
-                pool.say(format!("D{id}: warming"));
-            }
-            Ok(Command::Kill(ids)) => {
-                for id in ids {
-                    let pool = Arc::clone(&pool);
-                    std::thread::spawn(move || {
-                        if let Err(e) = pool.kill(id) {
-                            pool.say(e);
-                        }
-                    });
-                }
-            }
-            Ok(Command::KillAll) => {
-                let (devices, _) = pool.snapshot();
-                for d in devices {
-                    let pool = Arc::clone(&pool);
-                    std::thread::spawn(move || pool.kill(d.id));
-                }
-            }
-            Ok(Command::Shell(id, cmd)) => match pool.device(id) {
-                Some(dev) => {
-                    std::thread::spawn(move || match dev.shell_as(&cmd, Some(0), Duration::from_secs(120)) {
-                        Ok((code, out)) => {
-                            for l in out.lines().take(60) {
-                                pool.say(format!("D{id}> {l}"));
-                            }
-                            pool.say(format!("D{id}: exit {code}"));
-                        }
-                        Err(e) => pool.say(format!("D{id}: {e}")),
-                    });
-                }
-                None => pool.say(format!("no Android D{id}")),
-            },
-            Ok(Command::Plugins(args)) => match crate::plugins_lines(&args) {
-                Ok(lines) => lines.into_iter().for_each(|l| pool.say(l)),
-                Err(e) => pool.say(format!("plugins: {e}")),
-            },
-            Ok(Command::Settings) => {
-                let c = pool.config();
-                for (key, what) in omni_pool::config::KEYS {
-                    pool.say(format!("{key} = {}   ({what})", c.get(key).unwrap_or_default()));
-                }
-            }
-            Ok(Command::Set(key, value)) => match pool.set(&key, &value) {
-                Ok(()) if key.starts_with("mcp_") => self.mcp_follow(),
-                Ok(()) => {}
-                Err(e) => pool.say(e),
-            },
-            Ok(Command::Mcp(what)) => self.mcp_command(&what),
-            Ok(Command::Clear) => pool.clear_ended(),
-            Ok(Command::Help) => command::HELP.iter().for_each(|l| pool.say(*l)),
+            Err(e) => self.client.say(e),
+            Ok(Command::Run(apk, n, options)) => run_apk(&mut self.client, &apk, n, &options),
+            Ok(Command::Help) => command::HELP.iter().for_each(|l| self.client.say(*l)),
             Ok(Command::Quit) => self.ask_quit(instances),
-        }
-    }
-
-    /// The server as the settings say: started, stopped or moved.
-    fn mcp_follow(&mut self) {
-        let c = self.pool.config();
-        if let Some(s) = self.mcp.take() {
-            s.stop();
-        }
-        if c.mcp_enabled {
-            match McpServer::start(Arc::clone(&self.pool), c.mcp_port) {
-                Ok(s) => {
-                    self.pool.say(format!("MCP: listening on {}", s.url()));
-                    self.mcp = Some(s);
-                }
-                Err(e) => self.pool.say(format!("MCP: {e}")),
-            }
-        } else {
-            self.pool.say("MCP: off");
-        }
-    }
-
-    fn mcp_command(&mut self, what: &str) {
-        let pool = Arc::clone(&self.pool);
-        match what {
-            "on" => {
-                if let Err(e) = pool.set("mcp_enabled", "true") {
-                    return pool.say(e);
-                }
-                self.mcp_follow();
-                self.mcp_command("register");
-            }
-            "off" => {
-                if let Err(e) = pool.set("mcp_enabled", "false") {
-                    return pool.say(e);
-                }
-                self.mcp_follow();
-            }
-            "register" => match &self.mcp {
-                Some(s) => {
-                    let url = s.url();
-                    for r in [super::mcp::register_claude(&url), super::mcp::register_pi(&url)] {
-                        pool.say(match r {
-                            Ok(m) => m,
-                            Err(e) => format!("not registered: {e}"),
-                        });
-                    }
-                    super::mcp::snippet(&url).into_iter().for_each(|l| pool.say(l));
-                }
-                None => pool.say("MCP is off: `mcp on` first"),
-            },
-            "status" => match &self.mcp {
-                Some(s) => {
-                    pool.say(format!("MCP: on, {}", s.url()));
-                    super::mcp::snippet(&s.url()).into_iter().for_each(|l| pool.say(l));
-                }
-                None => pool.say("MCP: off (`mcp on` serves it on 127.0.0.1 and registers it for Claude Code and Omni Agent)"),
-            },
-            other => pool.say(format!("mcp on | off | register | status, not `{other}`")),
+            // The rest is the pool's: done by the host, its answer in every window's log.
+            Ok(_) => self.send(line),
         }
     }
 
     fn draw(&mut self, f: &mut Frame, devices: &[DeviceInfo], instances: &[InstanceInfo]) {
         let [top, middle, log, input] = Layout::vertical([Constraint::Length(1), Constraint::Min(8), Constraint::Length(10), Constraint::Length(3)]).areas(f.area());
-        let config = self.pool.config();
+        let config = self.view.config.clone();
         let ready = devices.iter().filter(|d| d.state == DeviceState::Ready).count();
         let running = instances.iter().filter(|i| i.state == InstanceState::Running).count();
-        let mcp = self.mcp.as_ref().map_or_else(|| "MCP off".to_string(), |s| format!("MCP {}", s.url()));
+        let mcp = self.view.mcp.as_ref().map_or_else(|| "MCP off".to_string(), |url| format!("MCP {url}"));
+        let windows = if self.view.windows > 1 { format!("  {} windows", self.view.windows) } else { String::new() };
         let idle = if config.idle_close_minutes == 0 { "idle-close never".to_string() } else { format!("idle-close {}m, keep {}", config.idle_close_minutes, config.keep_warm) };
         f.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(" Omnidroid ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::raw(format!("  Androids {} ({ready} ready)  Instances {running} running  {mcp}  {idle}  `help`", devices.len())),
+                Span::raw(format!("  Androids {} ({ready} ready)  Instances {running} running  {mcp}  {idle}{windows}  `help`", devices.len())),
             ])),
             top,
         );
         let [left, right] = Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(middle);
         self.draw_devices(f, left, devices);
         self.draw_instances(f, right, instances);
-        let lines = self.pool.log();
+        let lines = &self.client.log;
         let shown = log.height.saturating_sub(2) as usize;
         let text: Vec<Line> = lines[lines.len().saturating_sub(shown)..].iter().map(|l| Line::raw(l.clone())).collect();
         f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Log ")).wrap(Wrap { trim: false }), log);
@@ -412,6 +324,26 @@ impl App {
     }
 }
 
+/// `run`: the APK's path made whole here (the host's working directory is not this window's), as is
+/// an option's value naming a file here (a cookie file), then launched by the host.
+pub fn run_apk(client: &mut Client, apk: &Path, n: u32, options: &[String]) {
+    let options: String = options
+        .iter()
+        .map(|o| {
+            let o = if o.starts_with("--") { o.clone() } else { std::fs::canonicalize(o).map_or_else(|_| o.clone(), |p| p.display().to_string()) };
+            if o.contains(char::is_whitespace) { format!(" \"{o}\"") } else { format!(" {o}") }
+        })
+        .collect();
+    match std::fs::canonicalize(apk) {
+        Ok(full) => {
+            if let Err(e) = client.line(&format!("run {} x{n}{options}", full.display())) {
+                client.say(format!("run: the pool: {e}"));
+            }
+        }
+        Err(e) => client.say(format!("run: {}: {e}", apk.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,12 +352,16 @@ mod tests {
     fn the_screen_shows_the_panels_the_log_and_the_prompt() {
         let mut config = omni_pool::Config::default();
         config.warm_on_start = false;
-        let pool = Pool::start(config, None, std::path::PathBuf::from("omnidroid"));
+        let pool = omni_pool::Pool::start(config, None, std::path::PathBuf::from("omnidroid"));
         pool.say("hello from the pool");
-        let mut app = App::new(Arc::clone(&pool), None);
+        let host = super::super::host::Host::new(std::sync::Arc::clone(&pool));
+        let control = omni_mcp::http::serve(0, std::sync::Arc::clone(&host)).unwrap();
+        let url = format!("http://127.0.0.1:{}{}", control.port, omni_mcp::http::PATH);
+        let mut app = App::new(Client::attach(&url).unwrap());
+        app.refresh();
         app.input = "run x.apk".into();
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30)).unwrap();
-        let (devices, instances) = pool.snapshot();
+        let (devices, instances) = (app.view.devices.clone(), app.view.instances.clone());
         terminal.draw(|f| app.draw(f, &devices, &instances)).unwrap();
         let screen: String = terminal.backend().buffer().content().iter().map(ratatui::buffer::Cell::symbol).collect();
         for want in [" Omnidroid ", "Androids", "Instances", "Log", "hello from the pool", "> run x.apk", "MCP off"] {
@@ -434,7 +370,8 @@ mod tests {
         app.execute("set keep_warm 2", &instances);
         assert_eq!(pool.config().keep_warm, 2);
         app.execute("nonsense", &instances);
-        assert!(pool.log().last().unwrap().contains("unknown command"));
+        assert!(app.client.log.last().unwrap().contains("unknown command"));
+        control.stop();
         pool.shutdown(false);
     }
 

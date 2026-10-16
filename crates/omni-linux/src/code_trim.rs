@@ -32,12 +32,38 @@ pub const QUIET_BYTES: u64 = 1 << 20;
 pub const MIN_BYTES: u64 = 6 << 20;
 /// A process is trimmed at most this often.
 pub const AGAIN_AFTER: Duration = Duration::from_secs(600);
-/// A host process using more than this of a core is busy.
-pub const BUSY_CORES: f64 = 0.25;
+/// A host process using more than this of a core is busy. On arm64 hosts (each thread's own
+/// cache, vendored patch 0102) a twentieth: Super Mechs on screen at ~26 fps used 0.16 of a core,
+/// and a trim cost it 203 MiB of translations to make again (M4, 2026-10-16); a cached app process
+/// in the background uses ~0.
+pub const BUSY_CORES: f64 = if cfg!(target_arch = "aarch64") { 0.05 } else { 0.25 };
+
+/// A thread parked in a system call this long has its translations given back
+/// (`OMNI_CODE_PARKED_S`, seconds; 0 off): binder loopers and daemons waiting for work.
+pub const PARKED: Duration = Duration::from_secs(120);
+
+/// **Idle threads' translations, given back** (arm64: each thread translates what it runs into a
+/// cache of its own, and the system's host process has hundreds of threads that wait for work):
+/// every minute, each thread parked in a system call for [`PARKED`] has its code pages given back
+/// (dynarmic patch 0104); it translates what it runs next when it wakes.
+fn parked_pass() {
+    let parked = std::env::var("OMNI_CODE_PARKED_S").ok().and_then(|v| v.parse::<u64>().ok()).map_or(PARKED, Duration::from_secs);
+    if parked.is_zero() || !cfg!(target_arch = "aarch64") {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("omni-code-parked".into()).spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let given: u64 = crate::process::all_live().iter().map(|p| p.discard_parked_code(parked)).sum();
+        if given >= 1 << 20 {
+            eprintln!("[code] host process {}: {} MiB of parked threads' translations given back", std::process::id(), given >> 20);
+        }
+    });
+}
 
 /// Start the trimmer for this host process (once).
 pub fn start() {
     age::start();
+    parked_pass();
     if std::env::var("OMNI_CODE_TRIM").as_deref() == Ok("0") {
         return;
     }

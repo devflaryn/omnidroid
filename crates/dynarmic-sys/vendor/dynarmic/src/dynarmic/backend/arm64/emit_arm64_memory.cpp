@@ -16,6 +16,7 @@
 #include "dynarmic/backend/arm64/emit_context.h"
 #include "dynarmic/backend/arm64/fastmem.h"
 #include "dynarmic/backend/arm64/fpsr_manager.h"
+#include "dynarmic/backend/arm64/page_backed_allocator.h"
 #include "dynarmic/backend/arm64/reg_alloc.h"
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/spin_lock_arm64.h"
@@ -515,9 +516,20 @@ std::pair<oaknut::XReg, oaknut::XReg> FastmemEmitVAddrLookup(oaknut::CodeGenerat
     //   tst  offset, #0xffffffff00000000 ; csel base, Xfastmem, xzr, eq ; access [base, offset]
     // The base goes in whichever scratch the offset does not use (Xscratch1 when top-byte
     // mirroring put the offset in Xscratch0); neither is live at any caller.
+    // Patch 0105: 56 mirrored bits are what the host's own TBI ignores; the tagged address goes
+    // to the MMU as it is.
+    const bool host_tbi = ctx.conf.fastmem_address_space_bits == 56 && ctx.conf.silently_mirror_fastmem
+                       && live_fastmem_host_tbi.load(std::memory_order_relaxed) != 0;
     if (ctx.conf.fastmem_low_window) {
         ASSERT(!ShouldExt32(ctx));
         oaknut::XReg Xoffset = Xaddr;
+        if (host_tbi) {
+            // Below 2^32 whatever the tag: base + tagged offset is the window's host address with
+            // the tag on top (the base is below 2^56), which the MMU ignores.
+            code.TST(Xaddr, 0x00FF'FFFF'0000'0000);
+            code.CSEL(Xscratch0, Xfastmem, XZR, EQ);
+            return std::make_pair(Xscratch0, Xaddr);
+        }
         if (ctx.conf.fastmem_address_space_bits != 64) {
             if (ctx.conf.silently_mirror_fastmem) {
                 code.UBFX(Xscratch0, Xaddr, 0, ctx.conf.fastmem_address_space_bits);
@@ -533,7 +545,7 @@ std::pair<oaknut::XReg, oaknut::XReg> FastmemEmitVAddrLookup(oaknut::CodeGenerat
         return std::make_pair(Xbase, Xoffset);
     }
 
-    if (ctx.conf.fastmem_address_space_bits == 64 || ShouldExt32(ctx)) {
+    if (ctx.conf.fastmem_address_space_bits == 64 || ShouldExt32(ctx) || host_tbi) {
         return std::make_pair(Xfastmem, Xaddr);
     }
 

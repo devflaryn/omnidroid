@@ -7,11 +7,14 @@
 //! * [`pool`]: the devices and instances, the work on threads of their own, and the ticker that
 //!   follows boots, closed windows, ended apps and idle devices.
 //! * [`config`]: the settings, kept in `<app-data>/../app.conf`.
+//! * [`extras`]: what a launch does beyond the install and the start (a plugin's cookie, link).
 pub mod config;
 pub mod device;
+pub mod extras;
 pub mod plan;
 pub mod pool;
 
 pub use config::Config;
+pub use extras::Extras;
 pub use plan::DeviceId;
 pub use pool::{DeviceInfo, DeviceState, InstanceId, InstanceInfo, InstanceState, Pool};

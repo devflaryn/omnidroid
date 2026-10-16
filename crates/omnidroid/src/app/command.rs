@@ -5,8 +5,9 @@ use std::path::PathBuf;
 /// A command typed at the app's prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `run <apk> [xN | N]`: launch N instances of the APK.
-    Run(PathBuf, u32),
+    /// `run <apk> [xN | N] [plugin options]`: launch N instances of the APK, doing what the
+    /// plugins' options say (`--cookie <name> --place <id>`: `super::plugged`).
+    Run(PathBuf, u32, Vec<String>),
     /// `close <#id>... | all`.
     Close(Vec<u32>),
     CloseAll,
@@ -34,9 +35,10 @@ pub enum Command {
 /// The help the app shows.
 pub const HELP: &[&str] = &[
     "run <apk> [xN]       launch N instances of any APK (Tab completes the path)",
+    "  ... --cookie <c> --place <id>   with a plugin's options (`plugins` lists them)",
     "close <#id>... | all close instances (or Delete on a selected one)",
     "warm                 boot one more Android now",
-    "kill <D#>... | all   stop Androids (or Delete on a selected one)",
+    "kill <D#>... | all   stop Androids (or Delete on a selected one): after the last, none warms till run or warm",
     "shell <D#> <cmd>     a shell command on an Android, its output in the log",
     "plugins [list|add [--link] <dir>|remove|enable|disable <name>]",
     "settings | set <key> <value>   the app's settings (idle_close_minutes, keep_warm, mcp_port, ...)",
@@ -68,9 +70,45 @@ fn home() -> Option<PathBuf> {
     std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)
 }
 
-/// `run`'s argument: the path (which may hold spaces) and a trailing count (`x3`, `3`).
-fn run_args(rest: &str) -> Result<(PathBuf, u32), String> {
+/// Words as a shell splits them: on spaces, a quoted word kept whole (its quotes taken off).
+pub fn words(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let (mut quote, mut any) = (None, false);
+    for c in text.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => word.push(c),
+            (None, '"' | '\'') => (quote, any) = (Some(c), true),
+            (None, c) if c.is_whitespace() => {
+                if any || !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+                any = false;
+            }
+            (None, c) => word.push(c),
+        }
+    }
+    if any || !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
+
+/// `run`'s argument: the path (which may hold spaces), a count (`x3`, `3`), and the plugins'
+/// options from the first ` --` on.
+fn run_args(rest: &str) -> Result<(PathBuf, u32, Vec<String>), String> {
     let rest = rest.trim();
+    let (rest, options) = match rest.find(" --") {
+        Some(at) => (rest[..at].trim(), words(&rest[at..])),
+        None => (rest, Vec::new()),
+    };
+    let (path, n) = path_and_count(rest)?;
+    Ok((path, n, options))
+}
+
+/// The path (which may hold spaces) and a trailing count (`x3`, `3`).
+fn path_and_count(rest: &str) -> Result<(PathBuf, u32), String> {
     if rest.is_empty() {
         return Err("run needs an APK's path".into());
     }
@@ -95,7 +133,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
     let (word, rest) = line.split_once(char::is_whitespace).map_or((line, ""), |(w, r)| (w, r.trim()));
     let words: Vec<&str> = rest.split_whitespace().collect();
     match word.to_ascii_lowercase().as_str() {
-        "run" | "r" | "launch" => run_args(rest).map(|(p, n)| Command::Run(p, n)),
+        "run" | "r" | "launch" => run_args(rest).map(|(p, n, o)| Command::Run(p, n, o)),
         "close" | "c" => match words.as_slice() {
             ["all"] => Ok(Command::CloseAll),
             [] => Err("close #id... or close all".into()),
@@ -125,7 +163,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         other => {
             // A path to an APK typed alone runs it.
             if other.to_ascii_lowercase().ends_with(".apk") || line.to_ascii_lowercase().contains(".apk") {
-                return run_args(line).map(|(p, n)| Command::Run(p, n));
+                return run_args(line).map(|(p, n, o)| Command::Run(p, n, o));
             }
             Err(format!("unknown command `{other}` (help lists them)"))
         }
@@ -172,10 +210,16 @@ mod tests {
 
     #[test]
     fn run_takes_a_path_with_spaces_and_a_count() {
-        assert_eq!(parse("run /a b/Talking Tom.apk x3"), Ok(Command::Run(PathBuf::from("/a b/Talking Tom.apk"), 3)));
-        assert_eq!(parse("run game.apk 5"), Ok(Command::Run(PathBuf::from("game.apk"), 5)));
-        assert_eq!(parse("run \"/x/y.apk\""), Ok(Command::Run(PathBuf::from("/x/y.apk"), 1)));
-        assert_eq!(parse("/x/y.apk x2"), Ok(Command::Run(PathBuf::from("/x/y.apk"), 2)), "a path alone runs it");
+        assert_eq!(parse("run /a b/Talking Tom.apk x3"), Ok(Command::Run(PathBuf::from("/a b/Talking Tom.apk"), 3, vec![])));
+        assert_eq!(parse("run game.apk 5"), Ok(Command::Run(PathBuf::from("game.apk"), 5, vec![])));
+        assert_eq!(parse("run \"/x/y.apk\""), Ok(Command::Run(PathBuf::from("/x/y.apk"), 1, vec![])));
+        assert_eq!(parse("/x/y.apk x2"), Ok(Command::Run(PathBuf::from("/x/y.apk"), 2, vec![])), "a path alone runs it");
+        let o = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse("run /a b/Roblox.apk x2 --cookie farm4 --place 8737899170"),
+            Ok(Command::Run(PathBuf::from("/a b/Roblox.apk"), 2, o(&["--cookie", "farm4", "--place", "8737899170"])))
+        );
+        assert_eq!(parse("/x/r.apk --cookie \"/my cookies/a.txt\""), Ok(Command::Run(PathBuf::from("/x/r.apk"), 1, o(&["--cookie", "/my cookies/a.txt"]))));
         assert!(parse("run").is_err() && parse("run a.apk x0").is_err() && parse("run a.apk x65").is_err());
     }
 

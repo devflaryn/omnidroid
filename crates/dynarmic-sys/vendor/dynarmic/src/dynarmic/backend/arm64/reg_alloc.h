@@ -7,7 +7,7 @@
 
 #include <array>
 #include <optional>
-#include <random>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -157,8 +157,12 @@ class RegAlloc final {
 public:
     using ArgumentInfo = std::array<Argument, IR::max_arg_count>;
 
-    explicit RegAlloc(oaknut::CodeGenerator& code, FpsrManager& fpsr_manager, std::vector<int> gpr_order, std::vector<int> fpr_order)
-            : code{code}, fpsr_manager{fpsr_manager}, gpr_order{gpr_order}, fpr_order{fpr_order}, rand_gen{std::random_device{}()} {}
+    // Omnidroid patch 0103: made for every block -- the orders are borrowed (they were two vectors
+    // copied twice), and the generator that picks a register to evict is a few words of xorshift
+    // seeded from a counter (it was `std::random_device`, a system call, and a 624-word Mersenne
+    // Twister seeded from it, every block).
+    explicit RegAlloc(oaknut::CodeGenerator& code, FpsrManager& fpsr_manager, std::span<const int> gpr_order, std::span<const int> fpr_order)
+            : code{code}, fpsr_manager{fpsr_manager}, gpr_order{gpr_order}, fpr_order{fpr_order}, rand_state{NextSeed()} {}
 
     ArgumentInfo GetArgumentInfo(IR::Inst* inst);
     bool WasValueDefined(IR::Inst* inst) const;
@@ -311,7 +315,7 @@ private:
     template<HostLoc::Kind kind>
     int RealizeReadWriteImpl(const IR::Value& read_value, const IR::Inst* write_value);
 
-    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, const std::vector<int>& order) const;
+    int AllocateRegister(const std::array<HostLocInfo, 32>& regs, std::span<const int> order) const;
     void SpillGpr(int index);
     void SpillFpr(int index);
     int FindFreeSpill() const;
@@ -323,19 +327,30 @@ private:
     HostLocInfo& ValueInfo(HostLoc host_loc);
     HostLocInfo& ValueInfo(const IR::Inst* value);
 
+    // Omnidroid patch 0103: every location by one index -- GPRs 0-31, FPRs 32-63, the flags 64,
+    // spill slots from 65 -- for the IR's location hint (`Inst::HostLocHint`, patch 0080) and the
+    // set of locations an instruction touched, which `UpdateAllUses` visits instead of all 129.
+    static constexpr std::size_t location_count = 65 + SpillCount;
+    static std::size_t IndexOf(HostLoc loc);
+    static HostLoc LocationAt(std::size_t index);
+    void Touch(HostLoc loc) { touched[IndexOf(loc) / 64] |= std::uint64_t{1} << (IndexOf(loc) % 64); }
+    // Where the values of `info` (just moved or defined there) now are.
+    void Hint(const HostLocInfo& info, HostLoc loc) const;
+    static u64 NextSeed();
+
     oaknut::CodeGenerator& code;
     FpsrManager& fpsr_manager;
-    std::vector<int> gpr_order;
-    std::vector<int> fpr_order;
+    std::span<const int> gpr_order;
+    std::span<const int> fpr_order;
 
     std::array<HostLocInfo, 32> gprs;
     std::array<HostLocInfo, 32> fprs;
     HostLocInfo flags;
     std::array<HostLocInfo, SpillCount> spills;
+    std::array<std::uint64_t, (location_count + 63) / 64> touched{};
 
-    mutable std::mt19937 rand_gen;
+    mutable u64 rand_state;
 
-    tsl::robin_set<const IR::Inst*> defined_insts;
 };
 
 template<typename T>

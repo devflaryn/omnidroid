@@ -199,7 +199,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     EmittedBlockInfo ebi;
 
     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
-    RegAlloc reg_alloc{code, fpsr_manager, GPR_ORDER, FPR_ORDER};
+    RegAlloc reg_alloc{code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()}, std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()}};
     EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
 
     ebi.entry_point = code.xptr<CodePtr>();

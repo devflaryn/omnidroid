@@ -1,0 +1,187 @@
+diff --git a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+index 7d771678..177e978d 100644
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -152,6 +152,14 @@ struct Jit::Impl final {
+         current_address_space.DumpDisassembly();
+     }
+ 
++    std::size_t OdCodeBytesInUse() const {
++        return current_address_space.OdCodeBytesInUse();
++    }
++
++    std::uint64_t OdCodeBytesEmitted() const {
++        return current_address_space.OdCodeBytesEmitted();
++    }
++
+     std::vector<std::string> Disassemble() const {
+         ASSERT_FALSE("Unimplemented");
+     }
+@@ -320,4 +328,12 @@ std::vector<std::string> Jit::Disassemble() const {
+     return impl->Disassemble();
+ }
+ 
++std::size_t Jit::OdCodeBytesInUse() const {
++    return impl->OdCodeBytesInUse();
++}
++
++std::uint64_t Jit::OdCodeBytesEmitted() const {
++    return impl->OdCodeBytesEmitted();
++}
++
+ }  // namespace Dynarmic::A64
+diff --git a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+index 90fbaf43..258d5262 100644
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -7,6 +7,11 @@
+ #include <cstdio>
+ #include <limits>
+ 
++#if defined(__APPLE__) || defined(__linux__)
++#    include <sys/mman.h>
++#    include <unistd.h>
++#endif
++
+ #include <mcl/bit_cast.hpp>
+ 
+ #include "dynarmic/backend/arm64/a64_address_space.h"
+@@ -106,10 +111,65 @@ void AddressSpace::ClearCache() {
+     decltype(fastmem_records){}.swap(fastmem_records);
+     decltype(link_records){}.swap(link_records);
+     link_heads = {};
++    // Omnidroid patch 0102: and so are the pages the blocks were in.
++    const std::size_t used = static_cast<std::size_t>(code.offset());
+     code.set_offset(prelude_info.end_of_prelude);
++    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
++    od_in_use.store(0, std::memory_order_relaxed);
+     cache_clears++;
+ }
+ 
++// Omnidroid patch 0102: the whole pages of `[from, to)` (offsets into the cache) given back. Their
++// contents are left undefined; nothing executes them until emission writes them again -- the cache
++// is this thread's, and a clear happens outside generated code (at a run's edge, or when `Emit`
++// finds it full, called from the dispatcher in the prelude, which is kept).
++void AddressSpace::OdDiscard(std::size_t from, std::size_t to) {
++#if defined(__APPLE__) || defined(__linux__)
++    const std::size_t page = static_cast<std::size_t>(getpagesize());
++    const std::size_t start = (from + page - 1) & ~(page - 1);
++    const std::size_t end = std::min((to + page - 1) & ~(page - 1), code_cache_size);
++    if (end <= start) {
++        return;
++    }
++    auto* at = reinterpret_cast<u8*>(mem.ptr()) + start;
++#    if defined(__APPLE__)
++    // MADV_DONTNEED frees nothing here; REUSABLE drops the pages from the footprint at once.
++    if (madvise(at, end - start, MADV_FREE_REUSABLE) == 0) {
++        if (od_reusable_end == 0) {
++            od_reuse_mark = start;
++            od_reusable_end = end;
++        } else {
++            od_reuse_mark = std::min(od_reuse_mark, start);
++            od_reusable_end = std::max(od_reusable_end, end);
++        }
++    }
++#    else
++    madvise(at, end - start, MADV_DONTNEED);
++#    endif
++#else
++    (void)from;
++    (void)to;
++#endif
++}
++
++// Omnidroid patch 0102: pages marked reusable below `to` accounted for again before they are
++// written (macOS: MADV_FREE_REUSE), a megabyte at a time.
++void AddressSpace::OdReuseUpTo(std::size_t to) {
++#if defined(__APPLE__)
++    constexpr std::size_t chunk = 1024 * 1024;
++    while (od_reuse_mark < od_reusable_end && od_reuse_mark < to) {
++        const std::size_t end = std::min(od_reuse_mark + chunk, od_reusable_end);
++        madvise(reinterpret_cast<u8*>(mem.ptr()) + od_reuse_mark, end - od_reuse_mark, MADV_FREE_REUSE);
++        od_reuse_mark = end;
++    }
++    if (od_reuse_mark >= od_reusable_end) {
++        od_reuse_mark = od_reusable_end = 0;
++    }
++#else
++    (void)to;
++#endif
++}
++
+ void AddressSpace::DumpDisassembly() const {
+     for (u32* ptr = mem.ptr(); ptr < code.xptr<u32*>(); ptr++) {
+         std::printf("%s", Common::DisassembleAArch64(*ptr, mcl::bit_cast<u64>(ptr)).c_str());
+@@ -125,9 +185,15 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
+         ClearCache();
+     }
+ 
++    // Omnidroid patch 0102: pages given back by a clear are taken again before they are written.
++    const std::size_t emit_from = static_cast<std::size_t>(code.offset());
++    OdReuseUpTo(emit_from + 1024 * 1024);
++
+     UnprotectCodeMemory();
+ 
+     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
++    od_emitted.fetch_add(static_cast<std::size_t>(code.offset()) - emit_from, std::memory_order_relaxed);
++    od_in_use.store(static_cast<std::size_t>(code.offset()) - static_cast<std::size_t>(prelude_info.end_of_prelude), std::memory_order_relaxed);
+ 
+     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
+     const u32 block_index = RecordBlock(block.Location(), block_info);
+diff --git a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+index 322cb3c4..333815cd 100644
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -5,6 +5,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <map>
+ #include <optional>
+ #include <vector>
+@@ -51,6 +52,11 @@ public:
+     // tell a clear made while it emitted a block -- inside a run -- from none.
+     u64 CacheClears() const { return cache_clears; }
+ 
++    // Omnidroid patch 0102: the bytes of translated code the cache holds now (above its prelude)
++    // and has emitted in all, read from any thread.
++    std::size_t OdCodeBytesInUse() const { return od_in_use.load(std::memory_order_relaxed); }
++    u64 OdCodeBytesEmitted() const { return od_emitted.load(std::memory_order_relaxed); }
++
+     void DumpDisassembly() const;
+ 
+ protected:
+@@ -80,6 +86,16 @@ protected:
+ 
+     const size_t code_cache_size;
+     u64 cache_clears = 0;
++
++    // Omnidroid patch 0102: a clear gives the pages its blocks used back to the OS (`OdDiscard`);
++    // on macOS they are marked reusable and accounted for again, a megabyte ahead of emission, as
++    // they are written once more (`OdReuseUpTo`).
++    std::atomic<std::size_t> od_in_use{0};
++    std::atomic<u64> od_emitted{0};
++    std::size_t od_reuse_mark = 0;
++    std::size_t od_reusable_end = 0;
++    void OdDiscard(std::size_t from, std::size_t to);
++    void OdReuseUpTo(std::size_t to);
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+ 
+diff --git a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+index e291ed26..17f9f9d3 100644
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -128,6 +128,11 @@ public:
+      */
+     std::vector<std::string> Disassemble() const;
+ 
++    /// Omnidroid patch 0102 (arm64 backend only): the bytes of translated code this jit's cache
++    /// holds now, and has emitted in all. Safe to call from any thread.
++    std::size_t OdCodeBytesInUse() const;
++    std::uint64_t OdCodeBytesEmitted() const;
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl;

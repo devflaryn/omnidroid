@@ -49,8 +49,13 @@ fn trim(why: &str) {
     eprintln!("[ws-trim] host process {}{why}: working set {before} -> {after} MiB ({took} ms){}", std::process::id(), if ok { "" } else { ", refused" });
 }
 
-/// Start the trimming threads `OMNI_WS_TRIM` / `OMNI_WS_TRIM_IDLE` ask for.
+/// Start the trimming threads `OMNI_WS_TRIM` / `OMNI_WS_TRIM_IDLE` ask for. Windows only: elsewhere
+/// there is no working set to empty (`trim_working_set` refuses), and the idle look read the whole
+/// process's CPU time every 5 s -- on macOS a walk of every thread (~700 in the system's host).
 pub fn start() {
+    if !cfg!(windows) {
+        return;
+    }
     if let Some(every) = seconds("OMNI_WS_TRIM", 120) {
         let once = std::env::var("OMNI_WS_TRIM_ONCE").is_ok_and(|v| v.trim() == "1");
         let _ = std::thread::Builder::new().name("omni-ws-trim".into()).spawn(move || loop {

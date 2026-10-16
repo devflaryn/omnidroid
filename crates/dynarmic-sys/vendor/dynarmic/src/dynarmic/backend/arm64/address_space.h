@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <optional>
 #include <vector>
@@ -51,6 +52,11 @@ public:
     // tell a clear made while it emitted a block -- inside a run -- from none.
     u64 CacheClears() const { return cache_clears; }
 
+    // Omnidroid patch 0102: the bytes of translated code the cache holds now (above its prelude)
+    // and has emitted in all, read from any thread.
+    std::size_t OdCodeBytesInUse() const { return od_in_use.load(std::memory_order_relaxed); }
+    u64 OdCodeBytesEmitted() const { return od_emitted.load(std::memory_order_relaxed); }
+
     void DumpDisassembly() const;
 
 protected:
@@ -80,6 +86,24 @@ protected:
 
     const size_t code_cache_size;
     u64 cache_clears = 0;
+
+    // Omnidroid patch 0102: a clear gives the pages its blocks used back to the OS (`OdDiscard`);
+    // on macOS they are marked reusable and accounted for again, a megabyte ahead of emission, as
+    // they are written once more (`OdReuseUpTo`).
+    std::atomic<std::size_t> od_in_use{0};
+    std::atomic<u64> od_emitted{0};
+    std::size_t od_reuse_mark = 0;
+    std::size_t od_reusable_end = 0;
+    void OdDiscard(std::size_t from, std::size_t to);
+    void OdReuseUpTo(std::size_t to);
+
+public:
+    // Omnidroid patch 0104: every page of translated code given back but the prelude and the two
+    // pages from `keep` (host code a parked thread returns to); its owner is parked and holds no
+    // pointer into the rest. The bytes given back.
+    std::size_t OdDiscardExcept(std::uint64_t keep);
+
+protected:
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 

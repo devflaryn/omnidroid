@@ -152,6 +152,26 @@ struct Jit::Impl final {
         current_address_space.DumpDisassembly();
     }
 
+    std::size_t OdCodeBytesInUse() const {
+        return current_address_space.OdCodeBytesInUse();
+    }
+
+    std::uint64_t OdCodeBytesEmitted() const {
+        return current_address_space.OdCodeBytesEmitted();
+    }
+
+    std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked) {
+        std::unique_lock lock{invalidation_mutex};
+        invalidate_entire_cache = true;
+        HaltExecution(HaltReason::CacheInvalidation);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // The halt is up before this look: a thread that left the callback since will see it.
+        if (resume == 0 || parked.load(std::memory_order_seq_cst) != resume) {
+            return 0;
+        }
+        return current_address_space.OdDiscardExcept(resume);
+    }
+
     std::vector<std::string> Disassemble() const {
         ASSERT_FALSE("Unimplemented");
     }
@@ -318,6 +338,18 @@ void Jit::DumpDisassembly() const {
 
 std::vector<std::string> Jit::Disassemble() const {
     return impl->Disassemble();
+}
+
+std::size_t Jit::OdCodeBytesInUse() const {
+    return impl->OdCodeBytesInUse();
+}
+
+std::uint64_t Jit::OdCodeBytesEmitted() const {
+    return impl->OdCodeBytesEmitted();
+}
+
+std::size_t Jit::OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked) {
+    return impl->OdDiscardParked(resume, parked);
 }
 
 }  // namespace Dynarmic::A64

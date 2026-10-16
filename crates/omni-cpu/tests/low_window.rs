@@ -62,7 +62,15 @@ fn program(low: u64, high: u64, lazy: u64) -> Vec<u32> {
     p
 }
 
+/// Scudo's heap tag (`tbi.rs`).
+const TAG: u64 = 0x02 << 56;
+
 fn run(options: DynarmicOptions) {
+    run_tagged(options, 0);
+}
+
+/// [`run`] with every data pointer the program uses carrying `tag` in bits 56-63.
+fn run_tagged(options: DynarmicOptions, tag: u64) {
     let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let space = windowed();
     let window = space.low_window().expect("the window");
@@ -73,7 +81,7 @@ fn run(options: DynarmicOptions) {
     assert!(code >= LOW_WINDOW_END && high >= LOW_WINDOW_END, "unaddressed mappings stay out of the window");
 
     let backend = DynarmicBackend::new(Arc::clone(&space), options).expect("a backend");
-    let words = program(low as u64, high as u64, (lazy + 2 * MIB / 4) as u64);
+    let words = program(low as u64 | tag, high as u64 | tag, (lazy + 2 * MIB / 4) as u64 | tag);
     let ptr = space.ptr(code, words.len() * 4).expect("the code");
     // SAFETY: committed read-write memory this test owns, `words.len() * 4` bytes of it.
     unsafe { core::ptr::copy_nonoverlapping(words.as_ptr(), ptr.cast::<u32>(), words.len()) };
@@ -129,4 +137,96 @@ fn guest_accesses_below_4_gib_reach_the_window_on_the_direct_path() {
 #[test]
 fn and_with_top_byte_ignore_as_the_linux_personality_runs() {
     run(DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() });
+}
+
+#[test]
+fn and_through_tagged_pointers() {
+    run_tagged(DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() }, TAG);
+}
+
+/// Patch 0105: the tag left to the host's MMU (no `ubfx`; the window's test ignores bits 56-63).
+/// Tagged pointers below 4 GiB still reach the window, above it the identity, and a fault through
+/// a tagged pointer into a lazy range is still demand paging -- the fault layer hands the pager the
+/// untagged address (`omni_platform::fault::reports_untagged_addresses`).
+#[test]
+fn and_through_tagged_pointers_with_the_tag_left_to_the_host() {
+    let host = omni_platform::vm::host_ignores_top_byte() && omni_platform::fault::reports_untagged_addresses();
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let on = omni_cpu::dynarmic::set_fastmem_host_tbi(host);
+    drop(_serial);
+    assert_eq!(on, host && cfg!(target_arch = "aarch64"));
+    let options = DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() };
+    run_tagged(options, TAG);
+    run_tagged(options, 0);
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    omni_cpu::dynarmic::set_fastmem_host_tbi(false);
+}
+
+/// What the window's test costs where the address is on the critical path: four dependent loads an
+/// iteration through a self-pointing word, in the window, above it (the identity), and in a space
+/// without a window.
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_cost_of_the_window_on_pointer_chasing() {
+    const ITER: u64 = 10_000_000;
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for host_tbi in [false, true] {
+        omni_cpu::dynarmic::set_fastmem_host_tbi(host_tbi);
+        for (label, windowed_space, low_data) in [("window, low data ", true, true), ("window, high data", true, false), ("no window        ", false, false)] {
+            let space = if windowed_space {
+                windowed()
+            } else {
+                Arc::new(GuestSpace::with_config(GuestSpaceConfig { size: 8 << 30, ..GuestSpaceConfig::default() }).expect("a space"))
+            };
+            let code = map(&space, Placement::Anywhere { align: space.page_size() }, CommitPolicy::Eager);
+            let data = if low_data {
+                map(&space, Placement::Fixed(LOW_DATA), CommitPolicy::Eager)
+            } else {
+                map(&space, Placement::Anywhere { align: space.page_size() }, CommitPolicy::Eager)
+            };
+            let backend = DynarmicBackend::new(Arc::clone(&space), DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() }).expect("a backend");
+            // A random cycle through 1024 slots 64 bytes apart (64 KiB: L1-resident), so no value
+            // predictor knows the next address.
+            let mut order: Vec<usize> = (1..1024).collect();
+            let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+            for i in (1..order.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                order.swap(i, (seed % (i as u64 + 1)) as usize);
+            }
+            let mut at = 0usize;
+            for &next in order.iter().chain(std::iter::once(&0)) {
+                let slot = space.ptr(data + at * 64, 8).expect("data").cast::<u64>();
+                // SAFETY: committed, 8 bytes, this test's.
+                unsafe { slot.write_unaligned((data + next * 64) as u64) };
+                at = next;
+            }
+            let mut words = mov64(0, data as u64);
+            words.extend(mov64(1, ITER));
+            let start = words.len();
+            words.extend([ldr_imm(0, 0, 0), ldr_imm(0, 0, 0), ldr_imm(0, 0, 0), ldr_imm(0, 0, 0), subs_imm(1, 1, 1)]);
+            let here = words.len();
+            words.push(b_cond(1, start as i32 - here as i32));
+            words.push(ret(30));
+            let ptr = space.ptr(code, words.len() * 4).expect("the code");
+            // SAFETY: committed read-write memory this test owns.
+            unsafe { core::ptr::copy_nonoverlapping(words.as_ptr(), ptr.cast::<u32>(), words.len()) };
+            space.protect(code, MIB, Protection::ReadExecute).expect("executable");
+            backend.invalidate_code(GuestRange::new(code, words.len() * 4).expect("a range"));
+            let mut cpu = backend.create_thread_with_tls().expect("a thread");
+            let sentinel = code + MIB - 4;
+            cpu.set_return_sentinel(sentinel).expect("the sentinel");
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                cpu.set_x(x(30), sentinel as u64);
+                let t = std::time::Instant::now();
+                let exit = cpu.run(code, RunLimit::Unlimited).expect("runs");
+                assert_eq!(exit, ExitReason::Returned { pc: sentinel });
+                best = best.min(t.elapsed().as_secs_f64() * 1e9 / ITER as f64);
+            }
+            println!("host_tbi={} {label}: {best:.3} ns/iter", u8::from(host_tbi));
+        }
+    }
+    omni_cpu::dynarmic::set_fastmem_host_tbi(false);
 }

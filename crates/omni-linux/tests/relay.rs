@@ -98,7 +98,7 @@ fn a_pipe_read_end_receives_what_the_sender_writes() {
             omni_linux::pipe::take(end)
         };
         match r {
-            omni_linux::relay::Took::Data(d) => got.extend_from_slice(&d),
+            omni_linux::relay::Took::Data(d, _) => got.extend_from_slice(&d),
             omni_linux::relay::Took::Closed => break,
             omni_linux::relay::Took::Nothing => {
                 assert!(Instant::now() < deadline, "no end of file (got {got:?}, {} queued)", omni_linux::pipe::available(&pipe));

@@ -413,6 +413,55 @@ pub fn stats() -> FaultStats {
     backend::stats()
 }
 
+/// Whether declined faults are being sampled ([`record_declines`]).
+static RECORDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const DECLINE_RING: usize = 512;
+static DECLINE_AT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const NO_DECLINE: (core::sync::atomic::AtomicUsize, core::sync::atomic::AtomicUsize) = (core::sync::atomic::AtomicUsize::new(0), core::sync::atomic::AtomicUsize::new(0));
+static DECLINES: [(core::sync::atomic::AtomicUsize, core::sync::atomic::AtomicUsize); DECLINE_RING] = [NO_DECLINE; DECLINE_RING];
+
+/// **Sample the faults every handler declined** (a diagnostic, `OMNI_FAULT_STATS`): their address
+/// and instruction pointer go to a ring of the last 512, read by [`recent_declines`]. Nothing is
+/// allocated or locked on the fault path.
+pub fn record_declines(on: bool) {
+    RECORDING.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The declined faults sampled since the last call (at most the last 512): address, instruction
+/// pointer.
+pub fn recent_declines() -> Vec<(usize, usize)> {
+    use core::sync::atomic::Ordering::Relaxed;
+    let mut out = Vec::new();
+    for (a, pc) in &DECLINES {
+        let at = a.swap(0, Relaxed);
+        if at != 0 {
+            out.push((at, pc.load(Relaxed)));
+        }
+    }
+    out
+}
+
+/// A declined fault, for [`recent_declines`] when sampling is on.
+#[allow(dead_code)]
+pub(crate) fn note_decline(address: usize, pc: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if RECORDING.load(Relaxed) {
+        let i = DECLINE_AT.fetch_add(1, Relaxed) % DECLINE_RING;
+        DECLINES[i].1.store(pc, Relaxed);
+        DECLINES[i].0.store(address.max(1), Relaxed);
+    }
+}
+
+/// Whether a data fault through a tagged address (bits 56-63 set, on a host whose MMU ignores
+/// them: `vm::host_ignores_top_byte`) reaches the handlers with the address the MMU used, the
+/// untagged one. What lets a translator leave the tag to the host's MMU and still have its demand
+/// pager resolve such faults.
+#[must_use]
+pub fn reports_untagged_addresses() -> bool {
+    backend::REPORTS_UNTAGGED_ADDRESSES
+}
+
 /// Whether this target has a real implementation. `false` means every call returns
 /// [`FaultError::Unsupported`].
 #[must_use]

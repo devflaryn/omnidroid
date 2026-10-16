@@ -1,0 +1,124 @@
+diff -ru a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -160,6 +160,18 @@
+         return current_address_space.OdCodeBytesEmitted();
+     }
+ 
++    std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked) {
++        std::unique_lock lock{invalidation_mutex};
++        invalidate_entire_cache = true;
++        HaltExecution(HaltReason::CacheInvalidation);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        // The halt is up before this look: a thread that left the callback since will see it.
++        if (resume == 0 || parked.load(std::memory_order_seq_cst) != resume) {
++            return 0;
++        }
++        return current_address_space.OdDiscardExcept(resume);
++    }
++
+     std::vector<std::string> Disassemble() const {
+         ASSERT_FALSE("Unimplemented");
+     }
+@@ -334,6 +346,10 @@
+ 
+ std::uint64_t Jit::OdCodeBytesEmitted() const {
+     return impl->OdCodeBytesEmitted();
++}
++
++std::size_t Jit::OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked) {
++    return impl->OdDiscardParked(resume, parked);
+ }
+ 
+ }  // namespace Dynarmic::A64
+diff -ru a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -152,6 +152,42 @@
+ #endif
+ }
+ 
++// Omnidroid patch 0104: see the header. Called with the jit's invalidation lock held, while its
++// thread is parked in a callback; that thread takes the lock before it clears or emits again.
++std::size_t AddressSpace::OdDiscardExcept(std::uint64_t keep) {
++#if defined(__APPLE__) || defined(__linux__)
++    const std::size_t page = static_cast<std::size_t>(getpagesize());
++    const std::size_t prelude = static_cast<std::size_t>(prelude_info.end_of_prelude);
++    const std::size_t used = static_cast<std::size_t>(code.offset());
++    const auto base = reinterpret_cast<std::uint64_t>(mem.ptr());
++    if (used <= prelude) {
++        return 0;
++    }
++    std::size_t given = 0;
++    if (keep >= base && keep < base + used) {
++        const std::size_t at = static_cast<std::size_t>(keep - base) & ~(page - 1);
++        const std::size_t keep_end = at + 2 * page;
++        if (at > prelude) {
++            OdDiscard(prelude, at);
++            given += at - std::min(at, (prelude + page - 1) & ~(page - 1));
++        }
++        if (keep_end < used) {
++            OdDiscard(keep_end, used);
++            given += ((used + page - 1) & ~(page - 1)) - keep_end;
++        }
++    } else {
++        // Not in this cache's blocks (the prelude, or elsewhere): every block may go.
++        OdDiscard(prelude, used);
++        given += ((used + page - 1) & ~(page - 1)) - ((prelude + page - 1) & ~(page - 1));
++    }
++    od_in_use.store(0, std::memory_order_relaxed);
++    return given;
++#else
++    (void)keep;
++    return 0;
++#endif
++}
++
+ // Omnidroid patch 0102: pages marked reusable below `to` accounted for again before they are
+ // written (macOS: MADV_FREE_REUSE), a megabyte at a time.
+ void AddressSpace::OdReuseUpTo(std::size_t to) {
+diff -ru a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -96,6 +96,14 @@
+     std::size_t od_reusable_end = 0;
+     void OdDiscard(std::size_t from, std::size_t to);
+     void OdReuseUpTo(std::size_t to);
++
++public:
++    // Omnidroid patch 0104: every page of translated code given back but the prelude and the two
++    // pages from `keep` (host code a parked thread returns to); its owner is parked and holds no
++    // pointer into the rest. The bytes given back.
++    std::size_t OdDiscardExcept(std::uint64_t keep);
++
++protected:
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+ 
+diff -ru a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -6,6 +6,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <cstddef>
+ #include <cstdint>
+ #include <memory>
+@@ -132,6 +133,15 @@
+     /// holds now, and has emitted in all. Safe to call from any thread.
+     std::size_t OdCodeBytesInUse() const;
+     std::uint64_t OdCodeBytesEmitted() const;
++
++    /// Omnidroid patch 0104 (arm64 backend only): from another thread, while this jit's thread is
++    /// parked in a callback that returns to `resume` (host code in this jit's cache) and `parked`
++    /// still says so once a halt is raised: ask for a clear and give back every page of
++    /// translated code but those holding the rest of that block. The thread finishes the block on
++    /// return, the halt sends it to the dispatcher, and the clear is made at the edge of its run
++    /// (after this returns: both hold the invalidation lock). The bytes given back; 0 if the
++    /// thread was no longer parked there.
++    std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
+ 
+ private:
+     struct Impl;

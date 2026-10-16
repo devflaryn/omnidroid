@@ -165,7 +165,7 @@ pub fn take(end: &End) -> crate::relay::Took {
         let out: Vec<u8> = bytes.drain(..).collect();
         pipe.changed.notify_all();
         crate::poll::notify_key(std::ptr::from_ref(pipe) as crate::poll::Key);
-        return crate::relay::Took::Data(out);
+        return crate::relay::Took::Data(out, Vec::new());
     }
     if pipe.writers.load(Ordering::SeqCst) == 0 { crate::relay::Took::Closed } else { crate::relay::Took::Nothing }
 }

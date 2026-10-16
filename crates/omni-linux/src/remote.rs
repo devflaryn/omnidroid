@@ -36,6 +36,14 @@ const FD_GET: u8 = 14;
 const FD_DESC: u8 = 15;
 const PROPS: u8 = 16;
 const PROPS_DATA: u8 = 17;
+/// An ioctl with the app's memory it will read (`remote_carry`): `IOCTL`'s payload, then pieces
+/// `addr u64, len u32, bytes`.
+const IOCTL_WITH: u8 = 18;
+/// The system's writes to the app's memory, in order, to apply with no answer: `addr u64, len u32,
+/// bytes` each.
+const WRITES: u8 = 19;
+/// An `IOCTL_WITH`'s result (u64), then the writes it made that are still to apply, as `WRITES`.
+const DONE_WITH: u8 = 20;
 
 /// `OMNI_REMOTE_TRACE=1`: every frame, sent and received, in both host processes.
 fn trace() -> bool {
@@ -107,11 +115,14 @@ fn context_of(b: u8) -> Context {
 
 /// A descriptor as it crosses: `[kind]` then, for shared memory, its name, host path, length and
 /// ashmem protection mask (a read-only region is read-only on the other side too);
-/// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`) and the
-/// end's identity ([`crossing_id`]).
-fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
+/// for a socket pair's end or a pipe's end, the port its relay waits on (`crate::relay`), the
+/// end's identity ([`crossing_id`]) and its file status flags -- `O_NONBLOCK` belongs to the open
+/// file, which a passed descriptor shares: Chromium makes its IPC sockets non-blocking before it
+/// hands one to a renderer, and a renderer given a blocking end waited in `read` on its IO thread
+/// for good (run 2026-10-12).
+pub(crate) fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
     let port = if crate::relay::relayable(file) { crate::relay::offer(Arc::clone(file)).unwrap_or(0) } else { 0 };
-    let id = || [&std::process::id().to_le_bytes()[..], &crossing_id(file).to_le_bytes()].concat();
+    let id = || [&std::process::id().to_le_bytes()[..], &crossing_id(file).to_le_bytes(), &file.flags.lock().to_le_bytes()].concat();
     match &*file.kind.lock() {
         FileKind::Shared(m) => {
             let mut d = vec![1u8];
@@ -134,10 +145,25 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
         // opens the same host file, with the same access, at the same offset. The offset is then
         // each side's own (a Linux descriptor passed on shares one); the files that cross are read
         // or written by one side at a time.
+        //
+        // A file deleted while open (a temporary file, `mkstemp` then `unlink`: Chromium hands its
+        // renderer such files) has no path to open: it crosses as a copy of what it holds now,
+        // which the receiver deletes once it has it open (the trailing `1`). Writes after the
+        // crossing are then each side's own.
         FileKind::Host { file: host, guest, sysroot } if omni_platform::fs::path_of(host).is_ok() => {
             use std::io::Seek;
-            let path = omni_platform::fs::path_of(host).expect("checked");
+            let mut path = omni_platform::fs::path_of(host).expect("checked");
             let offset = (&*host).stream_position().unwrap_or(0);
+            let mut copied = false;
+            if !path.exists() {
+                match copy_of_unlinked(host) {
+                    Some(copy) => (path, copied) = (copy, true),
+                    None => {
+                        eprintln!("[remote] a deleted file cannot cross host processes: {}", String::from_utf8_lossy(guest));
+                        return vec![0u8];
+                    }
+                }
+            }
             let mut d = vec![5u8, u8::from(*sysroot)];
             d.extend_from_slice(&file.flags.lock().to_le_bytes());
             d.extend_from_slice(&offset.to_le_bytes());
@@ -145,6 +171,7 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
                 d.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 d.extend_from_slice(s);
             }
+            d.push(u8::from(copied));
             d
         }
         other => {
@@ -167,7 +194,7 @@ fn describe(file: &Arc<OpenFile>) -> Vec<u8> {
 }
 
 /// The open file a description names, in this host process.
-fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
+pub(crate) fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
     // An end this host process already holds (the same end, crossing again): the same end, as a
     // dup of one socket is one socket -- not a second relay taking from its queue.
     if matches!(d.first(), Some(3 | 4)) {
@@ -198,12 +225,15 @@ fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
             let socket = crate::socket::Socket { domain: 1, ty, peer: Some(mine), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false };
             let other = Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(other)), flags: parking_lot::Mutex::new(2) });
             relay_or_keep(other, port_at(d));
-            Ok(remember_crossed(d, Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(2) })))
+            Ok(remember_crossed(d, Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Socket(socket)), flags: parking_lot::Mutex::new(flags_at(d).unwrap_or(2)) })))
         }
         Some(4) => {
             let (read, write) = crate::pipe::pair();
             let (mine, other) = if d.get(1) == Some(&1) { (write, read) } else { (read, write) };
             relay_or_keep(other, port_at(d));
+            if let Some(flags) = flags_at(d) {
+                *mine.flags.lock() = flags;
+            }
             Ok(remember_crossed(d, mine))
         }
         Some(5) => {
@@ -227,6 +257,10 @@ fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
                 .open(String::from_utf8_lossy(&path).as_ref())
                 .map_err(|_| EBADF)?;
             host.seek(std::io::SeekFrom::Start(offset)).map_err(|_| EIO)?;
+            // A deleted file's copy (`describe`): open now, so deleted as the original was.
+            if d.get(at) == Some(&1) {
+                let _ = std::fs::remove_file(String::from_utf8_lossy(&path).as_ref());
+            }
             Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Host { file: host, guest, sysroot }), flags: parking_lot::Mutex::new(flags) }))
         }
         Some(6) => Ok(Arc::new(OpenFile { kind: parking_lot::Mutex::new(FileKind::Fuse(crate::fuse::Fuse::open())), flags: parking_lot::Mutex::new(2) })),
@@ -236,6 +270,42 @@ fn open_described(d: &[u8]) -> Result<Arc<OpenFile>, Errno> {
         }
         _ => Err(EBADF),
     }
+}
+
+/// A copy of the deleted file `host` holds, in a host temporary file of its own: its path. The
+/// file's offset is left where it was.
+fn copy_of_unlinked(host: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::io::{Seek, SeekFrom};
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("omni-crossing-{}-{n}", std::process::id()));
+    let mut src = host;
+    let at = src.stream_position().ok()?;
+    src.seek(SeekFrom::Start(0)).ok()?;
+    let copied = std::fs::File::create(&path).and_then(|mut dst| std::io::copy(&mut src, &mut dst));
+    src.seek(SeekFrom::Start(at)).ok()?;
+    match copied {
+        Ok(_) => Some(path),
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// What stands in for a descriptor that could not be opened on this side: an empty file. A
+/// message's descriptors are taken in order by count (Chromium's IPC), so one left out would hand
+/// every later one to the wrong message.
+pub(crate) fn placeholder() -> Arc<OpenFile> {
+    Arc::new(OpenFile {
+        kind: parking_lot::Mutex::new(FileKind::Synth { data: Vec::new(), guest: b"/dev/null".to_vec(), pos: 0, sized: true }),
+        flags: parking_lot::Mutex::new(0),
+    })
+}
+
+/// A described socket's or pipe's file status flags, when the description carries them.
+fn flags_at(d: &[u8]) -> Option<u32> {
+    Some(u32::from_le_bytes(d.get(16..20)?.try_into().ok()?))
 }
 
 /// A described socket's or pipe's relay port (0: none).
@@ -314,6 +384,156 @@ fn keep(end: Box<dyn std::any::Any + Send>) {
 thread_local! {
     /// The connection of the app thread whose ioctl this host thread runs.
     static CURRENT: RefCell<Option<TcpStream>> = const { RefCell::new(None) };
+    /// The app memory the running ioctl's request carried, and its writes not yet sent.
+    static CARRIED: RefCell<Option<Carried>> = const { RefCell::new(None) };
+}
+
+/// **`remote_carry=1`** (lever; off by default): an app's binder ioctl carries the memory the
+/// driver will read of it -- the `binder_write_read`, its commands, each transaction's data and
+/// offsets -- and the driver's writes to the app go back with the result, so an ioctl that made
+/// ~5 round trips back to the app's host process (MEASURED on an M4 with two games: 5.1-5.5 per
+/// ioctl, ~1000-1700 ioctls a second) makes none. What it did not carry it asks for as before,
+/// after sending the writes made so far, so the app sees them in order. macOS has no direct access
+/// (`remote_direct`), so this is its way out of the round trips.
+///
+/// Off by default: MEASURED (M4, 2026-10-16, Talking Tom at 60 fps and Super Mechs at its 25,
+/// 6 rounds of 30 s in one session) the round trips went from 3300 a second to 0 and the system
+/// host's connection threads from 10.4% to 5.9% of a core, but the host processes as a whole went
+/// from 118.7% to 128.0% -- SurfaceFlinger and the games' own code did more once their calls
+/// answered sooner, at the same frame rates -- and an app's launch took the same 7.9 s.
+/// `OMNI_REMOTE_CARRY=1` or the lever `remote_carry=1` turns it on (read on the app's side, which
+/// chooses the frame).
+pub static CARRY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The most an ioctl carries; past that, the driver asks.
+const CARRY_MAX: usize = 512 << 10;
+
+static CARRIED_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CARRIED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What an `IOCTL_WITH` brought ([`CARRY`]).
+struct Carried {
+    /// Pieces of the app's memory (untagged addresses), as of the request -- and as the ioctl's own
+    /// writes have changed them since.
+    pieces: Vec<(u64, Vec<u8>)>,
+    /// Writes made and not yet sent, encoded as a `WRITES` frame's payload.
+    pending: Vec<u8>,
+}
+
+impl Carried {
+    fn parse(mut b: &[u8]) -> Self {
+        let mut pieces = Vec::new();
+        while b.len() >= 12 {
+            let (addr, len) = (u64_at(b, 0), u32_at(b, 8) as usize);
+            let Some(bytes) = b.get(12..12 + len) else { break };
+            pieces.push((addr, bytes.to_vec()));
+            b = &b[12 + len..];
+        }
+        Self { pieces, pending: Vec::new() }
+    }
+
+    fn read(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        let end = addr.checked_add(len as u64)?;
+        self.pieces.iter().find(|(at, bytes)| *at <= addr && end <= at + bytes.len() as u64).map(|(at, bytes)| {
+            let from = (addr - at) as usize;
+            bytes[from..from + len].to_vec()
+        })
+    }
+
+    fn write(&mut self, addr: u64, bytes: &[u8]) {
+        let end = addr + bytes.len() as u64;
+        for (at, piece) in &mut self.pieces {
+            let piece_end = *at + piece.len() as u64;
+            if addr < piece_end && *at < end {
+                let (from, to) = (addr.max(*at), end.min(piece_end));
+                piece[(from - *at) as usize..(to - *at) as usize].copy_from_slice(&bytes[(from - addr) as usize..(to - addr) as usize]);
+            }
+        }
+        self.pending.extend_from_slice(&addr.to_le_bytes());
+        self.pending.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.pending.extend_from_slice(bytes);
+    }
+}
+
+/// The running ioctl's carried copy of `[addr, addr + len)`, if it has it.
+fn carried_read(addr: u64, len: usize) -> Option<Vec<u8>> {
+    let r = CARRIED.with(|c| c.borrow().as_ref().and_then(|c| c.read(addr, len)));
+    if r.is_some() {
+        CARRIED_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    r
+}
+
+/// A write of the running ioctl to its app, kept to send with its result (or before its next
+/// question); false when no ioctl carries.
+fn carried_write(addr: u64, bytes: &[u8]) -> bool {
+    let kept = CARRIED.with(|c| match c.borrow_mut().as_mut() {
+        Some(c) => {
+            c.write(addr, bytes);
+            true
+        }
+        None => false,
+    });
+    if kept {
+        CARRIED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if CARRIED.with(|c| c.borrow().as_ref().is_some_and(|c| c.pending.len() >= CARRY_MAX)) {
+            CURRENT.with(|s| s.borrow_mut().as_mut().map(send_pending));
+        }
+    }
+    kept
+}
+
+/// The writes kept so far, sent ahead of whatever goes to the app next.
+fn send_pending(stream: &mut TcpStream) {
+    let pending = CARRIED.with(|c| c.borrow_mut().as_mut().map(|c| std::mem::take(&mut c.pending)).unwrap_or_default());
+    if !pending.is_empty() {
+        let _ = send(stream, WRITES, &pending);
+    }
+}
+
+/// The app's side of [`CARRY`]: the pieces of its memory a binder ioctl `cmd` on `arg` will have
+/// read, appended to `req` -- the `binder_write_read`, the commands still to run, and each
+/// transaction's (or reply's) data and offsets. A piece that cannot be read is left out: the
+/// driver asks for it and hears the fault as before.
+fn carry(p: &Process, cmd: u64, arg: u64, req: &mut Vec<u8>) {
+    carry_from(|addr, len| p.mem.read(addr, len).ok(), cmd, arg, req);
+}
+
+/// [`carry`], reading the app's memory with `read`.
+fn carry_from(mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>, cmd: u64, arg: u64, req: &mut Vec<u8>) {
+    const BINDER_WRITE_READ: u64 = 0xc030_6201;
+    const TRANSACTIONS: [u32; 4] = [0x4040_6300, 0x4040_6301, 0x4048_6311, 0x4048_6312];
+    if cmd != BINDER_WRITE_READ {
+        return;
+    }
+    let mut budget = CARRY_MAX;
+    let mut piece = |req: &mut Vec<u8>, addr: u64, len: u64| -> Option<Vec<u8>> {
+        let len = usize::try_from(len).ok().filter(|&l| l > 0 && l <= budget)?;
+        let bytes = read(addr, len)?;
+        budget -= len;
+        req.extend_from_slice(&crate::guest::untag(addr).to_le_bytes());
+        req.extend_from_slice(&(len as u32).to_le_bytes());
+        req.extend_from_slice(&bytes);
+        Some(bytes)
+    };
+    let Some(bwr) = piece(req, arg, 48) else { return };
+    let (write_size, write_consumed, write_buffer) = (u64_at(&bwr, 0), u64_at(&bwr, 8), u64_at(&bwr, 16));
+    if write_size <= write_consumed {
+        return;
+    }
+    let Some(cmds) = piece(req, write_buffer.wrapping_add(write_consumed), write_size - write_consumed) else { return };
+    let mut at = 0usize;
+    while at + 4 <= cmds.len() {
+        let code = u32_at(&cmds, at);
+        let size = ((code >> 16) & 0x3fff) as usize;
+        let Some(tr) = cmds.get(at + 4..at + 4 + size) else { break };
+        if TRANSACTIONS.contains(&code) && tr.len() >= 64 {
+            let (data_size, offsets_size, data, offsets) = (u64_at(tr, 32), u64_at(tr, 40), u64_at(tr, 48), u64_at(tr, 56));
+            piece(req, data, data_size);
+            piece(req, offsets, offsets_size);
+        }
+        at += 4 + size;
+    }
 }
 
 /// What `OMNI_REMOTE_STATS=<seconds>` counts in the system's host process: apps' binder ioctls
@@ -334,6 +554,8 @@ fn start_stats() {
         let bytes = ASK_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed);
         let done = DIRECT_DONE.swap(0, std::sync::atomic::Ordering::Relaxed);
         let fell_back = DIRECT_FELL_BACK.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let (carried_reads, carried_writes) = (CARRIED_READS.swap(0, std::sync::atomic::Ordering::Relaxed), CARRIED_WRITES.swap(0, std::sync::atomic::Ordering::Relaxed));
+        eprintln!("[remote] pid {}: carried with the ioctls: {} reads/s, {} writes/s", std::process::id(), carried_reads / every, carried_writes / every);
         eprintln!(
             "[remote] pid {}: {} app binder ioctls/s, {} round trips/s back to the apps ({:.1} per ioctl, {} KB/s); direct {} /s, {} fell back /s (remote_direct={})",
             std::process::id(),
@@ -355,6 +577,8 @@ fn ask(kind: u8, payload: &[u8]) -> Result<(u8, Vec<u8>), Errno> {
     CURRENT.with(|c| {
         let mut c = c.borrow_mut();
         let stream = c.as_mut().ok_or(EFAULT)?;
+        // The writes kept so far first: what is asked next may be what they wrote.
+        send_pending(stream);
         send(stream, kind, payload).map_err(|_| EIO)?;
         let answer = receive(stream).map_err(|_| EIO)?;
         ASK_BYTES.fetch_add(answer.1.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -549,6 +773,9 @@ pub struct RemoteMemory;
 
 impl crate::guest::Remote for RemoteMemory {
     fn read(&self, addr: u64, len: usize) -> Result<Vec<u8>, Errno> {
+        if let Some(bytes) = carried_read(addr, len) {
+            return Ok(bytes);
+        }
         if let Some(bytes) = with_direct(|d| d.read(addr, len)) {
             return Ok(bytes);
         }
@@ -562,6 +789,9 @@ impl crate::guest::Remote for RemoteMemory {
 
     fn write(&self, addr: u64, bytes: &[u8]) -> Result<(), Errno> {
         if with_direct(|d| d.write(addr, bytes)).is_some() {
+            return Ok(());
+        }
+        if carried_write(addr, bytes) {
             return Ok(());
         }
         let mut req = addr.to_le_bytes().to_vec();
@@ -769,11 +999,14 @@ impl Server {
                 CURRENT_DIRECT.with(|d| *d.borrow_mut() = direct);
                 loop {
                     let Ok((kind, body)) = receive(&mut stream) else { break };
-                    if kind == IOCTL {
+                    if kind == IOCTL || kind == IOCTL_WITH {
                         IOCTLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
+                    if kind == IOCTL_WITH {
+                        CARRIED.with(|c| *c.borrow_mut() = Some(Carried::parse(body.get(16..).unwrap_or_default())));
+                    }
                     let ret: u64 = match kind {
-                        IOCTL => match crate::binder::ioctl(&p, &mut task, &file, u64_at(&body, 0), u64_at(&body, 8), false) {
+                        IOCTL | IOCTL_WITH => match crate::binder::ioctl(&p, &mut task, &file, u64_at(&body, 0), u64_at(&body, 8), false) {
                             Ok(v) => v,
                             Err(e) => e.as_return(),
                         },
@@ -786,7 +1019,12 @@ impl Server {
                             break;
                         }
                     };
-                    if send(&mut stream, DONE, &ret.to_le_bytes()).is_err() {
+                    let sent = match CARRIED.with(|c| c.borrow_mut().take()) {
+                        // The result with the writes still to apply.
+                        Some(carried) => send(&mut stream, DONE_WITH, &[&ret.to_le_bytes()[..], &carried.pending].concat()),
+                        None => send(&mut stream, DONE, &ret.to_le_bytes()),
+                    };
+                    if sent.is_err() {
                         break;
                     }
                 }
@@ -900,10 +1138,26 @@ impl RemoteBinder {
         let conn = self.thread(p, t.tid)?;
         let mut s = conn.lock();
         send(&mut s, kind, payload).map_err(|e| lost("send", &e))?;
+        // Whether a write the system sent with no answer (`WRITES`, `DONE_WITH`) faulted: the
+        // ioctl's result is then EFAULT, as the write's own would have been.
+        let mut faulted = false;
+        let mut apply = |mut w: &[u8]| {
+            while w.len() >= 12 {
+                let (addr, len) = (u64_at(w, 0), u32_at(w, 8) as usize);
+                let Some(bytes) = w.get(12..12 + len) else { break };
+                faulted |= p.mem.write(addr, bytes).is_err();
+                w = &w[12 + len..];
+            }
+        };
         loop {
             let (kind, body) = receive(&mut s).map_err(|e| lost("receive", &e))?;
             match kind {
                 DONE => return Ok(u64_at(&body, 0)),
+                WRITES => apply(&body),
+                DONE_WITH => {
+                    apply(body.get(8..).unwrap_or_default());
+                    return Ok(if faulted { EFAULT.as_return() } else { u64_at(&body, 0) });
+                }
                 MEM_READ => {
                     let reply = match p.mem.read(u64_at(&body, 0), u32_at(&body, 8) as usize) {
                         Ok(bytes) => [&[1u8][..], &bytes].concat(),
@@ -939,7 +1193,13 @@ impl RemoteBinder {
     pub fn ioctl(&self, p: &Process, t: &Task, cmd: u64, arg: u64) -> SysResult {
         let mut req = cmd.to_le_bytes().to_vec();
         req.extend_from_slice(&arg.to_le_bytes());
-        let r = self.call(p, t, IOCTL, &req)?;
+        let kind = if CARRY.load(std::sync::atomic::Ordering::Relaxed) {
+            carry(p, cmd, arg, &mut req);
+            IOCTL_WITH
+        } else {
+            IOCTL
+        };
+        let r = self.call(p, t, kind, &req)?;
         // The driver's answer, as a syscall return value.
         if r > (-4096i64) as u64 {
             let e = Errno(-(r as i64) as i32);
@@ -1057,6 +1317,99 @@ mod tests {
         assert!(u64_of(32) >= 4, "an answer read, written back directly ({})", u64_of(32));
         file.release();
         std::fs::remove_file(made.path()).ok();
+    }
+
+    /// `remote_carry`: a stand-in's whole `BINDER_WRITE_READ` -- a transaction, then an answer read
+    /// -- runs on what the request carried, with no connection to ask on, and its writes come back
+    /// to apply; the commands, the transaction's data and offsets are what was carried.
+    #[test]
+    fn a_stand_ins_binder_call_needs_no_round_trip_with_what_its_request_carried() {
+        let mut memory = vec![0u8; 1 << 16];
+        let base = 0x7_0000_0000u64;
+        let w64 = |m: &mut Vec<u8>, at: usize, v: u64| m[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        // bwr: write 4 + 64 bytes at +0x100, read 0x100 at +0x400.
+        w64(&mut memory, 0, 68);
+        w64(&mut memory, 16, base + 0x100);
+        w64(&mut memory, 24, 0x100);
+        w64(&mut memory, 40, base + 0x400);
+        memory[0x100..0x104].copy_from_slice(&0x4040_6300u32.to_le_bytes()); // BC_TRANSACTION
+        // binder_transaction_data: handle 0, code 1, 16 bytes of data at +0x800, no offsets.
+        let tr = 0x104;
+        memory[tr + 16..tr + 20].copy_from_slice(&1u32.to_le_bytes());
+        w64(&mut memory, tr + 32, 16);
+        w64(&mut memory, tr + 40, 0);
+        w64(&mut memory, tr + 48, base + 0x800);
+        w64(&mut memory, tr + 56, base + 0x900);
+        memory[0x800..0x810].copy_from_slice(b"sixteen bytes!!!");
+        let mut asked = Vec::new();
+        let mut req = Vec::new();
+        carry_from(
+            |addr, len| {
+                asked.push((addr - base, len));
+                let at = usize::try_from(addr.checked_sub(base)?).ok()?;
+                memory.get(at..at + len).map(<[u8]>::to_vec)
+            },
+            0xc030_6201,
+            base,
+            &mut req,
+        );
+        assert_eq!(asked, [(0, 48), (0x100, 68), (0x800, 16)], "the bwr, the commands, the data (no offsets)");
+
+        let m = crate::manifest::parse("d\t755\t/\n").unwrap();
+        let p = Process::stand_in(crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), m), 424_243, 10_000, Arc::new(RemoteMemory), Arc::new(RemoteFds));
+        let file = BinderFile::open(Context::VndBinder);
+        file.set_area(base + 0x4000, 0x8000);
+        let mut task = Task::new(424_243, Arc::clone(&p));
+        CARRIED.with(|c| *c.borrow_mut() = Some(Carried::parse(&req)));
+        let r = crate::binder::ioctl(&p, &mut task, &file, 0xc030_6201, base, true);
+        let carried = CARRIED.with(|c| c.borrow_mut().take()).expect("still carried");
+        assert_eq!(r, Ok(0), "the ioctl ran on what was carried alone");
+        // The writes, applied as the app applies them.
+        let mut w = &carried.pending[..];
+        while w.len() >= 12 {
+            let (addr, len) = (u64_at(w, 0), u32_at(w, 8) as usize);
+            let at = (addr - base) as usize;
+            memory[at..at + len].copy_from_slice(&w[12..12 + len]);
+            w = &w[12 + len..];
+        }
+        let u64_of = |at: usize| u64::from_le_bytes(memory[at..at + 8].try_into().unwrap());
+        assert_eq!(u64_of(8), 68, "the command consumed, written back with the result");
+        assert!(u64_of(32) >= 4, "an answer read, written back with the result ({})", u64_of(32));
+        // The carried copy follows the ioctl's own writes: a read after a write sees it.
+        assert_eq!(carried.read(base + 8, 8).map(|b| u64_at(&b, 0)), Some(68));
+        file.release();
+    }
+
+    /// A stand-in's thread waiting in a read when its app's host process goes (the open's
+    /// connection closes and the driver is released) ends its read, and so its connection's
+    /// thread: before, every looper of every app that had run stayed parked in the system's host
+    /// process (433 connection threads after nine launches and closes of one game).
+    #[test]
+    fn a_read_waiting_on_a_released_driver_ends() {
+        let base = 0x7_0000_0000u64;
+        // bwr: nothing to write, a 0x100-byte read at +0x400.
+        let mut bwr = vec![0u8; 48];
+        bwr[24..32].copy_from_slice(&0x100u64.to_le_bytes());
+        bwr[40..48].copy_from_slice(&(base + 0x400).to_le_bytes());
+        let mut req = base.to_le_bytes().to_vec();
+        req.extend_from_slice(&48u32.to_le_bytes());
+        req.extend_from_slice(&bwr);
+        let m = crate::manifest::parse("d\t755\t/\n").unwrap();
+        let p = Process::stand_in(crate::vfs::Sysroot::from_manifest(&std::env::temp_dir(), m), 424_244, 10_000, Arc::new(RemoteMemory), Arc::new(RemoteFds));
+        let file = BinderFile::open(Context::VndBinder);
+        file.set_area(base + 0x4000, 0x8000);
+        let (reader_file, reader_p) = (Arc::clone(&file), Arc::clone(&p));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut task = Task::new(424_244, Arc::clone(&reader_p));
+            CARRIED.with(|c| *c.borrow_mut() = Some(Carried::parse(&req)));
+            let r = crate::binder::ioctl(&reader_p, &mut task, &reader_file, 0xc030_6201, base, false);
+            let _ = tx.send(r);
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(), "the read waits for work");
+        file.release();
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the read ended with the driver's release");
+        assert_eq!(r, Err(EBADF));
     }
 
     /// The owner shuts the gate only once no direct access is in flight: a lease taken first is

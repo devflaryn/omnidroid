@@ -108,6 +108,24 @@ pub struct Process {
 /// Every process of this host process, for what reports on all of them (`OMNI_MEM_TRACE`).
 static ALL: Mutex<Vec<std::sync::Weak<Process>>> = Mutex::new(Vec::new());
 
+/// What host address `host` is to the guest: `<pid> <file>+<offset>` in the process whose space
+/// holds it, `<pid> anon <guest address>` outside file mappings, or `host <address>` in none
+/// (`OMNI_FAULT_STATS`' declined faults).
+#[must_use]
+pub fn describe_host_address(host: usize) -> String {
+    let all: Vec<Arc<Process>> = ALL.lock().iter().filter_map(std::sync::Weak::upgrade).collect();
+    for p in all {
+        if let Some(guest) = p.mem.space().host_to_guest(host) {
+            let guest = guest as u64;
+            return match p.mm.describe(guest) {
+                Some(d) => format!("{} {d}", p.sys.pid),
+                None => format!("{} anon {guest:#x}", p.sys.pid),
+            };
+        }
+    }
+    format!("host {host:#x}")
+}
+
 /// `OMNI_JIT_TBI=0|1`, read once (by `cpu_options`): whether Top Byte Ignore's mask is on the CPU's
 /// direct path from the start. 1 is how every process ran until 2026-10-09: 56 address bits,
 /// mirrored, a `shl`/`shr` before each guest access. 0, **the default now**, is the `jit_tbi=0` lever from boot
@@ -174,6 +192,13 @@ pub fn scalar_fp_in_xmm_default() {
         if std::env::var_os("OMNI_JIT_TABLE_SHRINK").is_none() {
             let _ = omni_cpu::dynarmic::set_shrink_tables(true);
         }
+        // Top Byte Ignore's mask left to the host's MMU (dynarmic patch 0105) where the host ignores
+        // the top byte and its fault layer reports the untagged address (macOS on Apple silicon):
+        // one instruction fewer before every guest load and store. `OMNI_JIT_HOST_TBI=0` or the
+        // lever `jit_hosttbi=0` turns it off.
+        if std::env::var("OMNI_JIT_HOST_TBI").as_deref() != Ok("0") {
+            let _ = set_host_tbi(true);
+        }
         // `IC IVAU` batched until `ISB` (dynarmic patch 0098): opt-in, `OMNI_JIT_IC_BATCH=1`. The game
         // writes code at its start and its world's load (174k and 45k lines invalidated, s13), each
         // line a return to the dispatcher and the shared cache's lock.
@@ -182,6 +207,12 @@ pub fn scalar_fp_in_xmm_default() {
             eprintln!("JIT SWITCH: IC IVAU batched until ISB (OMNI_JIT_IC_BATCH=1): {}", if on { "on" } else { "not available" });
         }
     });
+}
+
+/// [`omni_cpu::dynarmic::set_fastmem_host_tbi`] where this host vouches for it, else off.
+pub fn set_host_tbi(on: bool) -> bool {
+    let host = omni_platform::vm::host_ignores_top_byte() && omni_platform::fault::reports_untagged_addresses();
+    omni_cpu::dynarmic::set_fastmem_host_tbi(on && host)
 }
 
 /// The live processes of this host process.
@@ -218,6 +249,12 @@ impl Process {
         if let (Some(b), Ok(range)) = (&self.backend, omni_cpu::GuestRange::new(start as usize, len as usize)) {
             b.invalidate_code_everywhere(range);
         }
+    }
+
+    /// Give back the translations of its threads parked in a system call for at least `parked`
+    /// (`crate::code_trim`; arm64): the bytes given back.
+    pub fn discard_parked_code(&self, parked: std::time::Duration) -> u64 {
+        self.backend.as_ref().map_or(0, |b| b.discard_parked(parked))
     }
 
     /// Drop its translations (`crate::code_trim`).
@@ -302,6 +339,21 @@ pub struct Task {
 
 const GUEST_SPACE_BYTES: usize = 64 << 30;
 
+/// The guest space's size: [`GUEST_SPACE_BYTES`], or `OMNI_GUEST_SPACE_GIB` GiB for a process that
+/// needs more -- a WebView renderer's (`zygote::host_command`), whose V8 sandbox and PartitionAlloc
+/// pools reserve tens to hundreds of GiB at start and which ends itself when they are refused (an
+/// arm64 phone's kernel gives a process 512 GiB, 39 bits).
+fn guest_space_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("OMNI_GUEST_SPACE_GIB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&gib| (1..=4096).contains(&gib))
+            .map_or(GUEST_SPACE_BYTES, |gib| gib << 30)
+    })
+}
+
 /// `OMNI_SIGNAL_TRACE=1`: every signal delivered to a guest handler, with where it hit -- the
 /// syscall trace's signal lines alone, cheap enough to leave on.
 fn signal_trace() -> bool {
@@ -318,8 +370,11 @@ fn signal_trace() -> bool {
 const GUEST_SPACE_LOW_BASE: usize = 0x1000_0000;
 
 /// The least of a low space that must be free for it to be taken: the host's own pieces of that
-/// range (`KUSER_SHARED_DATA`, a DLL, a thread's stack) are megabytes, never gigabytes.
-const LOW_SPACE_MIN_FREE: usize = GUEST_SPACE_BYTES / 2;
+/// range (`KUSER_SHARED_DATA`, a DLL, a thread's stack) are megabytes, never gigabytes. Half the
+/// space.
+fn low_space_min_free() -> usize {
+    guest_space_bytes() / 2
+}
 
 /// The guest space, at [`GUEST_SPACE_LOW_BASE`] if the host has that free, else wherever it
 /// chooses (a program that needs no low memory still runs; ART will not).
@@ -353,7 +408,7 @@ pub fn reserve_space_for(snapshot_key: Option<&str>) -> Result<GuestSpace, omni_
     let low_window = omni_platform::vm::lowest_mappable_address() > GUEST_SPACE_LOW_BASE;
     let config = |base: Option<usize>| GuestSpaceConfig {
         base,
-        size: GUEST_SPACE_BYTES,
+        size: guest_space_bytes(),
         around_host: base.is_some(),
         low_window: low_window && base.is_some(),
         // 4 KiB pages for the guest on every host (D42): a sub-page overlay where the host's page
@@ -362,14 +417,14 @@ pub fn reserve_space_for(snapshot_key: Option<&str>) -> Result<GuestSpace, omni_
         ..GuestSpaceConfig::default()
     };
     match GuestSpace::with_config(config(Some(GUEST_SPACE_LOW_BASE))) {
-        Ok(low) if low.stats().free >= LOW_SPACE_MIN_FREE => Ok(low),
+        Ok(low) if low.stats().free >= low_space_min_free() => Ok(low),
         low => {
             match low {
                 Ok(low) => tracing::debug!(free = low.stats().free, "the low range is mostly another's; reserving where the host chooses"),
                 Err(e) => tracing::warn!(%e, "no guest space below 4 GiB; reserving where the host chooses"),
             }
             if let Some(key) = snapshot_key {
-                for base in crate::jit_snapshot::space_slots(key, GUEST_SPACE_BYTES) {
+                for base in crate::jit_snapshot::space_slots(key, guest_space_bytes()) {
                     let fixed = GuestSpaceConfig { base: Some(base), around_host: false, low_window: false, ..config(None) };
                     if let Ok(space) = GuestSpace::with_config(fixed) {
                         return Ok(space);
@@ -1693,7 +1748,8 @@ fn split_report_start() {
                         .top
                         .iter()
                         .take(4)
-                        .map(|(page, n)| format!("{page:#x}x{n} {}", p.mm.describe(*page as u64).unwrap_or_default()))
+                        .zip(st.top_parts.iter())
+                        .map(|((page, n), parts)| format!("{page:#x}x{n} [{parts}] {}", p.mm.describe(*page as u64).unwrap_or_default()))
                         .collect();
                     eprintln!("[split] pid {} tracked {} trapping {} served {} ({rate}/s) top: {}", p.sys.pid, st.tracked, st.trapping, st.served_total, top.join(", "));
                 }

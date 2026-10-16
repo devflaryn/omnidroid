@@ -30,6 +30,21 @@ fn program(tagged: u64) -> Vec<u32> {
 
 #[test]
 fn with_tbi_a_tagged_pointer_reaches_the_untagged_address() {
+    with_tbi_a_tagged_pointer_reaches_the_untagged_address_on_the_direct_path();
+}
+
+/// Patch 0105: with the tag left to the host's MMU (no `ubfx` before the access) where the host
+/// ignores the top byte, the same. (Process-wide; the other tests here are right under it too.)
+#[test]
+fn with_tbi_left_to_the_host_a_tagged_pointer_reaches_the_untagged_address() {
+    let host = omni_platform::vm::host_ignores_top_byte() && omni_platform::fault::reports_untagged_addresses();
+    let on = omni_cpu::dynarmic::set_fastmem_host_tbi(host);
+    assert_eq!(on, host && cfg!(target_arch = "aarch64"));
+    with_tbi_a_tagged_pointer_reaches_the_untagged_address_on_the_direct_path();
+    omni_cpu::dynarmic::set_fastmem_host_tbi(false);
+}
+
+fn with_tbi_a_tagged_pointer_reaches_the_untagged_address_on_the_direct_path() {
     let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: true, ..DynarmicOptions::default() });
     let entry = guest.load(&program(guest.data as u64 | TAG));
     let (mut cpu, sentinel) = guest.thread();

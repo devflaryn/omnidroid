@@ -53,6 +53,8 @@ pub struct SplitStats {
     pub served_total: u64,
     /// The host pages served most, with their counts, most first (at most eight).
     pub top: Vec<(GuestAddr, u64)>,
+    /// Each of `top`'s parts, 4 KiB at a time: `rw`, `r`, `-` (PROT_NONE), `.` (a hole).
+    pub top_parts: Vec<String>,
 }
 
 impl GuestSpace {
@@ -139,6 +141,10 @@ impl GuestSpace {
             }
             _ => {}
         }
+        if matches!(op, SubOp::Map(..) | SubOp::Unmap) && !st.sealed.is_empty() {
+            let end = address.saturating_add(len);
+            st.sealed.retain(|&(s, e)| !(s < end && address < e));
+        }
         let split = super::split_at_pages(address, len, self.page);
         if let Some((whole, whole_len)) = split.whole {
             self.apply_whole(inner, &mut st, operation, whole, whole_len, op)?;
@@ -216,6 +222,36 @@ impl GuestSpace {
         st.strict.iter().any(|&(s, e)| s < at + len && at < e)
     }
 
+    /// Whether the 4 KiB part at `at` lies in a sealed RELRO range.
+    fn is_sealed(st: &SubPages, at: GuestAddr) -> bool {
+        st.sealed.iter().any(|&(s, e)| s <= at && at + GUEST_PAGE <= e)
+    }
+
+    /// `[address, address + len)` is unmapped or mapped over: the sealed ranges it touches go.
+    pub(super) fn forget_sealed(&self, address: GuestAddr, len: usize) {
+        if let Some(sub) = &self.sub {
+            let mut st = sub.state.lock();
+            if !st.sealed.is_empty() {
+                let end = address.saturating_add(len);
+                st.sealed.retain(|&(s, e)| !(s < end && address < e));
+            }
+        }
+    }
+
+    /// **`[address, address + len)` is a library's RELRO, sealed read-only by the dynamic linker**:
+    /// its read-only parts beside a writable part of their host page need not trap
+    /// (`Split::host_protection_lenient`). Said before the `protect` that seals it, which then
+    /// takes it into account; forgotten where the range is unmapped or mapped over.
+    pub fn set_sealed_read_only(&self, address: GuestAddr, len: usize) {
+        let Some(sub) = &self.sub else { return };
+        let _inner = self.write();
+        let mut st = sub.state.lock();
+        let end = address.saturating_add(len);
+        if !st.sealed.iter().any(|&(s, e)| s == address && e == end) {
+            st.sealed.push((address, end));
+        }
+    }
+
     /// Put a changed host page's parts into effect, in SUBPAGE-ORDER. `zero`: parts newly mapped,
     /// which must read zero.
     fn settle(
@@ -242,7 +278,18 @@ impl GuestSpace {
         }
         // PROT_NONE parts count toward the host page only where the guest asked for strictness.
         let strict = crate::subpage::strict_prot_none_everywhere() || Self::is_strict(st, host_page, page);
-        let needs_view = split.traps(strict) || eager || (zero.is_some() && committed(inner));
+        // Read-only parts beside a writable one leniently (`Split::host_protection_lenient`) --
+        // not on a view of a shared backing, whose writes would reach every other view of it.
+        let shared = inner
+            .map
+            .entry_start(host_page)
+            .and_then(|s| inner.map.get(s))
+            .is_some_and(|e| matches!(e.os, OsState::View { .. }) && e.owner.as_ref().and_then(|o| o.backing.as_ref()).is_some_and(|b| b.is_shared()));
+        let lenient = crate::subpage::lenient_read_only() && !shared;
+        let strict_host = split.host_protection(strict);
+        let sealed = |i: usize| Self::is_sealed(st, host_page + i * GUEST_PAGE);
+        let mut host = if lenient { split.host_protection_lenient(strict, sealed) } else { strict_host };
+        let needs_view = split.traps_under(host) || eager || (zero.is_some() && committed(inner));
         if needs_view {
             self.commit_page(inner, operation, host_page)?;
             self.privatise(inner, st, operation, host_page)?;
@@ -263,8 +310,16 @@ impl GuestSpace {
             st.split.remove(&host_page);
             return Ok(());
         }
-        let host = split.host_protection(strict);
-        if split.traps(strict) {
+        if host != strict_host && inner.protect_range(operation, host_page, page, host).is_err() {
+            // The host refused the lenient protection: the page is held as strictly as before.
+            host = strict_host;
+            if split.traps_under(host) {
+                self.commit_page(inner, operation, host_page)?;
+                self.privatise(inner, st, operation, host_page)?;
+                self.ensure_alias(st, host_page)?;
+            }
+        }
+        if split.traps_under(host) {
             let was = sub.is_trapping(host_page);
             sub.set_trapping(host_page, true);
             if let Err(e) = inner.protect_range(operation, host_page, page, host) {
@@ -673,7 +728,26 @@ impl GuestSpace {
         let mut top: Vec<(GuestAddr, u64)> = st.served.iter().map(|(p, n)| (*p, *n)).collect();
         top.sort_by(|a, b| b.1.cmp(&a.1));
         top.truncate(8);
-        SplitStats { tracked: st.split.len(), trapping, served_total, top }
+        let top_parts = top
+            .iter()
+            .map(|(page, _)| {
+                st.split.get(page).map_or_else(String::new, |s| {
+                    s.parts
+                        .iter()
+                        .map(|p| match p {
+                            Part::Mapped(Protection::ReadWriteExecute) => "rwx",
+                            Part::Mapped(Protection::ReadExecute) => "rx",
+                            Part::Mapped(p) if p.is_writable() => "rw",
+                            Part::Mapped(p) if p.is_readable() => "r",
+                            Part::Mapped(_) => "-",
+                            Part::Hole | Part::StrictHole => ".",
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            })
+            .collect();
+        SplitStats { tracked: st.split.len(), trapping, served_total, top, top_parts }
     }
 }
 

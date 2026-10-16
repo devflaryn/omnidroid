@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
-use crate::errno::{Errno, SysResult, EAGAIN, EFAULT, EINVAL, ENOMEM, EPIPE, ETIMEDOUT};
+use crate::errno::{Errno, SysResult, EAGAIN, EBADF, EFAULT, EINVAL, ENOMEM, EPIPE, ETIMEDOUT};
 use crate::fd::OpenFile;
 use crate::process::{Process, Task};
 
@@ -336,10 +336,16 @@ struct ProcState {
     max_threads: u32,
     spawn_requested: u32,
     dead: bool,
+    /// A `poll`/`epoll` looked at its descriptor (`BinderFile::readiness`): its waiters there wait
+    /// on the process's key, so work for one of its threads is told on that key too.
+    polled: bool,
 }
 
 #[derive(Default)]
 struct State {
+    /// The broker's address: what the keys its processes' work is told by are made from
+    /// ([`proc_key`]), set by every open.
+    key_base: usize,
     procs: HashMap<ProcId, ProcState>,
     nodes: HashMap<NodeId, Node>,
     /// Delivered buffers that hold something until freed -- a oneway's node slot, nodes in
@@ -365,6 +371,38 @@ struct State {
     taps: Vec<(NodeId, u32, Tap)>,
     /// What the host answers in a node's place ([`Broker::intercept`]).
     intercepts: Vec<(NodeId, u32, Intercept)>,
+    /// The last window relayout each process sent each session ([`RELAYOUT_DEDUPE`]), but for its
+    /// sequence number.
+    relayouts: HashMap<(ProcId, NodeId), Vec<u8>>,
+}
+
+/// **`relayout_dedupe=0|1`** (lever; `OMNI_RELAYOUT_DEDUPE`): a one-way window relayout
+/// (`IWindowSession.relayoutAsync`, code 7 on this image) the same as the last one its process sent
+/// that session in every byte but its sequence number -- no descriptors in it -- completes for its
+/// sender and is not delivered: WindowManager would lay the window out again for nothing changed.
+/// Talking Tom Camp sends one every frame (its window's attributes set again each frame), and
+/// system_server laid out, scheduled an animation frame and sent SurfaceFlinger a transaction for
+/// each (M4, 2026-10-16, `OMNI_BINDER_TRACE`).
+pub static RELAYOUT_DEDUPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether a one-way transaction is a relayout the same as the last one from `sender` to `node`
+/// (the last remembered either way).
+fn repeated_relayout(st: &mut State, sender: ProcId, node: NodeId, code: u32, data: &[u8], fds: bool) -> bool {
+    const RELAYOUT_ASYNC: u32 = 7;
+    if code != RELAYOUT_ASYNC || fds || data.len() < 64 || !RELAYOUT_DEDUPE.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    if read_string16(data, 12).as_deref() != Some("android.view.IWindowSession") {
+        return false;
+    }
+    // Its last two words are the sequence number (which moves every time) and the last sync's.
+    let mut key = data.to_vec();
+    let seq = data.len() - 8;
+    key[seq..seq + 4].fill(0);
+    match st.relayouts.insert((sender, node), key.clone()) {
+        Some(last) => last == key,
+        None => false,
+    }
 }
 
 /// A host callback reading a tapped transaction's parcel ([`Broker::tap`]).
@@ -378,7 +416,7 @@ pub type Intercept = Arc<dyn Fn(&[u8]) -> Option<Vec<u8>> + Send + Sync>;
 /// The cross-process part of the driver.
 #[derive(Default)]
 pub struct Broker {
-    state: Mutex<State>,
+    state: crate::oslock::OsMutex<State>,
 }
 
 /// The binder devices: each its own context, as the kernel's `binder`, `hwbinder` (HIDL) and
@@ -646,13 +684,39 @@ impl State {
     }
 
     /// Queue work for a thread of `id`: `tid`'s own queue when given, the process's otherwise.
+    ///
+    /// **Work for one thread wakes that thread** (its [`thread_key`]), as the kernel wakes
+    /// `thread->wait`: told on the process's key, every idle looper of the process woke for each
+    /// reply, found nothing for it and slept again -- system_server has dozens -- and they queued
+    /// on the poll queues' lock and the broker's (M4, 2026-10-16: `parking_lot` spinning in
+    /// `Watch::drop` from `read_waiting` was the system host's busiest code after the display).
+    /// Work for the process wakes the threads that may take it (the process's key). A process
+    /// whose descriptor was polled (`polled`) hears both on the process's key, which its pollers
+    /// wait on.
     fn queue(&mut self, id: ProcId, tid: Option<i32>, work: Work) {
+        let state = self.key_base;
         let proc = self.proc_mut(id);
         match tid {
-            Some(t) => proc.threads.entry(t).or_default().todo.push_back(work),
-            None => proc.todo.push_back(work),
+            Some(t) => {
+                proc.threads.entry(t).or_default().todo.push_back(work);
+                if proc.polled {
+                    crate::poll::notify_keys(&[proc_key(state, id), thread_key(state, id, t)]);
+                } else {
+                    crate::poll::notify_key(thread_key(state, id, t));
+                }
+            }
+            None => {
+                proc.todo.push_back(work);
+                // One looper takes it, as the kernel wakes one (`binder_wakeup_proc_ilocked`); a
+                // read that ends with it still queued wakes another (`read`). Pollers wait on the
+                // process's key, so a polled process wakes them all.
+                if proc.polled {
+                    crate::poll::notify_key(proc_key(state, id));
+                } else {
+                    crate::poll::notify_key_one(proc_key(state, id));
+                }
+            }
         }
-        crate::poll::notify_key(proc_key(std::ptr::from_ref(self), id));
     }
 }
 
@@ -1046,8 +1110,18 @@ impl Parcel {
 }
 
 /// The key a process's work is told by: its broker's state and its id.
-fn proc_key(state: *const State, id: ProcId) -> crate::poll::Key {
+fn proc_key(state: usize, id: ProcId) -> crate::poll::Key {
     (state as crate::poll::Key).wrapping_add((id as crate::poll::Key).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as crate::poll::Key))
+}
+
+/// The key work for thread `tid` of a process is told by ([`State::queue`]).
+fn thread_key(state: usize, id: ProcId, tid: i32) -> crate::poll::Key {
+    proc_key(state, id) ^ ((tid as u32 as crate::poll::Key).wrapping_mul(0xC2B2_AE3D_27D4_EB4F_u64 as crate::poll::Key) | 1)
+}
+
+/// Whether a parcel's objects include a file descriptor (or an array of them).
+fn has_fds(data: &[u8], offsets: &[u64]) -> bool {
+    offsets.iter().any(|&off| data.get(off as usize..off as usize + 4).is_some_and(|t| matches!(u32_at(t, 0), TYPE_FD | TYPE_FDA)))
 }
 
 /// A `String16` at `at` in a parcel.
@@ -1115,6 +1189,7 @@ impl BinderFile {
         let broker = broker(context);
         let id = {
             let mut st = broker.state.lock();
+            st.key_base = Arc::as_ptr(&broker) as usize;
             st.next_proc += 1;
             let id = st.next_proc;
             st.procs.insert(id, ProcState { max_threads: 0, ..ProcState::default() });
@@ -1126,14 +1201,15 @@ impl BinderFile {
     /// What work queued for this process is told by (`crate::poll::notify_key`).
     #[must_use]
     pub fn key(&self) -> crate::poll::Key {
-        proc_key(self.broker.state.data_ptr(), self.id)
+        proc_key(Arc::as_ptr(&self.broker) as usize, self.id)
     }
 
     /// `EPOLLIN` when there is work a looper of this process could take.
     #[must_use]
     pub fn readiness(&self) -> u32 {
-        let st = self.broker.state.lock();
-        st.procs.get(&self.id).map_or(0, |p| {
+        let mut st = self.broker.state.lock();
+        st.procs.get_mut(&self.id).map_or(0, |p| {
+            p.polled = true;
             if !p.todo.is_empty() || p.threads.values().any(|t| !t.todo.is_empty()) {
                 crate::poll::IN
             } else {
@@ -1199,6 +1275,8 @@ impl BinderFile {
         // for that.
         let mut serving = Vec::new();
         let mut held = Vec::new();
+        let gone = self.id;
+        st.relayouts.retain(|(sender, _), _| *sender != gone);
         if let Some(p) = st.procs.get_mut(&self.id) {
             p.dead = true;
             dropped.extend(p.todo.drain(..));
@@ -1539,6 +1617,14 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
         }
     }
 
+    // A window relayout that changes nothing (`RELAYOUT_DEDUPE`): complete for its sender, gone.
+    if let (Some(node), true) = (target_node, oneway) {
+        if repeated_relayout(&mut st, file.id, node, code, &data, has_fds(&data, &offsets)) {
+            st.queue(file.id, Some(t.tid), Work::Complete);
+            return Ok(());
+        }
+    }
+
     // What the host listens to (`Broker::tap`), before the objects are translated.
     if let Some(node) = target_node {
         for (_, _, tap) in st.taps.iter().filter(|(n, c, _)| (*n, *c) == (node, code)) {
@@ -1569,8 +1655,19 @@ fn transaction(p: &Process, t: &mut Task, file: &Arc<BinderFile>, tr: &[u8], rep
     static TRACE: OnceLock<bool> = OnceLock::new();
     if *TRACE.get_or_init(|| std::env::var("OMNI_BINDER_TRACE").is_ok_and(|v| v == "1" || v == "2")) {
         let to = if target_proc == HOST { "host".to_string() } else { format!("{}", st.procs.get(&target_proc).map_or(0, |pr| pr.pid)) };
+        // A call's interface: the descriptor its parcel starts with (after the strict-mode policy,
+        // the work source and the `SYST` header).
+        let iface = if reply { String::new() } else { read_string16(&data, 12).map_or_else(String::new, |d| format!(" {d}")) };
+        // OMNI_BINDER_DUMP=<part of an interface>: those calls' parcels too, in hex.
+        static DUMP: OnceLock<Option<String>> = OnceLock::new();
+        if let Some(want) = DUMP.get_or_init(|| std::env::var("OMNI_BINDER_DUMP").ok().filter(|v| !v.is_empty())) {
+            if iface.contains(want.as_str()) {
+                let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+                eprintln!("[binder] dump {}:{} code {code:#x}: {hex}", p.sys.pid, t.tid);
+            }
+        }
         eprintln!(
-            "[binder] {} {}:{} -> {to} code {code:#x}{} ({} bytes)",
+            "[binder] {} {}:{} -> {to}{iface} code {code:#x}{} ({} bytes)",
             if reply { "reply" } else { "call" },
             p.sys.pid,
             t.tid,
@@ -1747,9 +1844,15 @@ fn read(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size: u64, f
     let mut asked = false;
     let done = read_waiting(p, t, file, at, size, first, nonblocking, &mut asked);
     let mut st = file.broker.state.lock();
+    let state = st.key_base;
     let proc = st.proc_mut(file.id);
     if let Some(th) = proc.threads.get_mut(&tid) {
         th.idle = false;
+    }
+    // The process's work is told to one looper (`State::queue`): one still queued as this read ends
+    // -- this thread took other work, or none (a signal, a close) -- goes to another.
+    if !proc.todo.is_empty() {
+        crate::poll::notify_key_one(proc_key(state, file.id));
     }
     // A spawn request this read made went nowhere if the read failed (EFAULT, EINTR): no thread
     // will register for it, and counted it would hold back every later request -- the pool frozen
@@ -1768,6 +1871,8 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
     }
     let flushed = file.flushes.load(std::sync::atomic::Ordering::SeqCst);
     let mut watching: Option<crate::poll::Watch> = None;
+    // Whether this thread may take the process's work (the last look's answer): what it waits on.
+    let mut takes_proc;
     loop {
         // Woken by work for this process (`queue`), or by a descriptor's close (`flush`, told to
         // everyone).
@@ -1781,6 +1886,7 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
             // waiting for a reply nor serving a call -- and nothing of its own takes the
             // process's work. A thread waiting for a reply is never handed a oneway.
             let may_take_proc = thread.looper && thread.awaiting == 0 && thread.serving.is_empty();
+            takes_proc = may_take_proc;
             let looper = thread.looper;
             let w = match own {
                 Some(w) => Some(w),
@@ -1830,6 +1936,13 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
                 p.mem.write(at, &out)?;
                 return Ok(out.len() as u64);
             }
+            // The driver itself was released while this thread waited -- a stand-in's app host
+            // process is gone, its connection closed -- so nothing will ever come: the read ends
+            // (the kernel's `binder_release` wakes its waiting threads), and with it the thread
+            // serving it. Else each looper of every app that ever ran stayed parked here.
+            None if file.released.load(std::sync::atomic::Ordering::SeqCst) => {
+                return Err(EBADF);
+            }
             // A descriptor was closed meanwhile: back to the caller with what there is.
             None if file.flushes.load(std::sync::atomic::Ordering::SeqCst) != flushed => {
                 p.mem.write(at, &out)?;
@@ -1837,7 +1950,10 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
             }
             // Registered only once a look found nothing, then looked again before sleeping.
             None => match watching.take() {
-                None => watching = Some(crate::poll::watch(Some(vec![file.key()]))),
+                None => {
+                    let own = thread_key(Arc::as_ptr(&file.broker) as usize, file.id, t.tid);
+                    watching = Some(crate::poll::watch(Some(if takes_proc { vec![file.key(), own] } else { vec![own] })));
+                }
                 Some(w) => w.wait(None, t)?,
             },
         }

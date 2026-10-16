@@ -82,7 +82,9 @@ pub fn boot(exe: &Path, dir: &Path, config: &Config) -> Result<Child, String> {
     cmd.env("OMNI_MULTI_DISPLAY", "1")
         .env("OMNI_PRIMARY_WINDOW", "0")
         .env("OMNI_SCREENSHOT", dir.with_extension("png"))
-        .env("OMNI_SCREENSHOT_MS", "1000")
+        // Written when the MCP `screenshot` asks (`<png>.want`), else once a minute: each is a
+        // 3.6 MB PNG a display, and every display wrote one each second for nobody.
+        .env("OMNI_SCREENSHOT_MS", "60000")
         .env("OMNI_R_SETPROPS", setprops)
         .env("OMNI_AOSP_WARM", "0");
     // Several apps start on one device, often while another device boots: Android's timeouts scaled
@@ -207,20 +209,27 @@ pub fn uninstall(dev: &Device, package: &str) -> Result<(), String> {
 }
 
 /// Start the app as `user` on the Android display `display`: a user other than 0 is made visible
-/// there first and has the package installed and granted. Answers `am start -W`'s output.
+/// there first and has the package installed; `before` (a root shell, e.g. [`crate::extras::plant`])
+/// runs then, with the user's data there, and the app is granted what it asks for. Answers
+/// `before`'s output and `am start -W`'s.
 ///
 /// # Errors
 /// The device's, or the start failed.
-pub fn start(dev: &Device, package: &str, launcher: &str, user: u32, display: i32) -> Result<String, String> {
+pub fn start(dev: &Device, package: &str, launcher: &str, user: u32, display: i32, before: &str) -> Result<String, String> {
     if user != 0 {
         root(dev, &format!("pm install-existing --user {user} {package}"))?;
-        root(dev, &grant_script(package, user))?;
         root(dev, &format!("am start-user -w --display {display} {user}"))?;
     }
-    let out = root(dev, &format!("input keyevent KEYCODE_WAKEUP; am start -W --display {display} --user {user} -n {package}/{launcher}"))?;
-    if !started(&out) {
-        return Err(format!("am start: {}", out.trim()));
+    // Before the grants, so a `before` that resets the app's data leaves them in place.
+    let mut out = if before.is_empty() { String::new() } else { root(dev, before)? };
+    if user != 0 {
+        root(dev, &grant_script(package, user))?;
     }
+    let started_out = root(dev, &format!("input keyevent KEYCODE_WAKEUP; am start -W --display {display} --user {user} -n {package}/{launcher}"))?;
+    if !started(&started_out) {
+        return Err(format!("am start: {}", started_out.trim()));
+    }
+    out.push_str(&started_out);
     Ok(out)
 }
 
@@ -274,6 +283,19 @@ pub fn activities(dump: &str) -> Vec<(i32, u32, String)> {
 ///
 /// # Errors
 /// The device's.
+/// The app processes running on the device, as its host knows them (`#host apps`, no guest
+/// process started): (Android user, process name).
+pub fn apps(dev: &Device) -> Result<Vec<(u32, String)>, String> {
+    Ok(host(dev, "apps")?
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            let (_pid, uid, name) = (w.next()?, w.next()?.parse::<u32>().ok()?, w.next()?);
+            Some((uid / 100_000, name.to_string()))
+        })
+        .collect())
+}
+
 pub fn running(dev: &Device) -> Result<Vec<(i32, u32, String)>, String> {
     Ok(activities(&root(dev, "dumpsys activity activities | grep -E 'Display #|ActivityRecord'")?))
 }

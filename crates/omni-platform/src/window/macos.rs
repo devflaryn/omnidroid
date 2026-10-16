@@ -53,6 +53,7 @@ use super::{RawWindow, WindowDesc, WindowError, WindowEvent, WindowResult};
 mod appkit;
 pub mod keys;
 mod main_thread;
+mod surface;
 
 use main_thread::{on_main, Status};
 
@@ -353,10 +354,46 @@ pub(super) struct Presenter {
 
 impl Presenter {
     pub(super) fn present_rgba(&self, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
-        // `on_main` waits for the main thread to run it, so the frame is lent, not copied: its one
-        // copy is `CFDataCreate`'s.
+        self.present(rgba, width, height, false)
+    }
+
+    /// `fill` writes the frame straight into one of the window's `IOSurface`s; its show is queued
+    /// on the AppKit thread and not waited for (see `surface::present_fill`).
+    pub(super) fn present_rows(&self, width: u32, height: u32, fill: &mut dyn FnMut(&mut [u8], usize)) -> WindowResult<bool> {
         let id = self.id;
-        on_main(move |_| appkit::present_rgba(id, rgba, width, height))
+        let shown = surface::present_fill(id, width, height, fill, |s| {
+            let (object, pending) = s.retained_pending();
+            main_thread::on_main_async(Box::new(move |_| {
+                let _ = appkit::present_surface(id, object as *mut core::ffi::c_void);
+                surface::release(object);
+                pending.store(false, Ordering::Release);
+            }));
+        });
+        Ok(shown.is_some())
+    }
+
+    /// BGRA rows, as `present_rgba`: no swizzle on the way into the surface.
+    pub(super) fn present_bgra(&self, bgra: &[u8], width: u32, height: u32) -> WindowResult<()> {
+        self.present(bgra, width, height, true)
+    }
+
+    /// The frame copied into one of the window's `IOSurface`s on this thread, which the AppKit
+    /// thread only sets as the layer's contents (`surface`). Where no surface can be had, the
+    /// `CGImage` way: `on_main` waits for the main thread to run it, so the frame is lent, not
+    /// copied -- its one copy is `CFDataCreate`'s.
+    fn present(&self, pixels: &[u8], width: u32, height: u32, bgra: bool) -> WindowResult<()> {
+        let id = self.id;
+        if let Some(shown) = surface::present(id, pixels, width, height, bgra, |s| {
+            let object = s.object() as usize;
+            on_main(move |_| appkit::present_surface(id, object as *mut core::ffi::c_void))
+        }) {
+            return shown;
+        }
+        if bgra {
+            let rgba: Vec<u8> = pixels.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
+            return on_main(move |_| appkit::present_rgba(id, &rgba, width, height));
+        }
+        on_main(move |_| appkit::present_rgba(id, pixels, width, height))
     }
 
     pub(super) fn client_size(&self) -> Option<(u32, u32)> {
@@ -370,6 +407,7 @@ impl Drop for Window {
     fn drop(&mut self) {
         let id = self.id;
         on_main(move |_| appkit::destroy(id));
+        surface::forget(id);
     }
 }
 

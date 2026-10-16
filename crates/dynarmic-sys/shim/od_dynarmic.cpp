@@ -13,6 +13,7 @@
 #include <new>
 #include <optional>
 #include <atomic>
+#include <chrono>
 #include <vector>
 
 #include "dynarmic/interface/A64/a64.h"
@@ -125,6 +126,10 @@ public:
     od_stats stats{};
 #if defined(__aarch64__)
     u64 last_svc_return = 0;
+    /* Patch 0104: while the thread is inside the `SVC` callback, the host code it returns to, and
+     * since when (steady clock, ns); 0 otherwise. Read by other threads (`od_jit_discard_parked`). */
+    std::atomic<u64> parked_return{0};
+    std::atomic<u64> parked_since{0};
 #endif
 
     std::optional<u32> MemoryReadCode(u64 vaddr) override {
@@ -232,9 +237,14 @@ public:
          * inside the code cache, which is what the W^X measurement needs and nothing else
          * exposes. */
         last_svc_return = reinterpret_cast<u64>(__builtin_return_address(0));
+        parked_since.store(static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), std::memory_order_relaxed);
+        parked_return.store(last_svc_return, std::memory_order_seq_cst);
 #endif
         stats.svc_calls++;
         cb.call_svc(ctx, swi);
+#if defined(__aarch64__)
+        parked_return.store(0, std::memory_order_seq_cst);
+#endif
     }
     void ExceptionRaised(u64 pc, A64::Exception e) override {
         stats.exceptions++;
@@ -1021,6 +1031,36 @@ void od_jit_effective_config(void* p, od_effective_config* out) {
     out->tpidrro_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidrro_el0);
 }
 
+uint64_t od_jit_discard_parked(void* p, uint64_t parked_at_least_ns) {
+#if defined(__aarch64__)
+    auto& cb = as_jit(p)->callbacks;
+    const u64 resume = cb.parked_return.load(std::memory_order_seq_cst);
+    if (resume == 0) {
+        return 0;
+    }
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (now - cb.parked_since.load(std::memory_order_relaxed) < parked_at_least_ns) {
+        return 0;
+    }
+    return static_cast<uint64_t>(as_jit(p)->jit->OdDiscardParked(resume, cb.parked_return));
+#else
+    (void)p;
+    (void)parked_at_least_ns;
+    return 0;
+#endif
+}
+
+void od_jit_code_bytes(void* p, uint64_t* in_use, uint64_t* emitted) {
+#if defined(__aarch64__)
+    *in_use = static_cast<uint64_t>(as_jit(p)->jit->OdCodeBytesInUse());
+    *emitted = as_jit(p)->jit->OdCodeBytesEmitted();
+#else
+    (void)p;
+    *in_use = 0;
+    *emitted = 0;
+#endif
+}
+
 void od_jit_stats(void* p, od_stats* out) {
     *out = as_jit(p)->callbacks.stats;
 }
@@ -1117,6 +1157,16 @@ uint32_t od_set_fastmem_mask_by_and(uint32_t on) {
 uint32_t od_set_tbi_unmasked(uint32_t on) {
 #if !defined(__aarch64__) && !defined(_M_ARM64)
     Dynarmic::Backend::X64::live_fastmem_tbi_unmasked.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    return on != 0 ? 1u : 0u;
+#else
+    (void)on;
+    return 0;
+#endif
+}
+
+uint32_t od_set_fastmem_host_tbi(uint32_t on) {
+#if defined(__aarch64__)
+    Dynarmic::Backend::Arm64::live_fastmem_host_tbi.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
     return on != 0 ? 1u : 0u;
 #else
     (void)on;

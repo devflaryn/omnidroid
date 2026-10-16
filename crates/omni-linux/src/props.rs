@@ -30,7 +30,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 18] = [
+const OVERLAY: [(&str, &str); 21] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -66,6 +66,22 @@ const OVERLAY: [(&str, &str); 18] = [
     // two runs, 2026-09-29), and the "isn't responding" dialog then took the pointer and the keys
     // (a space pressed its "Close app").
     ("ro.hw_timeout_multiplier", "5"),
+    // SurfaceFlinger compiles none of RenderEngine's shaders ahead (`primeCache`): each is compiled
+    // when a frame first needs it. MEASURED (M4, 2026-10-16): priming made 122 shaders in 129 s --
+    // GLES through ANGLE, Vulkan and MoltenVK, translated -- and `bootFinished` waits for it, so
+    // boot_completed came ~45 s after the launcher was up.
+    ("service.sf.prime_shader_cache", "0"),
+    // SurfaceFlinger's scheduler logs "trackPendingFrame: Invalid present fence" for every frame of
+    // every display (the composer answers no present fence: a real one costs ~4% more CPU,
+    // measured by A/B) -- 87% of the device's log while a game ran (M4, 2026-10-16). Its fatal
+    // lines only; `setprop log.tag.Scheduler V` brings the rest back live.
+    ("log.tag.Scheduler", "F"),
+    // SurfaceFlinger's continuous transaction tracing (Android 13+: every transaction, and each
+    // frame's layer changes, turned into protobuf into a ring buffer kept for bug reports) is off:
+    // nothing here takes a bug report from it. MEASURED (M4, 2026-10-16, two games running):
+    // turning it off live (`service call SurfaceFlinger 1041 i32 -1`) gave back 138 MiB of the
+    // system host process. `dumpsys SurfaceFlinger` says "Transaction tracing: disabled".
+    ("debug.sf.enable_transaction_tracing", "0"),
 ];
 
 /// `ro.hw_timeout_multiplier` for a host with `cpus` logical CPUs (`asked`: `OMNI_HW_TIMEOUT_MULTIPLIER`),

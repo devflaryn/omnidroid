@@ -189,6 +189,20 @@ fn child_zygote_socket(args: &[String]) -> Option<&str> {
 static CHILDREN: parking_lot::Mutex<std::collections::BTreeMap<i32, Arc<parking_lot::Mutex<std::process::Child>>>> =
     parking_lot::Mutex::new(std::collections::BTreeMap::new());
 
+/// What each app process launched here runs as: its uid and process name (`--nice-name`).
+static NAMES: parking_lot::Mutex<std::collections::BTreeMap<i32, (u32, String)>> = parking_lot::Mutex::new(std::collections::BTreeMap::new());
+
+/// **The app processes launched here and still running**: pid, uid and process name, by pid. What
+/// a host program asks to know whether an app still runs (`#host apps`, the pool's check) without
+/// starting a shell and `dumpsys` in the guest -- ~1.5-1.9 s of translation for each, every 5 s.
+#[must_use]
+pub fn apps() -> Vec<(i32, u32, String)> {
+    let children = CHILDREN.lock();
+    let mut names = NAMES.lock();
+    names.retain(|pid, _| children.contains_key(pid));
+    names.iter().map(|(pid, (uid, name))| (*pid, *uid, name.clone())).collect()
+}
+
 /// The host process of app process `pid`, launched here and running: its host pid. What
 /// `crate::remote` trusts for a direct access to an app's memory -- the process this one
 /// started, not a number a connection claims.
@@ -233,6 +247,12 @@ fn installed_app(instance: &std::path::Path, package: &str) -> bool {
 /// `OMNI_APP_SPARE=1` and `spare` (an installed app) a spare app process waiting for an app
 /// (`start_spare`) becomes it instead.
 fn launch(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String], spare: bool) -> Option<i32> {
+    let pid = launch_host(launcher, uid, nice, sdk, class_and_args, spare)?;
+    NAMES.lock().insert(pid, (uid, nice.unwrap_or_default().to_string()));
+    Some(pid)
+}
+
+fn launch_host(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String], spare: bool) -> Option<i32> {
     if let Some(pid) = spare.then(|| take_spare(uid, nice, sdk, class_and_args)).flatten() {
         return Some(pid);
     }
@@ -276,8 +296,14 @@ fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env
     if let Some(n) = nice {
         cmd.arg(format!("--nice-name={n}"));
     }
-    // OMNI_TRACE_APP=<process name>: that app's host process traces its system calls.
-    if nice.is_some() && std::env::var("OMNI_TRACE_APP").ok().as_deref() == nice {
+    // OMNI_TRACE_APP=<process name>: that app's host process traces its system calls; `<prefix>*`
+    // every process whose name starts so (a WebView's renderers: `com.android.webview:sandboxed*`).
+    let traced = std::env::var("OMNI_TRACE_APP").ok().is_some_and(|t| match (t.strip_suffix('*'), nice) {
+        (Some(prefix), Some(n)) => n.starts_with(prefix),
+        (None, Some(n)) => n == t,
+        _ => false,
+    });
+    if traced {
         cmd.env("OMNI_SYSCALL_TRACE", "1");
     }
     // OMNI_SIGNAL_TRACE_APP=<process name>: that app's host process traces every signal it
@@ -287,6 +313,13 @@ fn host_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, env
     // killed at ~220 s on a Mac at load 25, with and without the trace).
     if nice.is_some() && std::env::var("OMNI_SIGNAL_TRACE_APP").ok().as_deref() == nice {
         cmd.env("OMNI_SIGNAL_TRACE", "1");
+    }
+    // A WebView renderer (`<webview package>:sandboxed_process<n>:...`) reserves its V8 sandbox and
+    // PartitionAlloc pools at start -- 196 GiB first, then 16 and 8 GiB pools -- and ends itself when
+    // a 64 GiB space refuses them; the app's WebView then kills the app ("Renderer process crash
+    // detected"), the sign-in captcha with it. A phone's 39-bit space (512 GiB) is what it expects.
+    if nice.is_some_and(|n| n.contains(":sandboxed_process")) && std::env::var_os("OMNI_GUEST_SPACE_GIB").is_none() {
+        cmd.env("OMNI_GUEST_SPACE_GIB", "512");
     }
     // An app's host process: its CPU options are an app's (`Process::cpu_options`).
     cmd.env("OMNI_LINUX_APP", "1");
@@ -378,7 +411,7 @@ fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
 /// the zygote's reply gives ActivityManager, its uid is rebound (`remote::rebind_uid`) before it
 /// runs WrapperInit (its preload done while it waited), and a new spare is started some seconds
 /// after (`OMNI_APP_SPARE_DELAY_S`, default 5: the app's start runs on one thread, the spare's on
-/// others). The warm device keeps one (`tests/r_roblox.rs`); an app session does not.
+/// others). The warm device keeps one (`tests/r_app.rs`); an app session does not.
 struct Spare {
     pid: i32,
     /// The host path of the file it waits for.

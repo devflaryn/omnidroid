@@ -1,5 +1,116 @@
 # Handoff
 
+## PLUGIN OPTIONS ON THE POOL'S LAUNCHES (2026-10-13, macOS; branch `omnidroid-app`, uncommitted)
+
+- **What**: `omnidroid <apk> [xN] --cookie <c> --place <id>`, `run <apk> ... --cookie ...` at the
+  prompt, MCP `start_instance` `options` -- the plugins' `aosp` options on a pool launch.
+  `app::plugged::extras` runs the plugins' `session-start` hooks as `aosp` does and turns what they
+  name (`OMNI_R_COOKIE`, `OMNI_R_LINK` + `_LINK_ID`, the `_READY`/`_SIGNED_IN`/`_LINK_TAKEN`
+  markers) into `omni_pool::Extras`; the pool (`omni_pool::extras`, `Pool::launch_with`) plants
+  the cookie store for the instance's own user before its start and follows the device log to send
+  the link on its display (`am start --user U --display D`), resending until it is taken.
+- **Live (2026-10-13)**: two accounts (`~/Desktop/cookies`), Delta, `--place 1818`, one Android
+  (users 10, 11): both signed in and in Crossroads, on the same server; no cookie file left behind.
+- **Found on the way** (each fixed, each said in the code):
+  - `pm clear --user U` force-stops the package for *every* user (`clearApplicationUserData`,
+    "user=-1"): it killed the other instance. The plant empties that user's data by hand.
+  - Most of Roblox's log lines name no user: the second instance took the first's sign-in and join
+    for its own. Lines naming a user (`ActivityRecord{.. uN`, `START uN {`, `/data/user/N/`) count
+    for that user; one app's instances on a device take turns at their links, and a line naming no
+    user counts for the one holding the turn.
+  - The launch held the device's install-and-start lock while following its link (the next launch
+    waited minutes; a close during a start could deadlock in `cleanup`): released after the start.
+- **Seen, not ours**: WARP's slow connects came back (3-10 s, "healthy") and an instance's Roblox
+  showed Sign In after its 15 s auth request timed out; a reconnect did not help at once, it passed
+  minutes later. One Roblox died of a native SIGSEGV (fault addr 0x8) on a start under load; not
+  reproduced in the next run.
+- `omnidroid serve` ending now says "the server's input closed", not "the last window quit".
+
+## A NEW ANDROID'S BOOT KILLED THE OTHERS' NEW APPS (2026-10-13, macOS; branch `omnidroid-app`, uncommitted)
+
+- **Seen**: two Roblox builds launched together; the first died 9 s after it came up while the
+  second's Android booted. On D1: `failed to complete startup` ANRs for Roblox, statementservice,
+  keychain, MediaProvider; `[binder] <pid>:<tid> oneway code 0x5 not delivered: errno 5` (39 on D1).
+- **Cause**: `omnidroid aosp` (every pool device's boot) removed *every* `omni-shm-*` file in the
+  session dir -- every device's. A running Android's shared memory (the font map bindApplication
+  carries) could then not cross into a new app's host process (`remote::open_described` ->
+  `Shm::open_path` EIO), so bindApplication never arrived and each new app ANRed at startup.
+- **Fix** (`crates/omnidroid/src/main.rs`, `shm_owner`): only files whose pid (`omni-shm-<pid>-<n>`)
+  is no longer alive are removed. Checked live: Arceus X on D2 kept running while D3 booted and Delta
+  ran on it; no ANRs on either.
+- The app's `run` / MCP `start_instance` take no plugin arguments (`--cookie`, `--place`); those are
+  still `omnidroid aosp --apk <apk> --cookie <c> --place <id>`, a session outside the pool.
+
+## ONE POOL FOR EVERY WINDOW; CAMERA DRAG; "UNABLE TO CONTACT SERVER" WAS THE NETWORK (2026-10-12, macOS M4; branch `omnidroid-app`, uncommitted)
+
+**"Unable to contact server. Please check your internet connection!"** (Roblox's sign-in security
+checks) is Roblox's own message (`string/CommonUI_Messages_Response_ConnectionError`, shown by its Lua
+app when an HTTP request fails). Its log (`<device>/data/user/<u>/com.roblox.client/files/appData/
+logs/*_last.log`, `DFLog::HttpTraceError`) showed curl `Connection timed out after 14999 ms` and
+answers after ~13.5 s of `net` time. The same was measured **on the Mac with no Android at all**:
+every new TCP connection through Cloudflare WARP (`utun4`, MASQUE) to a non-Cloudflare address took
+~9-10 s (google.com, apis.roblox.com, Arkose's captcha CDN, 8.8.8.8), while WARP said "healthy"
+(21 ms, 0.09% loss). `warp-cli disconnect && warp-cli connect` brought it to 80-120 ms; Roblox's
+requests then took 0.2-0.5 s in the device. Not an omnidroid layer. Check: `nc -z -G 20 8.8.8.8 443`
+should take well under a second. (A captcha itself was not reached: a made-up account gets
+"Incorrect username or password".)
+
+**Right-drag camera snapped back on release** (`omni-linux/src/window_input.rs`): the release was
+followed by a move of the app's pointer back to where the drag was pressed, carrying
+`AXIS_RELATIVE` = minus the whole drag in the same frame -- one more camera turn, undoing it. Now the
+pointer stays where the drag left it, the host's cursor is warped there (`Out::Warp`) before the
+capture is given back, and the window's report of the held cursor at the press point right after
+(`SETTLE`, 300 ms) is dropped. Drag moves also carry the raw motion as `REL_X/REL_Y`, which the
+injector (`inject.rs` `Mouse::sync`) makes the relative axes, so the camera keeps turning once the
+pointer is pinned at the display's edge. Unit-tested; not tried in a Roblox game (no account here).
+
+**One pool for every window** (`crates/omnidroid/src/app/host.rs`): before, each `omnidroid` was a
+pool of its own and adopted the other's running Androids (`<dir>.pool` marker), removing their
+extra displays -- closing its apps. Now the first window starts `omnidroid host` (detached: process
+group / `DETACHED_PROCESS`), which owns the pool and the MCP server and writes `pool.host` (`<port>
+<pid>`, made `create_new`; a silent one is replaced) beside `app.conf`. Windows are clients over
+JSON-RPC on 127.0.0.1 (`omni_mcp::http`): `attach`, `state` (snapshot, settings, log since; leases
+renewed, 30 s), `line` (the typed command, done by the host), `detach`. The last window to quit stops
+the host (and the Androids per `stop_on_exit`); `omnidroid serve` is a host that ends with stdin.
+Tested on a pty (`script`), isolated pool: window 1 started the host and ran TalkingTomCamp, window
+2 joined (no second Android), window 1 quit with one Ctrl+C and the app ran on, window 2's second
+Ctrl+C stopped everything and removed `pool.host`. Host log: `pool.host.log`.
+
+## WEBVIEWS WORK; WEB PAGES DRIVEN OVER MCP (2026-10-12, macOS M4; branch `omnidroid-app`, uncommitted)
+
+Goal (owner): Roblox's sign-in captcha (a WebView) said "Unable to contact server" and the app died;
+make WebViews work, and let agents drive a page through the MCP server (its DOM, JavaScript,
+clicks by element or position). Tested with the AOSP WebView shell (`org.chromium.webview_shell`,
+copied off the device) on example.com and hCaptcha's demo -- not with Roblox (the owner's WARP).
+
+**Why every WebView died** (each found with `OMNI_APP_ENV_FILE` + `OMNI_THREAD_DUMP`/`OMNI_SYSCALL_TRACE`):
+1. `SCM_RIGHTS` was dropped: Chromium's IPC passes shared memory and channels with its messages; the
+   renderer read messages without their handles, called its channel broken and exited 0, and the
+   WebView killed the app ("Renderer process crash detected"). Now `sendmsg`/`recvmsg` carry
+   descriptors on socket pairs, delivered with the bytes they were sent with
+   (`socket.rs`: `PairChannel::rights`, by stream position), and relays carry them across host
+   processes (`relay.rs`: a frame flag, `remote::describe`/`open_described`).
+2. A socket or pipe that crossed host processes lost its file flags (`O_NONBLOCK`): descriptions now
+   carry them (`remote.rs`, `flags_at`).
+3. A deleted-but-open file (Chromium's `mkstemp`+`unlink` in the app's cache) could not be reopened
+   by path on the other side and was left out -- every later descriptor went to the wrong message, a
+   read-write region reached a read-only one ("Ashmem region has a wrong protection mask"), Chromium
+   dumped without crashing and waited for good on a crash handler that cannot start (`setsid`:
+   ENOSYS). Such a file now crosses as a copy the receiver deletes once open, and a descriptor that
+   still cannot be opened arrives as an empty placeholder, so the count never shifts.
+Result: pages render; hCaptcha's widget and its drag-the-bottles challenge show and take taps.
+
+**MCP web tools** (`crates/omnidroid/src/app/web.rs`): `web_pages`, `web_dom` (every frame's elements
+with `ref`, attributes, text, box and the display point to tap), `web_eval` (any frame by url part),
+`web_click` (ref / selector / text; a touchscreen tap by default, `via: cdp` for DevTools mouse
+events), `web_tap` (CSS or display point), `web_type`, `web_screenshot`. They reach the WebView's
+DevTools socket (`@webview_devtools_remote_<pid>`, on for every app on this `userdebug` image) from the
+host through the xsocket broker (`omni_linux::xsocket::HostStream`, `published`).
+
+Open: `setsid` is ENOSYS (Chromium's crash handler cannot start); a drag is still the `input` tool's
+swipe at web_dom's `tap` points. Devices booted before this build mix old and new runtimes when new
+app processes start: restart the app.
+
 ## THE OMNIDROID APP: A POOL OF WARM ANDROIDS, ANY APK, MANY INSTANCES (2026-10-10, macOS M1; branch `omnidroid-app`, **not merged, not pushed**)
 
 Goal (owner): a full CLI app instead of one-shot commands; it warms an Android on open, puts each

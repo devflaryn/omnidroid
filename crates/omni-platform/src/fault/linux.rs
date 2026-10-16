@@ -106,6 +106,9 @@ use crate::vm::OsError;
 /// This backend is real.
 pub(super) const AVAILABLE: bool = true;
 
+/// Not vouched for: the kernel clears a tag from `si_addr`, but no test here has watched it.
+pub(super) const REPORTS_UNTAGGED_ADDRESSES: bool = false;
+
 // -------------------------------------------------------------------------------------------
 // The slot table and its quiescence protocol: fault/windows.rs's, unchanged. See that file for the
 // ordering argument; the comments here say only where the code is.

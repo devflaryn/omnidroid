@@ -6,6 +6,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -127,6 +128,20 @@ public:
      * the resulting instructions as a vector of their string representations.
      */
     std::vector<std::string> Disassemble() const;
+
+    /// Omnidroid patch 0102 (arm64 backend only): the bytes of translated code this jit's cache
+    /// holds now, and has emitted in all. Safe to call from any thread.
+    std::size_t OdCodeBytesInUse() const;
+    std::uint64_t OdCodeBytesEmitted() const;
+
+    /// Omnidroid patch 0104 (arm64 backend only): from another thread, while this jit's thread is
+    /// parked in a callback that returns to `resume` (host code in this jit's cache) and `parked`
+    /// still says so once a halt is raised: ask for a clear and give back every page of
+    /// translated code but those holding the rest of that block. The thread finishes the block on
+    /// return, the halt sends it to the dispatcher, and the clear is made at the edge of its run
+    /// (after this returns: both hold the invalidation lock). The bytes given back; 0 if the
+    /// thread was no longer parked there.
+    std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
 
 private:
     struct Impl;

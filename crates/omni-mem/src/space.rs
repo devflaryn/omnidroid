@@ -946,6 +946,8 @@ impl GuestSpace {
             }
             let host_len = self.round_size(OP, guest_len)?;
             let address = self.map_anonymous_locked(&mut inner, OP, placement, host_len, protection, commit)?;
+            // What was there (a sealed library's range) is mapped over.
+            self.forget_sealed(address, host_len);
             if guest_len < host_len {
                 if let Err(e) = self.sub_apply(&mut inner, OP, address + guest_len, host_len - guest_len, subpage_ops::SubOp::Unmap) {
                     let _ = inner.unmap_range(OP, address, host_len);
@@ -1070,6 +1072,7 @@ impl GuestSpace {
         inner.make_exact_placeholder(OP, address, size, true)?;
 
         let view = inner.map_view(OP, backing, file_offset, address, size, protection)?;
+        self.forget_sealed(address, size);
         let owner = Owner {
             id: MappingId(NEXT_MAPPING.fetch_add(1, Ordering::Relaxed)),
             mapping_start: address,
@@ -1330,6 +1333,7 @@ impl GuestSpace {
             } else {
                 inner.unmap_range(OP, address, len)?;
                 self.forget_aliases(address, len);
+                self.forget_sealed(address, len);
             }
             inner.validate();
             return Ok(());

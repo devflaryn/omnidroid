@@ -200,6 +200,8 @@ unsafe extern "C" {
     static _dispatch_main_q: DispatchQueue;
     /// `dispatch_sync_f(3)`.
     fn dispatch_sync_f(queue: *const DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
+    /// `dispatch_async_f(3)`.
+    fn dispatch_async_f(queue: *const DispatchQueue, context: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -474,6 +476,26 @@ fn serve() -> ! {
 pub(super) fn stop_run_loop() {
     // SAFETY: `CFRunLoopStop` is thread-safe and the main run loop exists.
     unsafe { CFRunLoopStop(CFRunLoopGetMain()) };
+}
+
+/// **Run `work` on the AppKit thread, later**: queued behind what is there, and not waited for (the
+/// caller may be a thread the guest is waiting on, which the AppKit thread -- in a window drag's
+/// modal loop, say -- must not hold up). A panic in `work` is caught and dropped there. Inline when
+/// already on that thread.
+pub(crate) fn on_main_async(work: Box<dyn FnOnce(MainThreadMarker) + Send>) {
+    if let Some(mtm) = MainThreadMarker::new() {
+        return work(mtm);
+    }
+    extern "C" fn trampoline(context: *mut c_void) {
+        // SAFETY: `context` is the box `on_main_async` leaked for this call, taken back once.
+        let work = unsafe { Box::from_raw(context.cast::<Box<dyn FnOnce(MainThreadMarker) + Send>>()) };
+        // SAFETY: the main queue runs its work on the main thread.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let _ = catch_unwind(AssertUnwindSafe(|| objc2::rc::autoreleasepool(|_| work(mtm))));
+    }
+    let context = Box::into_raw(Box::new(work)).cast::<c_void>();
+    // SAFETY: the main queue is a static; the box is taken back by `trampoline`, which runs once.
+    unsafe { dispatch_async_f(&raw const _dispatch_main_q, context, trampoline) };
 }
 
 /// **Run `work` on the AppKit thread and return what it returned**, synchronously.

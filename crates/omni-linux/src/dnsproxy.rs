@@ -109,7 +109,8 @@ impl Proxy {
                 Some(command) => {
                     let reply = answer(&command, &self.hosts);
                     self.out.lock().extend(reply);
-                    crate::poll::notify();
+                    // The socket's key (`socket::key`): its waiters, not every waiter.
+                    crate::poll::notify_key(std::ptr::from_ref(self) as crate::poll::Key);
                 }
                 None => {
                     self.working.store(false, Ordering::SeqCst);

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use crate::binder::{Broker, Parcel};
-use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_ABS, EV_KEY, EV_REL, REL_HWHEEL, REL_WHEEL};
+use crate::evdev::{ABS_X, ABS_Y, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE, EV_ABS, EV_KEY, EV_REL, REL_HWHEEL, REL_WHEEL, REL_X, REL_Y};
 
 const INPUT_MANAGER: &str = "android.hardware.input.IInputManager";
 /// `IInputManager$Stub.TRANSACTION_injectInputEvent` in the image.
@@ -119,6 +119,9 @@ impl Mouse {
     pub fn sync(&mut self, packet: &[(u16, u16, i32)], now: i64) -> Vec<Motion> {
         let (mut x, mut y) = (self.x, self.y);
         let (mut pressed, mut released, mut wheel, mut hwheel) = (0, 0, 0, 0);
+        // A camera drag's raw motion (`window_input`): the relative axes, as a device's mouse
+        // reports them even where its pointer stops at the display's edge.
+        let mut rel: Option<(f32, f32)> = None;
         for &(kind, code, value) in packet {
             match (kind, code) {
                 (EV_ABS, ABS_X) => x = value as f32,
@@ -127,10 +130,12 @@ impl Mouse {
                 (EV_KEY, c) => released |= button(c),
                 (EV_REL, REL_WHEEL) => wheel += value,
                 (EV_REL, REL_HWHEEL) => hwheel += value,
+                (EV_REL, REL_X) => rel.get_or_insert((0.0, 0.0)).0 += value as f32,
+                (EV_REL, REL_Y) => rel.get_or_insert((0.0, 0.0)).1 += value as f32,
                 _ => {}
             }
         }
-        let (dx, dy) = (x - self.x, y - self.y);
+        let (dx, dy) = rel.unwrap_or((x - self.x, y - self.y));
         (self.x, self.y) = (x, y);
         let last = self.buttons;
         let current = (last & !released) | pressed;
@@ -411,6 +416,19 @@ mod tests {
 
     /// `setPointerIcon`'s parcel as the app's `IInputManager$Stub$Proxy` writes it: the token,
     /// the typed object's marker, the icon's type first.
+    /// A camera drag's raw motion is the relative axes, also where the pointer no longer moves.
+    #[test]
+    fn relative_motion_is_the_drags_own_not_the_positions() {
+        let mut mouse = Mouse::default();
+        mouse.sync(&[(EV_ABS, ABS_X, 10), (EV_ABS, ABS_Y, 10), (EV_KEY, BTN_RIGHT, 1)], 1);
+        let m = mouse.sync(&[(EV_ABS, ABS_X, 0), (EV_REL, REL_X, -25)], 2);
+        assert_eq!((m[0].action, m[0].x, m[0].dx, m[0].dy), (ACTION_MOVE, 0.0, -25.0, 0.0));
+        let m = mouse.sync(&[(EV_REL, REL_X, -7)], 3);
+        assert_eq!((m[0].action, m[0].x, m[0].dx), (ACTION_MOVE, 0.0, -7.0), "at the edge, still turning");
+        let m = mouse.sync(&abs(5, 10), 4);
+        assert_eq!(m[0].dx, 5.0, "a move without them: the position's change");
+    }
+
     #[test]
     fn the_pointer_icon_type_is_read_from_set_pointer_icons_parcel() {
         let mut p = Parcel::with_interface_token(INPUT_MANAGER);

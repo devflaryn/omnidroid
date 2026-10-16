@@ -7,6 +7,11 @@
 #include <cstdio>
 #include <limits>
 
+#if defined(__APPLE__) || defined(__linux__)
+#    include <sys/mman.h>
+#    include <unistd.h>
+#endif
+
 #include <mcl/bit_cast.hpp>
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
@@ -106,8 +111,99 @@ void AddressSpace::ClearCache() {
     decltype(fastmem_records){}.swap(fastmem_records);
     decltype(link_records){}.swap(link_records);
     link_heads = {};
+    // Omnidroid patch 0102: and so are the pages the blocks were in.
+    const std::size_t used = static_cast<std::size_t>(code.offset());
     code.set_offset(prelude_info.end_of_prelude);
+    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
+    od_in_use.store(0, std::memory_order_relaxed);
     cache_clears++;
+}
+
+// Omnidroid patch 0102: the whole pages of `[from, to)` (offsets into the cache) given back. Their
+// contents are left undefined; nothing executes them until emission writes them again -- the cache
+// is this thread's, and a clear happens outside generated code (at a run's edge, or when `Emit`
+// finds it full, called from the dispatcher in the prelude, which is kept).
+void AddressSpace::OdDiscard(std::size_t from, std::size_t to) {
+#if defined(__APPLE__) || defined(__linux__)
+    const std::size_t page = static_cast<std::size_t>(getpagesize());
+    const std::size_t start = (from + page - 1) & ~(page - 1);
+    const std::size_t end = std::min((to + page - 1) & ~(page - 1), code_cache_size);
+    if (end <= start) {
+        return;
+    }
+    auto* at = reinterpret_cast<u8*>(mem.ptr()) + start;
+#    if defined(__APPLE__)
+    // MADV_DONTNEED frees nothing here; REUSABLE drops the pages from the footprint at once.
+    if (madvise(at, end - start, MADV_FREE_REUSABLE) == 0) {
+        if (od_reusable_end == 0) {
+            od_reuse_mark = start;
+            od_reusable_end = end;
+        } else {
+            od_reuse_mark = std::min(od_reuse_mark, start);
+            od_reusable_end = std::max(od_reusable_end, end);
+        }
+    }
+#    else
+    madvise(at, end - start, MADV_DONTNEED);
+#    endif
+#else
+    (void)from;
+    (void)to;
+#endif
+}
+
+// Omnidroid patch 0104: see the header. Called with the jit's invalidation lock held, while its
+// thread is parked in a callback; that thread takes the lock before it clears or emits again.
+std::size_t AddressSpace::OdDiscardExcept(std::uint64_t keep) {
+#if defined(__APPLE__) || defined(__linux__)
+    const std::size_t page = static_cast<std::size_t>(getpagesize());
+    const std::size_t prelude = static_cast<std::size_t>(prelude_info.end_of_prelude);
+    const std::size_t used = static_cast<std::size_t>(code.offset());
+    const auto base = reinterpret_cast<std::uint64_t>(mem.ptr());
+    if (used <= prelude) {
+        return 0;
+    }
+    std::size_t given = 0;
+    if (keep >= base && keep < base + used) {
+        const std::size_t at = static_cast<std::size_t>(keep - base) & ~(page - 1);
+        const std::size_t keep_end = at + 2 * page;
+        if (at > prelude) {
+            OdDiscard(prelude, at);
+            given += at - std::min(at, (prelude + page - 1) & ~(page - 1));
+        }
+        if (keep_end < used) {
+            OdDiscard(keep_end, used);
+            given += ((used + page - 1) & ~(page - 1)) - keep_end;
+        }
+    } else {
+        // Not in this cache's blocks (the prelude, or elsewhere): every block may go.
+        OdDiscard(prelude, used);
+        given += ((used + page - 1) & ~(page - 1)) - ((prelude + page - 1) & ~(page - 1));
+    }
+    od_in_use.store(0, std::memory_order_relaxed);
+    return given;
+#else
+    (void)keep;
+    return 0;
+#endif
+}
+
+// Omnidroid patch 0102: pages marked reusable below `to` accounted for again before they are
+// written (macOS: MADV_FREE_REUSE), a megabyte at a time.
+void AddressSpace::OdReuseUpTo(std::size_t to) {
+#if defined(__APPLE__)
+    constexpr std::size_t chunk = 1024 * 1024;
+    while (od_reuse_mark < od_reusable_end && od_reuse_mark < to) {
+        const std::size_t end = std::min(od_reuse_mark + chunk, od_reusable_end);
+        madvise(reinterpret_cast<u8*>(mem.ptr()) + od_reuse_mark, end - od_reuse_mark, MADV_FREE_REUSE);
+        od_reuse_mark = end;
+    }
+    if (od_reuse_mark >= od_reusable_end) {
+        od_reuse_mark = od_reusable_end = 0;
+    }
+#else
+    (void)to;
+#endif
 }
 
 void AddressSpace::DumpDisassembly() const {
@@ -125,9 +221,15 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
         ClearCache();
     }
 
+    // Omnidroid patch 0102: pages given back by a clear are taken again before they are written.
+    const std::size_t emit_from = static_cast<std::size_t>(code.offset());
+    OdReuseUpTo(emit_from + 1024 * 1024);
+
     UnprotectCodeMemory();
 
     EmittedBlockInfo block_info = EmitArm64(code, std::move(block), GetEmitConfig(), fastmem_manager);
+    od_emitted.fetch_add(static_cast<std::size_t>(code.offset()) - emit_from, std::memory_order_relaxed);
+    od_in_use.store(static_cast<std::size_t>(code.offset()) - static_cast<std::size_t>(prelude_info.end_of_prelude), std::memory_order_relaxed);
 
     ASSERT(block_entries.insert({block.Location(), block_info.entry_point}).second);
     const u32 block_index = RecordBlock(block.Location(), block_info);

@@ -293,6 +293,9 @@ fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Dev
             Out::Title(title) => {
                 let _ = window.set_title(title);
             }
+            Out::Warp(x, y) => {
+                let _ = window.warp_pointer(x, y);
+            }
             Out::Center => {
                 if let Ok((w, h)) = window.client_size() {
                     let _ = window.warp_pointer(i32::try_from(w / 2).unwrap_or(0), i32::try_from(h / 2).unwrap_or(0));
@@ -565,8 +568,34 @@ impl crate::hal::framebuffer::ZeroSink for WindowSink {
     }
 }
 
+/// The window's image as the composer's [`CpuSink`](crate::hal::framebuffer::CpuSink): frames
+/// written straight into it (macOS: its `IOSurface`s).
+struct WindowRows(Presenter);
+
+impl crate::hal::framebuffer::CpuSink for WindowRows {
+    fn present_rows(&self, width: u32, height: u32, fill: &mut dyn FnMut(&mut [u8], usize)) -> bool {
+        self.0.present_rows(width, height, fill).unwrap_or(false)
+    }
+}
+
+/// The composer's row sink for as long as the present thread runs: taken away when it ends.
+struct RowsSlot<'a>(&'a Framebuffer);
+
+impl Drop for RowsSlot<'_> {
+    fn drop(&mut self) {
+        self.0.set_cpu_sink(None);
+    }
+}
+
 /// The present thread: each frame to the window, and the window's size to the display.
 fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebuffer: &Framebuffer, composer: &Composer, shown_display: i64, stop: &AtomicBool) {
+    // macOS: the composer writes a frame of one opaque layer straight into the window's image
+    // (`present_single`); this thread then has nothing to copy for it. Elsewhere the window takes
+    // no rows.
+    let _rows = cfg!(target_os = "macos").then(|| {
+        framebuffer.set_cpu_sink(Some(Arc::new(WindowRows(presenter.clone()))));
+        RowsSlot(framebuffer)
+    });
     // The framebuffer frame last shown, and how many frames were shown.
     let (mut shown, mut presented) = (0u64, 0u64);
     let mut refused = false;

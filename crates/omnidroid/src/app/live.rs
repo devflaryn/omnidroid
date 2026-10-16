@@ -15,20 +15,20 @@ pub struct PoolLive {
 }
 
 /// A tool's description: name, what it does, its parameters as (name, type, required, what).
-type ToolDef = (&'static str, &'static str, &'static [(&'static str, &'static str, bool, &'static str)]);
+pub type ToolDef = (&'static str, &'static str, &'static [(&'static str, &'static str, bool, &'static str)]);
 
 const TOOLS: &[ToolDef] = &[
-    ("start_instance", "Launch any APK (a host path) as `count` instances (default 1). Answers their ids at once; each runs in a window of its own on a warm Android: the same APK file again shares an Android (one Android user per extra instance), another package goes into a warm Android beside the others, another build of a package running elsewhere gets an Android of its own. `wait_instance` waits until one runs.", &[("apk", "string", true, "host path of the APK"), ("count", "number", false, "how many instances (1-64, default 1)")]),
+    ("start_instance", "Launch any APK (a host path) as `count` instances (default 1). Answers their ids at once; each runs in a window of its own on a warm Android: the same APK file again shares an Android (one Android user per extra instance), another package goes into a warm Android beside the others, another build of a package running elsewhere gets an Android of its own. `wait_instance` waits until one runs.", &[("apk", "string", true, "host path of the APK"), ("count", "number", false, "how many instances (1-64, default 1)"), ("options", "string", false, "the installed plugins' options, as on omnidroid's command line: e.g. `--cookie <file or name login saved> --place <id>` (roblox plugin) signs each instance in as that account and joins the place")]),
     ("wait_instance", "Wait until an instance runs (its app's Activity displayed) or ends, at most `timeout` seconds (default 300). Answers its state.", &[("instance_id", "number", true, "the id start_instance gave"), ("timeout", "number", false, "seconds (default 300)")]),
     ("list_instances", "Every instance: id, package, its Android (device), user, display, state (waiting, installing, starting, running, closing, ended: why), screenshot path.", &[]),
     ("stop_instance", "Close an instance: its app stopped, its window gone. Its Android stays warm.", &[("instance_id", "number", true, "the instance")]),
-    ("screenshot", "The instance's display as a PNG (written every second): path, width, height.", &[("instance_id", "number", true, "the instance")]),
+    ("screenshot", "The instance's display as a PNG, written now: path, width, height.", &[("instance_id", "number", true, "the instance")]),
     ("input", "Input to an instance's display: action tap (x,y), swipe (x,y,x2,y2,ms), text (text), key (key: a KEYCODE_ name or number).", &[("instance_id", "number", true, "the instance"), ("action", "string", true, "tap | swipe | text | key"), ("x", "number", false, "x"), ("y", "number", false, "y"), ("x2", "number", false, "swipe end x"), ("y2", "number", false, "swipe end y"), ("ms", "number", false, "swipe duration"), ("text", "string", false, "text to type"), ("key", "string", false, "e.g. KEYCODE_BACK")]),
     ("shell", "A shell command on an Android (as `adb shell`): exit status and output. `device` defaults to the first ready one; `uid` 0 runs as root.", &[("command", "string", true, "a /system/bin/sh command line"), ("device", "number", false, "the Android's id (list_devices)"), ("uid", "number", false, "0 root, 1000 system, default 2000 shell")]),
     ("list_devices", "The warm Androids: id, state (booting, ready, closing), how long up and idle, builds installed, instances.", &[]),
     ("device_status", "The same as list_devices.", &[]),
     ("warm_device", "Boot one more Android now (so later launches start at once).", &[]),
-    ("stop_device", "Stop an Android and the instances on it.", &[("device", "number", true, "the Android's id")]),
+    ("stop_device", "Stop an Android and the instances on it. Stopping the last one leaves none: no other is warmed (nor when the app opens next) until a launch or `warm_device`.", &[("device", "number", true, "the Android's id")]),
     ("settings", "The app's settings; with `key` and `value`, change one (idle_close_minutes, keep_warm, warm_on_start, stop_on_exit, max_devices, instance_size, gpu, device_ram_mb).", &[("key", "string", false, "a setting"), ("value", "string", false, "its new value")]),
     ("pool_log", "The app's log (launches, installs, boots, ends), newest last.", &[("lines", "number", false, "how many (default 60)")]),
 ];
@@ -120,7 +120,9 @@ impl PoolLive {
             "start_instance" | "launch_app" => {
                 let apk = args.get("apk").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `apk` (a host path)"))?;
                 let count = arg_u64(args, "count").unwrap_or(1).clamp(1, 64) as u32;
-                let ids = pool.launch(Path::new(apk), count).map_err(RpcError::server)?;
+                let options = args.get("options").and_then(Json::as_str).map(super::command::words).unwrap_or_default();
+                let extras = super::plugged::extras(Path::new(apk), &options).map_err(RpcError::params)?;
+                let ids = pool.launch_with(Path::new(apk), count, extras).map_err(RpcError::server)?;
                 Ok(json::obj([
                     ("instances", Json::Array(ids.iter().map(|i| Json::Num(f64::from(*i))).collect())),
                     ("note", json::s("launching: wait_instance {instance_id} waits until it runs; list_instances shows every state")),
@@ -156,6 +158,15 @@ impl PoolLive {
                 let (_, instances) = pool.snapshot();
                 let i = instances.iter().find(|i| i.id == id).ok_or_else(|| RpcError::params(format!("no instance #{id}")))?;
                 let path = i.screenshot.clone().ok_or_else(|| RpcError::server(format!("#{id} has no display yet ({})", state_name(&i.state))))?;
+                // The device writes the display's frame now (`omni_linux::displays::keep_screenshot`)
+                // and removes the request once the PNG is current.
+                let want = omni_linux::displays::screenshot_want(&path);
+                if std::fs::write(&want, b"").is_ok() {
+                    let t = Instant::now();
+                    while want.exists() && t.elapsed() < Duration::from_secs(3) {
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
                 let (w, h) = png_size(&path).ok_or_else(|| RpcError::server(format!("no frame yet at {}", path.display())))?;
                 Ok(json::obj([("path", json::s(path.display().to_string())), ("width", Json::Num(f64::from(w))), ("height", Json::Num(f64::from(h)))]))
             }
@@ -228,6 +239,7 @@ impl omni_mcp::Live for PoolLive {
     fn tools(&self) -> Vec<Json> {
         TOOLS
             .iter()
+            .chain(super::web::TOOLS)
             .map(|(name, desc, params)| {
                 let props: std::collections::BTreeMap<String, Json> = params.iter().map(|(n, t, _, d)| ((*n).to_string(), json::obj([("type", json::s(if *t == "number" { "number" } else { t })), ("description", json::s(*d))]))).collect();
                 let required: Vec<Json> = params.iter().filter(|p| p.2).map(|p| json::s(p.0)).collect();
@@ -241,6 +253,9 @@ impl omni_mcp::Live for PoolLive {
     }
 
     fn call(&mut self, name: &str, arguments: &Json) -> Option<Result<Json, RpcError>> {
+        if let Some(answer) = super::web::call(&self.pool, name, arguments) {
+            return Some(answer);
+        }
         let known = TOOLS.iter().any(|t| t.0 == name) || name == "launch_app";
         known.then(|| self.run(name, arguments))
     }

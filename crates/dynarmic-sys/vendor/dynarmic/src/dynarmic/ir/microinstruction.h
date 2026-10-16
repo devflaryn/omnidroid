@@ -184,6 +184,11 @@ public:
     std::uint8_t HostLocHint() const { return host_loc_hint; }
     void SetHostLocHint(std::uint8_t loc) const { host_loc_hint = loc; }
 
+    /// Omnidroid patch 0103: whether the arm64 register allocator has defined this value in the
+    /// block being emitted (it was a hash set of instructions, filled and asked per block).
+    bool BackendDefined() const { return backend_defined; }
+    void SetBackendDefined() const { backend_defined = true; }
+
 private:
     [[noreturn]] void BadGetArg(size_t index) const;  // patch 0086
     // Patch 0087: what the inline predicates above were, from which `detail::inst_flags` is made.
@@ -198,6 +203,7 @@ private:
     unsigned use_count = 0;
     unsigned name = 0;
     mutable std::uint8_t host_loc_hint = 0xFF;  // patch 0080, in what was padding
+    mutable bool backend_defined = false;        // patch 0103, in what was padding
     std::array<Value, max_arg_count> args;
 
     // Linked list of pseudooperations associated with this instruction.

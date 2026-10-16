@@ -9,6 +9,71 @@
 //! Roblox in a world ran at 1.65 composed frames a second with SurfaceFlinger composing every frame
 //! (r16: its own process at 1.37 cores, waiting; the system's at 3.97).
 
+/// A 5- and a 6-bit channel as 8 bits: `round(v * 255 / max)`, as a GPU sampling a 565 image and
+/// writing 8 bits does (SurfaceFlinger's composition of such a layer, before the composer took it).
+const FIVE: [u8; 32] = {
+    let mut t = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        t[i] = ((i as u32 * 255 + 15) / 31) as u8;
+        i += 1;
+    }
+    t
+};
+const SIX: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut i = 0;
+    while i < 64 {
+        t[i] = ((i as u32 * 255 + 31) / 63) as u8;
+        i += 1;
+    }
+    t
+};
+
+/// One RGB565 pixel (`R5 G6 B5`, little-endian) as opaque RGBA.
+#[inline]
+fn rgba_of_565(lo: u8, hi: u8) -> [u8; 4] {
+    let v = u16::from_le_bytes([lo, hi]);
+    [FIVE[usize::from(v >> 11)], SIX[usize::from((v >> 5) & 63)], FIVE[usize::from(v & 31)], 255]
+}
+
+/// [`rgba_of_565`] as arithmetic, which the compiler vectorizes: `(x * 527 + 23) >> 6` is
+/// `round(x * 255 / 31)` for every 5-bit `x`, `(x * 259 + 33) >> 6` `round(x * 255 / 63)` for every
+/// 6-bit one (`tests::the_565_arithmetic_is_the_table`).
+#[inline]
+fn rgba_word_of_565(v: u16) -> u32 {
+    let v = u32::from(v);
+    let r = ((v >> 11) * 527 + 23) >> 6;
+    let g = (((v >> 5) & 63) * 259 + 33) >> 6;
+    let b = ((v & 31) * 527 + 23) >> 6;
+    r | g << 8 | b << 16 | 0xff00_0000
+}
+
+/// **RGB565 to RGBA, in place**: `buf[from..]` holds 16-bit pixels, which become opaque RGBA from
+/// `buf[0]` on -- `buf.len() == 2 * from`, each pixel's two bytes read before its four are written
+/// (the write never passes the read).
+pub fn expand_565_in_place(buf: &mut [u8], from: usize) {
+    debug_assert_eq!(buf.len(), from * 2);
+    for i in 0..from / 2 {
+        let px = rgba_of_565(buf[from + 2 * i], buf[from + 2 * i + 1]);
+        buf[4 * i..4 * i + 4].copy_from_slice(&px);
+    }
+}
+
+/// [`expand_565_row`] as opaque **BGRA** (a window's own order).
+pub fn expand_565_row_bgra(src: &[u8], dst: &mut [u8]) {
+    for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
+        d.copy_from_slice(&swap_rb(rgba_word_of_565(u16::from_le_bytes([s[0], s[1]]))).to_le_bytes());
+    }
+}
+
+/// A row of RGB565 pixels into `dst` as opaque RGBA (`dst` four bytes a pixel of `src`'s two).
+pub fn expand_565_row(src: &[u8], dst: &mut [u8]) {
+    for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(4)) {
+        d.copy_from_slice(&rgba_word_of_565(u16::from_le_bytes([s[0], s[1]])).to_le_bytes());
+    }
+}
+
 /// How a layer's pixels combine with what is under them (`BlendMode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blend {
@@ -292,7 +357,7 @@ fn fill_black(out: &mut [u8]) {
 
 /// `dst = src`, red and blue swapped when `swap`, alpha made 255 when `alpha`.
 #[inline]
-fn copy_row(dst: &mut [u8], src: &[u8], swap: bool, alpha: bool) {
+pub fn copy_row(dst: &mut [u8], src: &[u8], swap: bool, alpha: bool) {
     if !swap && !alpha {
         dst.copy_from_slice(src);
         return;
@@ -461,6 +526,75 @@ fn blend_pixel(d: &mut [u8], s: &[u8], blend: Blend, opaque: bool, plane: u32) {
 
 #[cfg(test)]
 mod tests {
+    /// The composer's direct path for one opaque layer over the display (`present_single`) makes
+    /// the pixels composing it would: RGBX copied with alpha 1, RGBA under blend `NONE` as it is,
+    /// RGB565 expanded.
+    #[test]
+    fn one_opaque_layer_s_rows_are_what_composing_it_makes() {
+        use super::{compose_with, copy_row, expand_565_in_place, expand_565_row, Blend, Layer, Source};
+        let (w, h, stride) = (5usize, 3usize, 7usize);
+        let src: Vec<u8> = (0..stride * h * 4).map(|i| (i * 37 % 251) as u8).collect();
+        for (opaque, blend) in [(true, Blend::Premultiplied), (false, Blend::None)] {
+            let mut composed = vec![0u8; w * h * 4];
+            let layer = Layer { source: Source::Pixels { data: &src, stride, opaque, crop_x: 1, crop_y: 0 }, frame: (0, 0, w as i32, h as i32), blend, alpha: 1.0 };
+            compose_with(&mut composed, w, h, &[layer], true);
+            let mut direct = vec![0u8; w * h * 4];
+            for y in 0..h {
+                let at = (y * stride + 1) * 4;
+                copy_row(&mut direct[y * w * 4..(y + 1) * w * 4], &src[at..at + w * 4], false, opaque);
+            }
+            assert_eq!(direct, composed, "opaque {opaque}");
+        }
+        let src565: Vec<u8> = (0..stride * h * 2).map(|i| (i * 53 % 256) as u8).collect();
+        let mut expanded = vec![0u8; stride * h * 4];
+        expanded[stride * h * 2..].copy_from_slice(&src565);
+        expand_565_in_place(&mut expanded, stride * h * 2);
+        let mut composed = vec![0u8; w * h * 4];
+        let layer = Layer { source: Source::Pixels { data: &expanded, stride, opaque: true, crop_x: 1, crop_y: 0 }, frame: (0, 0, w as i32, h as i32), blend: Blend::Premultiplied, alpha: 1.0 };
+        compose_with(&mut composed, w, h, &[layer], true);
+        let mut direct = vec![0u8; w * h * 4];
+        for y in 0..h {
+            let at = (y * stride + 1) * 2;
+            expand_565_row(&src565[at..at + w * 2], &mut direct[y * w * 4..(y + 1) * w * 4]);
+        }
+        assert_eq!(direct, composed, "565");
+    }
+
+    #[test]
+    fn a_565_row_for_a_window_is_the_composer_s_with_red_and_blue_swapped() {
+        let src: Vec<u8> = (0..64u32).flat_map(|i| ((i * 2731) as u16).to_le_bytes()).collect();
+        let (mut rgba, mut bgra) = (vec![0u8; 128], vec![0u8; 128]);
+        super::expand_565_row(&src, &mut rgba);
+        super::expand_565_row_bgra(&src, &mut bgra);
+        for (a, b) in rgba.chunks_exact(4).zip(bgra.chunks_exact(4)) {
+            assert_eq!([a[2], a[1], a[0], a[3]], [b[0], b[1], b[2], b[3]]);
+        }
+    }
+
+    #[test]
+    fn the_565_arithmetic_is_the_table() {
+        for v in 0..=u16::MAX {
+            let [lo, hi] = v.to_le_bytes();
+            assert_eq!(super::rgba_word_of_565(v).to_le_bytes(), super::rgba_of_565(lo, hi), "{v:#06x}");
+        }
+    }
+
+    #[test]
+    fn rgb565_expands_to_opaque_rgba_as_a_gpu_samples_it() {
+        let px = [0xf800u16, 0x07e0, 0x001f, 0xffff, 0x0000, 0x7bef];
+        let mut buf = vec![0u8; px.len() * 4];
+        for (i, p) in px.iter().enumerate() {
+            buf[px.len() * 2 + 2 * i..px.len() * 2 + 2 * i + 2].copy_from_slice(&p.to_le_bytes());
+        }
+        super::expand_565_in_place(&mut buf, px.len() * 2);
+        // 0x7bef: 15/31, 31/63, 15/31 of full.
+        assert_eq!(buf, [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255, 123, 125, 123, 255]);
+        let mut one = vec![0u8; 4];
+        one[2..].copy_from_slice(&(3u16 << 11).to_le_bytes());
+        super::expand_565_in_place(&mut one, 2);
+        assert_eq!(one[0], 25, "3/31 of 255 is 24.7: rounded, as a GPU writes it");
+    }
+
     use super::*;
 
     fn px(out: &[u8], w: usize, x: usize, y: usize) -> [u8; 4] {

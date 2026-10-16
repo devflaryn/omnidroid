@@ -47,6 +47,43 @@ pub struct PairChannel {
     stream: bool,
     /// An input channel's messages in flight (`crate::input_channel`), if this pair is one.
     input: Mutex<crate::input_channel::Channel>,
+    /// `sent[side]`, `taken[side]`: the bytes ever queued to `side` and taken from it (a datagram
+    /// counts whole when taken) -- the stream positions descriptors are delivered at. Changed with
+    /// `queues` held.
+    sent: [std::sync::atomic::AtomicU64; 2],
+    taken: [std::sync::atomic::AtomicU64; 2],
+    /// `rights[side]`: descriptors sent to `side` with a message (`SCM_RIGHTS`), each batch at the
+    /// position of its message's first byte. Chromium's IPC (Mojo) passes every shared-memory
+    /// region and channel this way, between an app and its WebView renderer; when they were
+    /// dropped, the renderer read a message missing its handles, took its channel for broken and
+    /// exited, and the WebView killed the app ("Renderer process crash detected", run 2026-10-12).
+    rights: Mutex<[std::collections::VecDeque<(u64, Vec<Arc<OpenFile>>)>; 2]>,
+}
+
+impl PairChannel {
+    fn new(creds: [Cred; 2], stream: bool) -> Self {
+        Self {
+            creds,
+            queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
+            open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
+            stream,
+            input: Mutex::default(),
+            sent: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+            taken: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+            rights: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
+        }
+    }
+
+    /// The descriptors `side` has now read up to (sent with a message whose first byte it took).
+    fn rights_taken(&self, side: usize) -> Vec<Arc<OpenFile>> {
+        let taken = self.taken[side].load(std::sync::atomic::Ordering::SeqCst);
+        let mut rights = self.rights.lock();
+        let mut out = Vec::new();
+        while rights[side].front().is_some_and(|(at, _)| *at < taken) {
+            out.extend(rights[side].pop_front().expect("checked").1);
+        }
+        out
+    }
 }
 
 /// In an init socket's type: `+passcred`.
@@ -71,13 +108,7 @@ pub fn init_socket(instance: usize, name: &str, ty: u64, cred: Cred) -> OpenFile
 /// A connected pair of type `ty`: the client end's peer, and the server's socket.
 #[must_use]
 pub fn pair(ty: u64, client: Cred, server: Cred) -> (Peer, Socket) {
-    let channel = Arc::new(PairChannel {
-        creds: [client, server],
-        queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
-        open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
-        stream: ty == 1,
-        input: Mutex::default(),
-    });
+    let channel = Arc::new(PairChannel::new([client, server], ty == 1));
     let server = Socket { domain: AF_UNIX, ty, peer: Some(Peer::Pair { channel: Arc::clone(&channel), side: 1 }), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: server[0], passcred: false };
     (Peer::Pair { channel, side: 0 }, server)
 }
@@ -218,6 +249,12 @@ fn nonblocking(file: &OpenFile) -> bool {
 
 /// Deliver `bytes` to a connected socket's peer.
 pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
+    send_with(socket, bytes, Vec::new())
+}
+
+/// Deliver `bytes` with descriptors (`SCM_RIGHTS`) to a connected socket's peer. Only a socket
+/// pair's end carries descriptors (as only an `AF_UNIX` socket does); the others drop them.
+pub fn send_with(socket: &mut Socket, bytes: &[u8], rights: Vec<Arc<OpenFile>>) -> Result<usize, Errno> {
     // To the kernel (`crate::netlink`), from the port the socket is bound to (bound now if not).
     if socket.domain == AF_NETLINK && socket.peer.is_none() {
         let port = match &socket.name {
@@ -250,7 +287,13 @@ pub fn send(socket: &mut Socket, bytes: &[u8]) -> Result<usize, Errno> {
             if !channel.stream {
                 crate::input_channel::observe(&channel.input, bytes);
             }
-            channel.queues.lock()[other].push_back(bytes.to_vec());
+            let mut queues = channel.queues.lock();
+            let at = channel.sent[other].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            if !rights.is_empty() {
+                channel.rights.lock()[other].push_back((at, rights));
+            }
+            queues[other].push_back(bytes.to_vec());
+            drop(queues);
             crate::poll::notify_key(Arc::as_ptr(channel) as crate::poll::Key);
             Ok(bytes.len())
         }
@@ -319,6 +362,14 @@ fn instance_of(p: &Process) -> usize {
 
 fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    let was = peerless_key(&file);
+    let done = connect(p, t, a, &file);
+    told_of_peer(&file, was);
+    done
+}
+
+fn connect(p: &Process, t: &mut Task, a: [u64; 6], file: &Arc<OpenFile>) -> SysResult {
+    let file = Arc::clone(file);
     // A host socket connects without its descriptor's lock held: a blocking connect waits.
     if let Some(host) = host_of(&file) {
         let addr = p.mem.read(a[1], (a[2] as usize).min(128))?;
@@ -405,6 +456,7 @@ fn sys_sendmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         spans.push((base, take));
         total += take;
     }
+    let rights = rights_sent(p, &hdr)?;
     crate::guest::with_scratch(total, |bytes| {
         let mut at = 0;
         for &(base, len) in spans.as_slice() {
@@ -419,8 +471,39 @@ fn sys_sendmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         }
         let mut kind = file.kind.lock();
         let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
-        Ok(send(socket, bytes)? as u64)
+        Ok(send_with(socket, bytes, rights)? as u64)
     })
+}
+
+/// `SOL_SOCKET`, and its control messages' types.
+const SOL_SOCKET: u32 = 1;
+const SCM_RIGHTS: u32 = 1;
+const SCM_CREDENTIALS: u32 = 2;
+
+/// The descriptors a `sendmsg` passes (its `SCM_RIGHTS` control messages), as open files.
+fn rights_sent(p: &Process, hdr: &Msghdr) -> Result<Vec<Arc<OpenFile>>, Errno> {
+    let mut rights = Vec::new();
+    if hdr.control == 0 || hdr.controllen < 16 {
+        return Ok(rights);
+    }
+    let control = p.mem.read(hdr.control, (hdr.controllen as usize).min(64 * 1024))?;
+    // struct cmsghdr { len u64, level i32, type i32 } then the data, each padded to 8.
+    let mut at = 0usize;
+    while at + 16 <= control.len() {
+        let len = u64::from_le_bytes(control[at..at + 8].try_into().expect("8")) as usize;
+        if len < 16 || at + len > control.len() {
+            break;
+        }
+        let level = u32::from_le_bytes(control[at + 8..at + 12].try_into().expect("4"));
+        let ty = u32::from_le_bytes(control[at + 12..at + 16].try_into().expect("4"));
+        if level == SOL_SOCKET && ty == SCM_RIGHTS {
+            for fd in control[at + 16..at + len].chunks_exact(4) {
+                rights.push(p.fds.get(i32::from_le_bytes(fd.try_into().expect("4")))?);
+            }
+        }
+        at += (len + 7) & !7;
+    }
+    Ok(rights)
 }
 
 /// A guest `struct msghdr` (56 bytes), read in one copy.
@@ -472,6 +555,14 @@ impl Spans {
 /// no device coming or going here. Serving an address of another family is not offered.
 fn sys_bind(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
+    let was = peerless_key(&file);
+    let done = bind(p, t, a, &file);
+    told_of_peer(&file, was);
+    done
+}
+
+fn bind(p: &Process, t: &mut Task, a: [u64; 6], file: &Arc<OpenFile>) -> SysResult {
+    let file = Arc::clone(file);
     let mut kind = file.kind.lock();
     let FileKind::Socket(socket) = &mut *kind else { return Err(crate::errno::ENOTSOCK) };
     if socket.domain == AF_UNIX {
@@ -703,6 +794,7 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
             let msg = q.pop_front().expect("not empty");
             let n = msg.len().min(buf.len());
             buf[..n].copy_from_slice(&msg[..n]);
+            channel.taken[*side].fetch_add(msg.len() as u64, std::sync::atomic::Ordering::SeqCst);
             return Ok(n);
         }
         let mut n = 0;
@@ -716,6 +808,7 @@ pub fn receive(socket: &mut Socket, buf: &mut [u8]) -> Result<usize, Errno> {
             }
             n += take;
         }
+        channel.taken[*side].fetch_add(n as u64, std::sync::atomic::Ordering::SeqCst);
         return Ok(n);
     }
     if socket.inbox.is_empty() {
@@ -747,7 +840,10 @@ pub fn take(socket: &Socket) -> crate::relay::Took {
                 msg.extend_from_slice(&more);
             }
         }
-        return crate::relay::Took::Data(msg);
+        channel.taken[*side].fetch_add(msg.len() as u64, std::sync::atomic::Ordering::SeqCst);
+        drop(queues);
+        let rights = channel.rights_taken(*side);
+        return crate::relay::Took::Data(msg, rights);
     }
     if channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst) {
         crate::relay::Took::Nothing
@@ -876,6 +972,8 @@ pub fn key(socket: &Socket) -> Option<crate::poll::Key> {
         Some(Peer::Pair { channel, .. }) => Some(Arc::as_ptr(channel) as crate::poll::Key),
         Some(Peer::Host(h)) => Some(Arc::as_ptr(h) as crate::poll::Key),
         Some(Peer::Bound(b)) => Some(Arc::as_ptr(b) as crate::poll::Key),
+        // Its answers are told by the proxy (`dnsproxy`), as they are queued.
+        Some(Peer::Dns(d)) => Some(Arc::as_ptr(d) as crate::poll::Key),
         _ => None,
     }
 }
@@ -885,13 +983,38 @@ pub fn key(socket: &Socket) -> Option<crate::poll::Key> {
 /// as it is sent to), `logd`'s and a datagram socket connected to a bound one (always writable,
 /// never readable). The socket's own address, which is stable: it lives in its open file.
 #[must_use]
+///
+/// A socket of another family with no peer yet (a raw or ICMP socket -- the host's network does not
+/// stand behind those -- or one not yet bound or connected) is keyed so too: nothing fills its inbox
+/// but its own sends, and the `bind` or `connect` that gives it a peer wakes its waiters
+/// ([`told_of_peer`]) to look again under the peer's key. Waiting on anything instead, the system
+/// host's ConnectivityService thread (an IPv6 raw socket in its looper) was woken by every change
+/// in the process, ~3,200 times a second (M4, 2026-10-16).
 pub fn own_key(socket: &Socket) -> Option<crate::poll::Key> {
     let own = match &socket.peer {
-        None => socket.domain == AF_NETLINK,
+        None => true,
         Some(Peer::Logd(_) | Peer::PropertyService { .. } | Peer::Dgram(_)) => true,
         _ => false,
     };
     own.then_some(std::ptr::from_ref(socket) as crate::poll::Key)
+}
+
+/// The socket's own key while it has no peer: what a `bind` or `connect` that gives it one tells.
+fn peerless_key(file: &OpenFile) -> Option<crate::poll::Key> {
+    match &*file.kind.lock() {
+        FileKind::Socket(s) if s.peer.is_none() => Some(std::ptr::from_ref(s) as crate::poll::Key),
+        _ => None,
+    }
+}
+
+/// After `bind`/`connect`: a socket that had no peer and has one now wakes whoever waited on its
+/// own key ([`own_key`]), to look again under its new one.
+fn told_of_peer(file: &OpenFile, was: Option<crate::poll::Key>) {
+    if let Some(key) = was {
+        if peerless_key(file).is_none() {
+            crate::poll::notify_key(key);
+        }
+    }
 }
 
 /// `read` of a socket pair's end (which may wait); `None` for anything else.
@@ -959,13 +1082,7 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     if !matches!(kind, 1 | SOCK_DGRAM | SOCK_SEQPACKET) {
         return Err(EINVAL);
     }
-    let channel = Arc::new(PairChannel {
-        creds: [cred_of(p), cred_of(p)],
-        queues: Mutex::new([std::collections::VecDeque::new(), std::collections::VecDeque::new()]),
-        open: [std::sync::atomic::AtomicBool::new(true), std::sync::atomic::AtomicBool::new(true)],
-        stream: kind == 1,
-        input: Mutex::default(),
-    });
+    let channel = Arc::new(PairChannel::new([cred_of(p), cred_of(p)], kind == 1));
     let flags = if ty & SOCK_NONBLOCK != 0 { 0o4000 } else { 0 } | 2; // O_RDWR
     let mut fds = [0i32; 2];
     for (side, fd) in fds.iter_mut().enumerate() {
@@ -980,8 +1097,8 @@ fn sys_socketpair(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
-/// `recvmsg`: into the message's iovecs, no control data (nothing here passes descriptors over a
-/// socket).
+/// `recvmsg`: into the message's iovecs; the control data is the sender's credentials
+/// (`SO_PASSCRED`) and the descriptors sent with what was read (`SCM_RIGHTS`).
 fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
     let hdr = Msghdr::read(p, a[1])?;
@@ -1026,29 +1143,56 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         p.mem.write(a[1] + 48, &0u32.to_le_bytes())?;
         return Ok(n as u64);
     }
-    // SO_PASSCRED: the sender's credentials, SCM_CREDENTIALS; otherwise no control data.
-    let creds = match &*file.kind.lock() {
-        FileKind::Socket(s) if s.passcred => peer_cred(s),
-        _ => None,
+    // SO_PASSCRED: the sender's credentials, SCM_CREDENTIALS; the descriptors sent with what was
+    // read, SCM_RIGHTS.
+    let (creds, rights) = match &*file.kind.lock() {
+        FileKind::Socket(s) => (if s.passcred { peer_cred(s) } else { None }, match &s.peer {
+            Some(Peer::Pair { channel, side }) => channel.rights_taken(*side),
+            _ => Vec::new(),
+        }),
+        _ => (None, Vec::new()),
     };
     let (control, room) = (hdr.control, hdr.controllen);
-    let mut controllen = 0u64;
+    let mut cmsgs = Vec::new();
     let mut flags = 0u32;
     if let Some(c) = creds {
         // struct cmsghdr { len u64, level i32, type i32 } + struct ucred, padded to 8.
-        const SCM_CREDENTIALS: u32 = 2;
         if room >= 32 {
-            let mut cmsg = Vec::with_capacity(32);
-            cmsg.extend_from_slice(&28u64.to_le_bytes());
-            cmsg.extend_from_slice(&1u32.to_le_bytes());
-            cmsg.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
-            cmsg.extend_from_slice(&ucred(c));
-            cmsg.extend_from_slice(&[0; 4]);
-            p.mem.write(control, &cmsg)?;
-            controllen = 32;
+            cmsgs.extend_from_slice(&28u64.to_le_bytes());
+            cmsgs.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+            cmsgs.extend_from_slice(&SCM_CREDENTIALS.to_le_bytes());
+            cmsgs.extend_from_slice(&ucred(c));
+            cmsgs.extend_from_slice(&[0; 4]);
         } else {
             flags |= 0x8; // MSG_CTRUNC
         }
+    }
+    if !rights.is_empty() {
+        // As many as the buffer holds, each a new descriptor here (MSG_CMSG_CLOEXEC: close-on-exec);
+        // the rest are closed, and the message says it was cut (MSG_CTRUNC).
+        let fit = ((room as usize).saturating_sub(cmsgs.len() + 16) / 4).min(rights.len());
+        if fit < rights.len() {
+            flags |= 0x8;
+        }
+        if fit > 0 {
+            const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+            let mut fds = Vec::with_capacity(fit);
+            for file in rights.into_iter().take(fit) {
+                fds.push(p.fds.insert(file, a[2] & MSG_CMSG_CLOEXEC != 0, 0)?);
+            }
+            let len = 16 + 4 * fds.len();
+            cmsgs.extend_from_slice(&(len as u64).to_le_bytes());
+            cmsgs.extend_from_slice(&SOL_SOCKET.to_le_bytes());
+            cmsgs.extend_from_slice(&SCM_RIGHTS.to_le_bytes());
+            for fd in fds {
+                cmsgs.extend_from_slice(&fd.to_le_bytes());
+            }
+            cmsgs.resize((cmsgs.len() + 7) & !7, 0);
+        }
+    }
+    let controllen = (cmsgs.len() as u64).min(room);
+    if controllen > 0 {
+        p.mem.write(control, &cmsgs[..controllen as usize])?;
     }
     // msg_controllen and msg_flags, adjacent: one copy.
     let mut tail = [0u8; 12];
@@ -1075,4 +1219,57 @@ pub fn install(table: &mut Table) {
     table.set(nr::SENDMSG, sys_sendmsg);
     table.set(nr::SETSOCKOPT, sys_setsockopt);
     table.set(nr::SHUTDOWN, sys_shutdown);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn end(peer: Peer) -> Socket {
+        Socket { domain: AF_UNIX, ty: 1, peer: Some(peer), inbox: std::collections::VecDeque::new(), name: None, protocol: 0, owner: 0, passcred: false }
+    }
+
+    fn file() -> Arc<OpenFile> {
+        Arc::new(OpenFile { kind: Mutex::new(FileKind::Stdin), flags: Mutex::new(0) })
+    }
+
+    fn rights(s: &Socket) -> usize {
+        match &s.peer {
+            Some(Peer::Pair { channel, side }) => channel.rights_taken(*side).len(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn descriptors_arrive_with_the_bytes_they_were_sent_with_in_order() {
+        let (peer, mut b) = pair(1, [0; 3], [0; 3]);
+        let mut a = end(peer);
+        let (x, y) = (file(), file());
+        send_with(&mut a, b"one", vec![Arc::clone(&x)]).unwrap();
+        send_with(&mut a, b"two", Vec::new()).unwrap();
+        send_with(&mut a, b"three", vec![Arc::clone(&y)]).unwrap();
+        let mut buf = [0u8; 2];
+        assert_eq!(rights(&b), 0, "nothing read yet");
+        assert_eq!(receive(&mut b, &mut buf), Ok(2));
+        let taken = match &b.peer { Some(Peer::Pair { channel, side }) => channel.rights_taken(*side), _ => Vec::new() };
+        assert!(taken.len() == 1 && Arc::ptr_eq(&taken[0], &x), "the first message's, once its first byte is read");
+        let mut buf = [0u8; 4];
+        assert_eq!(receive(&mut b, &mut buf), Ok(4));
+        assert_eq!(rights(&b), 0, "\"e\" and \"two\": none");
+        let mut buf = [0u8; 16];
+        assert_eq!(receive(&mut b, &mut buf), Ok(5));
+        assert_eq!(rights(&b), 1, "the third message's");
+    }
+
+    #[test]
+    fn a_relay_takes_the_bytes_and_their_descriptors_together() {
+        let (peer, b) = pair(1, [0; 3], [0; 3]);
+        let mut a = end(peer);
+        send_with(&mut a, b"x", vec![file(), file()]).unwrap();
+        send_with(&mut a, b"y", vec![file()]).unwrap();
+        match take(&b) {
+            crate::relay::Took::Data(bytes, rights) => assert_eq!((bytes.as_slice(), rights.len()), (&b"xy"[..], 3)),
+            _ => panic!("data"),
+        }
+    }
 }

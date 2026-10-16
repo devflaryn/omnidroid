@@ -13,6 +13,7 @@
 //! | `display bind <id> <android id>` | -- (the window's pointer goes to that Android display) |
 //! | `display size <id> <w>x<h>` | its size now, as a window resized to it would make it |
 //! | `display list` | a line `<id> <w>x<h> <android id>` per display beyond display 0 |
+//! | `apps` | a line `<pid> <uid> <process name>` per app process running ([`crate::zygote::apps`]) |
 //!
 //! Android gives the display an id of its own; a host finds it by the display's name
 //! ([`crate::hal::composer::display_name`]) in `dumpsys display`, and binds it.
@@ -52,6 +53,43 @@ struct Extra {
 pub fn screenshot_path(base: &Path, id: i64) -> PathBuf {
     let stem = base.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
     base.with_file_name(format!("{stem}.d{id}.png"))
+}
+
+/// The file a reader makes to have a display's screenshot written now: `<png>.want` beside it.
+#[must_use]
+pub fn screenshot_want(png: &Path) -> PathBuf {
+    png.with_extension("png.want")
+}
+
+/// **A display's screenshot, kept at `to`** until `stop`: written whole (a rename, so a reader
+/// never sees half) when a reader asks for it -- [`screenshot_want`] is there; the file is removed
+/// once the PNG is current -- and otherwise every `every`, only if a frame came since. Asked-for
+/// shots are seen within 100 ms. Before, every display's 3.6 MB PNG (1280x720, stored) was written
+/// each second for nobody: ~11 MB/s of disk writes and their CRCs with three displays (2026-10-16).
+pub fn keep_screenshot(framebuffer: &crate::hal::framebuffer::Framebuffer, to: &Path, every: Duration, stop: &AtomicBool, mut each: impl FnMut()) {
+    const LOOK: Duration = Duration::from_millis(100);
+    let want = screenshot_want(to);
+    let (mut written, mut last) = (0, std::time::Instant::now());
+    while !stop.load(Ordering::Acquire) {
+        std::thread::sleep(LOOK);
+        each();
+        let asked = want.exists();
+        if !asked && last.elapsed() < every {
+            continue;
+        }
+        last = std::time::Instant::now();
+        let frames = framebuffer.frames();
+        if frames != 0 && (frames != written || !to.exists()) {
+            written = frames;
+            let part = to.with_extension("png.part");
+            if std::fs::write(&part, framebuffer.png()).is_ok() {
+                let _ = std::fs::rename(&part, to);
+            }
+        }
+        if asked {
+            let _ = std::fs::remove_file(&want);
+        }
+    }
 }
 
 /// The marker a window the person closed leaves: `<dir>/display-<id>.closed`.
@@ -115,20 +153,9 @@ impl Displays {
             let to = screenshot_path(base, id);
             let (every, stop) = (self.screenshot_every, Arc::clone(&stop));
             let _ = std::thread::Builder::new().name(format!("omni-display-{id}-shot")).spawn(move || {
-                let mut written = 0;
-                while !stop.load(Ordering::Acquire) {
-                    std::thread::sleep(every);
-                    let frames = framebuffer.frames();
-                    if frames == 0 || frames == written {
-                        continue;
-                    }
-                    written = frames;
-                    let part = to.with_extension("png.part");
-                    if std::fs::write(&part, framebuffer.png()).is_ok() {
-                        let _ = std::fs::rename(&part, &to);
-                    }
-                }
+                keep_screenshot(&framebuffer, &to, every, &stop, || {});
                 let _ = std::fs::remove_file(&to);
+                let _ = std::fs::remove_file(screenshot_want(&to));
             });
         }
         Ok(id)
@@ -184,7 +211,8 @@ impl Displays {
                 _ => Err(format!("not <id> <w>x<h>: {id} {wh}")),
             },
             ["display", "list"] => Ok(self.list()),
-            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | size <id> <w>x<h> | list)")),
+            ["apps"] => Ok(crate::zygote::apps().into_iter().map(|(pid, uid, name)| format!("{pid} {uid} {name}\n")).collect()),
+            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | size <id> <w>x<h> | list; apps)")),
         };
         match answer {
             Ok(out) => (0, out),

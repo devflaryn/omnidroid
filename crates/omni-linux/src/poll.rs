@@ -94,40 +94,95 @@ thread_local! {
     static ME: Arc<Waiter> = Arc::new(Waiter::default());
 }
 
-/// The queues: the change counter (for the callers that still compare it), the waiters on
-/// anything, and the waiters by key.
-#[derive(Default)]
-struct Queues {
-    generation: u64,
-    anything: Vec<Arc<Waiter>>,
-    keyed: HashMap<Key, Vec<Arc<Waiter>>>,
+/// **The queues**, split so that waiters on different things do not wait for one another's lock:
+/// the change counter (for the callers that still compare it), the waiters on anything, and the
+/// waiters by key in [`SHARDS`] lists chosen by the key. One lock for all of them was the system
+/// host's busiest lock: each binder read registers and unregisters its thread, hundreds of threads
+/// at once (M4, 2026-10-16: `parking_lot` spinning in `Watch::drop`). A change takes the lock of
+/// the list its waiters are in after it is made, and a waiter is in its lists before it looks, so
+/// none is missed (as with one lock).
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ANYTHING: crate::oslock::OsMutex<Vec<Arc<Waiter>>> = crate::oslock::OsMutex::new(Vec::new());
+const SHARDS: usize = 64;
+static KEYED_QUEUES: LazyLock<Vec<crate::oslock::OsMutex<HashMap<Key, Vec<Arc<Waiter>>>>>> = LazyLock::new(|| (0..SHARDS).map(|_| crate::oslock::OsMutex::default()).collect());
+
+/// The list of waiters `key` is in.
+fn shard(key: Key) -> &'static crate::oslock::OsMutex<HashMap<Key, Vec<Arc<Waiter>>>> {
+    &KEYED_QUEUES[((key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % SHARDS]
 }
 
-static QUEUES: LazyLock<Mutex<Queues>> = LazyLock::new(Mutex::default);
+/// Wake every waiter on anything; how many.
+fn wake_anything() -> usize {
+    let anything = ANYTHING.lock();
+    for w in anything.iter() {
+        w.wake();
+    }
+    anything.len()
+}
+
+/// Wake every waiter on a key.
+fn wake_keyed() {
+    for shard in KEYED_QUEUES.iter() {
+        for w in shard.lock().values().flatten() {
+            w.wake();
+        }
+    }
+}
+
+/// Wake `key`'s waiters.
+fn wake_key(key: Key) {
+    if let Some(list) = shard(key).lock().get(&key) {
+        for w in list {
+            w.wake();
+        }
+    }
+}
 
 /// Something changed that no key names (a descriptor closed, an `epoll` set edited): wake every
 /// waiter to look again.
 pub fn notify() {
     EDGE_ALL.fetch_add(1, Ordering::AcqRel);
-    let mut q = QUEUES.lock();
-    q.generation += 1;
-    for w in q.anything.iter().chain(q.keyed.values().flatten()) {
-        w.wake();
-    }
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    wake_anything();
+    wake_keyed();
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
     STATS.unkeyed.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What `key` names changed, for **one** of its waiters to act on: wake the first of them not woken
+/// already, and those waiting on anything. For work any one waiter takes whole (a binder
+/// process's queue: `crate::binder`'s), which woke every idle looper of the process to find it
+/// gone. The caller makes sure work left behind wakes another.
+pub fn notify_key_one(key: Key) {
+    edge(key);
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    let anything = wake_anything();
+    if let Some(list) = shard(key).lock().get(&key) {
+        // The most recent waiter first, as the kernel's binder picks the thread that went idle
+        // last (`binder_select_thread_ilocked`, a list it adds to at the head): the work stays on
+        // a few threads whose translations are warm, instead of going round every idle looper --
+        // on arm64 each thread translates what it runs into a cache of its own.
+        for w in list.iter().rev() {
+            let mut woken = w.woken.lock();
+            if !*woken {
+                *woken = true;
+                w.cv.notify_one();
+                break;
+            }
+        }
+    }
+    STATS.notifies.fetch_add(1, Ordering::Relaxed);
+    STATS.anything_woken.fetch_add(anything as u64, Ordering::Relaxed);
 }
 
 /// What `key` names changed: wake its waiters, and those waiting on anything.
 pub fn notify_key(key: Key) {
     edge(key);
-    let mut q = QUEUES.lock();
-    q.generation += 1;
-    for w in q.anything.iter().chain(q.keyed.get(&key).into_iter().flatten()) {
-        w.wake();
-    }
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    let anything = wake_anything();
+    wake_key(key);
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
-    STATS.anything_woken.fetch_add(q.anything.len() as u64, Ordering::Relaxed);
+    STATS.anything_woken.fetch_add(anything as u64, Ordering::Relaxed);
 }
 
 /// `poll_slice_ms=<ms>` (lever; **1000 by default** since the in-world A/B of 2026-10-09, PS99
@@ -141,10 +196,8 @@ pub static SLICE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Wake every waiter of this host process to look again: a signal was posted (the waiter whose
 /// task it is sees it and answers `EINTR`), or a process is ending. Rare.
 pub fn wake_everyone() {
-    let q = QUEUES.lock();
-    for w in q.anything.iter().chain(q.keyed.values().flatten()) {
-        w.wake();
-    }
+    wake_anything();
+    wake_keyed();
 }
 
 /// What each of `keys` names changed: [`notify_key`] for them all, under one lock.
@@ -152,15 +205,10 @@ pub fn notify_keys(keys: &[Key]) {
     for key in keys {
         edge(*key);
     }
-    let mut q = QUEUES.lock();
-    q.generation += 1;
-    for w in &q.anything {
-        w.wake();
-    }
+    GENERATION.fetch_add(1, Ordering::SeqCst);
+    wake_anything();
     for key in keys {
-        for w in q.keyed.get(key).into_iter().flatten() {
-            w.wake();
-        }
+        wake_key(*key);
     }
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
 }
@@ -179,23 +227,52 @@ pub(crate) fn watch(keys: Option<Vec<Key>>) -> Watch {
     let keys = keys.map(|k| if k.is_empty() { vec![INERT] } else { k });
     let me = ME.with(Arc::clone);
     *me.woken.lock() = false;
-    let mut q = QUEUES.lock();
     match &keys {
-        None => q.anything.push(Arc::clone(&me)),
+        None => ANYTHING.lock().push(Arc::clone(&me)),
         Some(keys) => {
             for k in keys {
-                q.keyed.entry(*k).or_default().push(Arc::clone(&me));
+                shard(*k).lock().entry(*k).or_default().push(Arc::clone(&me));
             }
         }
     }
     Watch { me, keys }
 }
 
+/// What kind of file has no key, for `OMNI_POLL_STATS`: each kind said once per host process.
+fn note_unkeyed(file: &OpenFile) {
+    static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("OMNI_POLL_STATS").is_some()) {
+        return;
+    }
+    let what = match &*file.kind.lock() {
+        FileKind::Socket(s) => {
+            let peer = match &s.peer {
+                None => "none",
+                Some(crate::socket::Peer::Inet(_)) => "inet",
+                Some(crate::socket::Peer::Dns(_)) => "dns",
+                Some(crate::socket::Peer::Host(_)) => "host",
+                Some(_) => "other",
+            };
+            format!("socket domain {} type {} peer {peer}", s.domain, s.ty)
+        }
+        k => format!("{:?}", std::mem::discriminant(k)),
+    };
+    let mut said = SAID.lock();
+    if !said.contains(&what) {
+        eprintln!("[poll] pid {}: a wait on anything, for a {what}", std::process::id());
+        said.push(what);
+    }
+}
+
 /// The keys of these files, or `None` when one of them has none (then the wait is on anything).
 pub(crate) fn keys_of<'a>(files: impl IntoIterator<Item = &'a OpenFile>) -> Option<Vec<Key>> {
     let mut keys = Vec::new();
     for f in files {
-        let k = key_of(f)?;
+        let Some(k) = key_of(f) else {
+            note_unkeyed(f);
+            return None;
+        };
         if !keys.contains(&k) {
             keys.push(k);
         }
@@ -229,21 +306,22 @@ impl Watch {
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        let mut q = QUEUES.lock();
         let me = &self.me;
+        // In order: the newest waiter is the last (`notify_key_one`).
         let gone = |list: &mut Vec<Arc<Waiter>>| {
-            if let Some(i) = list.iter().position(|w| Arc::ptr_eq(w, me)) {
-                list.swap_remove(i);
+            if let Some(i) = list.iter().rposition(|w| Arc::ptr_eq(w, me)) {
+                list.remove(i);
             }
         };
         match &self.keys {
-            None => gone(&mut q.anything),
+            None => gone(&mut ANYTHING.lock()),
             Some(keys) => {
                 for k in keys {
-                    if let Some(list) = q.keyed.get_mut(k) {
+                    let mut shard = shard(*k).lock();
+                    if let Some(list) = shard.get_mut(k) {
                         gone(list);
                         if list.is_empty() {
-                            q.keyed.remove(k);
+                            shard.remove(k);
                         }
                     }
                 }
@@ -345,7 +423,7 @@ pub fn start_stats() {
             let n = STATS.notifies.swap(0, Ordering::Relaxed);
             let w = STATS.wakes.swap(0, Ordering::Relaxed);
             let (unkeyed, anything) = (STATS.unkeyed.load(Ordering::Relaxed), STATS.anything_woken.load(Ordering::Relaxed));
-            let on_anything = QUEUES.lock().anything.len();
+            let on_anything = ANYTHING.lock().len();
             eprintln!(
                 "[poll] pid {}: {} notifications/s, {} threads waiting, {} wake-ups/s; {} unkeyed/s, {on_anything} waiting on anything, {} wake-ups/s to them (poll_keyed={})",
                 std::process::id(),
@@ -383,7 +461,7 @@ impl Drop for Waiting {
 /// afterwards: this can wake early. A wait on anything; [`watch`] waits on what it names.
 pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task) -> Result<(), Errno> {
     let w = watch(None);
-    if QUEUES.lock().generation != seen {
+    if GENERATION.load(Ordering::SeqCst) != seen {
         return Ok(());
     }
     w.wait(deadline, task)
@@ -393,13 +471,13 @@ pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task)
 /// latest.
 pub(crate) fn wait_for_change_host(seen: u64, deadline: Instant) {
     let w = watch(None);
-    if QUEUES.lock().generation == seen {
+    if GENERATION.load(Ordering::SeqCst) == seen {
         w.sleep(deadline);
     }
 }
 
 pub(crate) fn generation() -> u64 {
-    QUEUES.lock().generation
+    GENERATION.load(Ordering::SeqCst)
 }
 
 // ---------------------------------------------------------------------------------- eventfd
@@ -615,7 +693,12 @@ fn readiness(file: &OpenFile, now: Instant) -> (u32, Option<Instant>) {
             let c = *e.count.lock();
             ((if c > 0 { IN } else { 0 }) | (if c < u64::MAX - 1 { OUT } else { 0 }), None)
         }
-        FileKind::TimerFd(t) => (if t.ready(now) { IN } else { 0 }, t.next()),
+        // The expiry ahead is when to look again; one passed (the timer ready, not read yet) is
+        // not -- until a read or a new setting nothing about it changes with time, and a waiter
+        // that does not report it (`EPOLLET` already reported, a mask without `EPOLLIN`) slept
+        // until that past instant, at once, and looked again: a busy loop in system_server's
+        // ConnectivityService, ~6% of a core in one `epoll_pwait` a second (M4, 2026-10-16).
+        FileKind::TimerFd(t) => (if t.ready(now) { IN } else { 0 }, t.next().filter(|n| *n > now)),
         FileKind::Pipe(end) => (crate::pipe::readiness(end), None),
         FileKind::Epoll(ep) => (if ep.any_ready(now) { IN } else { 0 }, None),
         FileKind::Socket(s) => (crate::socket::readiness(s), None),

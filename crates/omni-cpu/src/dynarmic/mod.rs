@@ -89,7 +89,7 @@ use std::sync::Arc;
 use dynarmic_sys::{
     optimization, od_code_cache_clear, od_code_cache_evict_to, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
     od_code_cache_guest_pcs_of, od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt,
-    od_jit_effective_config,
+    od_jit_clear_cache, od_jit_code_bytes, od_jit_discard_parked, od_jit_effective_config,
     od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
     od_jit_halt, od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
     od_jit_set_pc, od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec,
@@ -432,6 +432,20 @@ pub fn set_fastmem_mask_by_and(on: bool) -> bool {
 pub fn set_tbi_unmasked(on: bool) -> bool {
     // SAFETY: stores one process-wide atomic; no pointer crosses.
     unsafe { dynarmic_sys::od_set_tbi_unmasked(u32::from(on)) != 0 }
+}
+
+/// **Top Byte Ignore's mask left to the host MMU** (patch 0105, arm64): a context configured with
+/// the mask (56 bits, mirrored) emits its direct accesses with the tagged address as it is, which
+/// the host's own TBI takes to the untagged one -- one `ubfx` fewer before every guest load and
+/// store. For blocks emitted from now on; a no-op on x64. The caller vouches for the host: its
+/// MMU ignores the top byte of a user data address (`omni_platform::vm::host_ignores_top_byte`),
+/// and its fault layer hands the demand pager the untagged address of a fault through a tagged
+/// one (`omni_platform::fault::reports_untagged_addresses`) -- else such a fault is declined and
+/// the access goes to the slow path for good. Returns what is in force. On by default in
+/// `omni-linux` where both hold; `OMNI_JIT_HOST_TBI=0` or the lever `jit_hosttbi=0` turns it off.
+pub fn set_fastmem_host_tbi(on: bool) -> bool {
+    // SAFETY: stores one process-wide atomic; no pointer crosses.
+    unsafe { dynarmic_sys::od_set_fastmem_host_tbi(u32::from(on)) != 0 }
 }
 
 /// **The return-stack buffer's and fast-dispatch table's hit paths inside each block** (patch
@@ -1479,7 +1493,37 @@ impl DynarmicBackend {
             // SAFETY: the cache is live for `self.shared`'s life; this is not called from inside a
             // callback (the backend has none -- only its contexts do).
             unsafe { od_code_cache_clear(cache.0) };
+            return;
         }
+        // Each thread's own cache (arm64): asked to clear, which its thread does at the edge of its
+        // next run, outside generated code, giving the pages back (vendored patch 0102). A thread
+        // that never runs again keeps what it has.
+        for &jit in self.shared.peers.0.lock().iter() {
+            // SAFETY: a peer is live while it is in the list; `ClearCache` only records the request
+            // and halts the jit, which is safe from any thread.
+            unsafe { od_jit_clear_cache(jit as *mut core::ffi::c_void) };
+        }
+    }
+
+    /// **Give back the translations of threads parked in a system call** for at least `parked`
+    /// (arm64, each thread's own cache; vendored patch 0104): each such thread's cache is cleared
+    /// when it next runs, its code pages given back now. What an idle thread -- a binder looper
+    /// waiting for work, a daemon in its event loop -- otherwise holds for good. The bytes given
+    /// back (0 without per-thread caches).
+    pub fn discard_parked(&self, parked: std::time::Duration) -> u64 {
+        if self.shared.code_cache.is_some() || !cfg!(target_arch = "aarch64") {
+            return 0;
+        }
+        let ns = u64::try_from(parked.as_nanos()).unwrap_or(u64::MAX);
+        self.shared
+            .peers
+            .0
+            .lock()
+            .iter()
+            // SAFETY: a peer is live while it is in the list; the call only reads atomics and takes
+            // the jit's own invalidation lock.
+            .map(|&jit| unsafe { od_jit_discard_parked(jit as *mut core::ffi::c_void, ns) })
+            .sum()
     }
 
     /// Retire the shared cache's oldest full regions until at most `keep_bytes` of regions are
@@ -1567,12 +1611,27 @@ impl DynarmicBackend {
     /// The shared code cache's counters, or `None` without one.
     #[must_use]
     pub fn code_cache_stats(&self) -> Option<OdCodeCacheStats> {
-        self.shared.code_cache.as_ref().map(|cache| {
+        if let Some(cache) = self.shared.code_cache.as_ref() {
             let mut out = OdCodeCacheStats::default();
             // SAFETY: the cache is live for `self.shared`'s life; `out` is writable.
             unsafe { od_code_cache_stats_of(cache.0, &mut out) };
-            out
-        })
+            return Some(out);
+        }
+        // Each thread's own cache (arm64, vendored patch 0102): what they hold and have emitted,
+        // summed -- what the code trim (`omni-linux`'s `code_trim`) decides by.
+        if !cfg!(target_arch = "aarch64") {
+            return None;
+        }
+        let peers = self.shared.peers.0.lock();
+        let mut out = OdCodeCacheStats { attached: peers.len() as u64, ..OdCodeCacheStats::default() };
+        for &jit in peers.iter() {
+            let (mut in_use, mut emitted) = (0u64, 0u64);
+            // SAFETY: a peer is live while it is in the list; the counters are atomics.
+            unsafe { od_jit_code_bytes(jit as *mut core::ffi::c_void, &mut in_use, &mut emitted) };
+            out.committed_bytes += in_use;
+            out.code_bytes_emitted += emitted;
+        }
+        Some(out)
     }
 
     /// What this backend's demand pager has done, or `None` if it has none.

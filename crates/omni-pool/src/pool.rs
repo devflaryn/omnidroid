@@ -10,6 +10,9 @@
 //! * A ticker (every second) follows the devices' boots, the windows people close, the apps that
 //!   end on their own, and the idle devices: closed after `idle_close_minutes` unless they are the
 //!   `keep_warm` kept warm, and one booted when none is idle.
+//! * **Cold after a kill**: killing the last Android (`kill`, `stop_device`) warms none in its place
+//!   -- the person wanted none running -- until a launch or `warm`; and `pool.cold` beside the
+//!   settings keeps that for the next time the app opens, which then warms none either.
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Child;
@@ -22,6 +25,7 @@ use omni_warm::Device;
 
 use crate::config::Config;
 use crate::device;
+use crate::extras::{self, Extras};
 use crate::plan::{self, DeviceId, DeviceView, IdleView, Place};
 
 /// An instance's id in the pool.
@@ -119,6 +123,8 @@ struct State {
     instances: BTreeMap<InstanceId, InstanceRec>,
     next_device: DeviceId,
     next_instance: InstanceId,
+    /// The last device was killed: none is warmed until a launch or `warm`.
+    cold: bool,
 }
 
 impl State {
@@ -146,15 +152,44 @@ pub struct Pool {
     logged: std::sync::atomic::AtomicU64,
     started: Instant,
     stopping: std::sync::atomic::AtomicBool,
+    /// The (device, package) a link is being followed for now: one instance at a time each
+    /// ([`Pool::follow_link`]).
+    link_turns: Mutex<std::collections::BTreeSet<(DeviceId, String)>>,
+}
+
+/// An instance's turn at its link on its device ([`Pool::follow_link`]), given back when dropped.
+struct LinkTurn<'a> {
+    turns: &'a Mutex<std::collections::BTreeSet<(DeviceId, String)>>,
+    key: (DeviceId, String),
+}
+
+impl Drop for LinkTurn<'_> {
+    fn drop(&mut self) {
+        self.turns.lock().remove(&self.key);
+    }
 }
 
 impl Pool {
     /// A pool with these settings, booting devices with `exe`: the devices this app left running
-    /// are adopted, and its ticker started (it warms a device when the settings say so).
+    /// are adopted, and its ticker started (it warms a device when the settings say so, and the
+    /// last device was not killed).
     #[must_use]
     pub fn start(config: Config, config_path: Option<PathBuf>, exe: PathBuf) -> Arc<Self> {
-        let pool = Arc::new(Self {
-            state: Mutex::new(State { next_device: 1, next_instance: 1, ..State::default() }),
+        let pool = Arc::new(Self::new(config, config_path, exe));
+        if pool.state.lock().cold {
+            pool.say("no Android warmed: the last one was killed (`warm` boots one; a launch does too)");
+        }
+        pool.adopt();
+        let ticker = Arc::clone(&pool);
+        let _ = std::thread::Builder::new().name("omni-pool-ticker".into()).spawn(move || ticker.tick_forever());
+        pool
+    }
+
+    /// The pool, nothing adopted and no ticker: cold if `pool.cold` is beside the settings.
+    fn new(config: Config, config_path: Option<PathBuf>, exe: PathBuf) -> Self {
+        let cold = config_path.as_deref().and_then(cold_file).is_some_and(|f| f.exists());
+        Self {
+            state: Mutex::new(State { next_device: 1, next_instance: 1, cold, ..State::default() }),
             config: Mutex::new(config),
             config_path,
             exe,
@@ -163,11 +198,32 @@ impl Pool {
             logged: std::sync::atomic::AtomicU64::new(0),
             started: Instant::now(),
             stopping: std::sync::atomic::AtomicBool::new(false),
-        });
-        pool.adopt();
-        let ticker = Arc::clone(&pool);
-        let _ = std::thread::Builder::new().name("omni-pool-ticker".into()).spawn(move || ticker.tick_forever());
-        pool
+            link_turns: Mutex::default(),
+        }
+    }
+
+    /// The last device was killed: no device is warmed until a launch or `warm`.
+    #[must_use]
+    pub fn cold(&self) -> bool {
+        self.state.lock().cold
+    }
+
+    /// Cold or not, and kept so (`pool.cold`) for the next time the app opens.
+    fn keep_cold(&self, cold: bool) {
+        let Some(file) = self.config_path.as_deref().and_then(cold_file) else { return };
+        let done = if cold { std::fs::write(&file, "the last Android was killed: none is warmed when the app opens\n") } else { std::fs::remove_file(&file).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }) };
+        if let Err(e) = done {
+            self.say(format!("{}: {e}", file.display()));
+        }
+    }
+
+    /// A launch or a `warm`: devices are warmed again.
+    fn warm_again(&self) {
+        let was = std::mem::take(&mut self.state.lock().cold);
+        if was {
+            self.keep_cold(false);
+            self.say(format!("Androids are kept warm again (keep_warm = {})", self.config.lock().keep_warm));
+        }
     }
 
     /// A line in the pool's log.
@@ -274,6 +330,15 @@ impl Pool {
     /// # Errors
     /// Not an APK, or one with no launcher Activity; a device limit reached.
     pub fn launch(self: &Arc<Self>, apk: &Path, count: u32) -> Result<Vec<InstanceId>, String> {
+        self.launch_with(apk, count, Extras::default())
+    }
+
+    /// [`launch`](Self::launch), each instance doing `extras` beyond the install and the start (a
+    /// plugin's: a cookie planted for its user, a link opened on its display).
+    ///
+    /// # Errors
+    /// As `launch`.
+    pub fn launch_with(self: &Arc<Self>, apk: &Path, count: u32, extras: Extras) -> Result<Vec<InstanceId>, String> {
         let apk = std::fs::canonicalize(apk).map_err(|e| format!("{}: {e}", apk.display()))?;
         let apk = Arc::new(omni_warm::Apk::read(&apk)?);
         let launcher = apk.launcher.clone().ok_or_else(|| format!("{} has no launcher Activity: nothing to start", apk.package))?;
@@ -325,29 +390,44 @@ impl Pool {
                 ids.push(id);
             }
         }
+        self.warm_again();
         for id in boots {
             self.boot(id);
         }
         for &id in &ids {
             let pool = Arc::clone(self);
             let launcher = launcher.clone();
-            let _ = std::thread::Builder::new().name(format!("omni-pool-launch-{id}")).spawn(move || pool.run_launch(id, &launcher));
+            let extras = extras.clone();
+            let _ = std::thread::Builder::new().name(format!("omni-pool-launch-{id}")).spawn(move || pool.run_launch(id, &launcher, extras));
         }
         self.say(format!("launch {} x{} ({}): instance{} {}", apk.package, ids.len(), &apk.sha256[..12], if ids.len() == 1 { "" } else { "s" }, ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" ")));
+        for line in &extras.said {
+            self.say(format!("  {line}"));
+        }
         Ok(ids)
     }
 
-    /// Warm a device now (one more than there are).
+    /// Warm a device now (one more than there are); the pool is not cold any more.
     pub fn warm(self: &Arc<Self>) -> DeviceId {
+        self.warm_again();
+        // Never `None`: not `unless_cold`.
+        self.add_device(false).unwrap_or_default()
+    }
+
+    /// A device booted; none `unless_cold` and the pool is cold (the ticker's, racing a kill).
+    fn add_device(&self, unless_cold: bool) -> Option<DeviceId> {
         let id = {
             let mut s = self.state.lock();
+            if unless_cold && s.cold {
+                return None;
+            }
             let id = s.next_device;
             s.next_device += 1;
             s.devices.insert(id, DeviceRec { dir: device::new_dir(&self.root), child: None, state: DeviceState::Booting, born: Instant::now(), idle_since: None, installed: BTreeMap::new(), users: Vec::new(), busy: Arc::default() });
             id
         };
         self.boot(id);
-        id
+        Some(id)
     }
 
     fn boot(&self, id: DeviceId) {
@@ -382,7 +462,7 @@ impl Pool {
     }
 
     /// One launch's work: wait for the device, install, a display and a user, start.
-    fn run_launch(self: Arc<Self>, id: InstanceId, launcher: &str) {
+    fn run_launch(self: Arc<Self>, id: InstanceId, launcher: &str, mut extras: Extras) {
         let Some((device_id, apk)) = self.state.lock().instances.get(&id).map(|i| (i.device, Arc::clone(&i.apk))) else { return };
         // The device up.
         let t = Instant::now();
@@ -400,7 +480,7 @@ impl Pool {
         }
         self.set_state(id, InstanceState::Installing);
         let Some((dev, busy, size)) = self.state.lock().devices.get(&device_id).map(|d| (d.device(), Arc::clone(&d.busy), self.config.lock().instance_size)) else { return };
-        let _turn = busy.lock();
+        let turn = busy.lock();
         if matches!(self.state.lock().instances.get(&id).map(|i| &i.state), Some(InstanceState::Closing | InstanceState::Ended(_)) | None) {
             return;
         }
@@ -447,9 +527,38 @@ impl Pool {
         if let Some(i) = self.state.lock().instances.get_mut(&id) {
             (i.hwc, i.display) = (Some(hwc), Some(display));
         }
+        // The launch's cookie store, handed over to the device for this user's app: the host's copy
+        // removed once the start is done, whatever happens (the guest's goes with the plant).
+        let mut handed = None;
+        let before = match &extras.cookie_store {
+            None => String::new(),
+            Some(store) => match omni_warm::hand_over_path(&dev, &format!("cookies-{id}.db")).and_then(|(host, guest)| {
+                std::fs::copy(store.path(), &host).map_err(|e| format!("{}: {e}", host.display()))?;
+                Ok((host, guest))
+            }) {
+                Ok((host, guest)) => {
+                    handed = Some(extras::TempFile::new(host));
+                    extras::plant(&apk.package, user, &guest)
+                }
+                Err(e) => return self.end(id, &format!("its cookie store: {e}")),
+            },
+        };
+        // The device's log from before the start: what says the app is ready for the link.
+        let log = extras.link.as_ref().map(|_| omni_warm::LogTail::from_end(&dev.log()));
         let t = Instant::now();
-        match device::start(&dev, &apk.package, launcher, user, display) {
-            Ok(_) => {
+        let started = device::start(&dev, &apk.package, launcher, user, display, &before);
+        // Done with the account's session: the launch's store goes with its last instance's start.
+        drop(handed);
+        let planted = extras.cookie_store.take().is_some();
+        match started {
+            Ok(out) => {
+                if planted {
+                    if out.contains("cookie store planted") {
+                        self.say(format!("#{id}: signed in with the cookie (never shown)"));
+                    } else {
+                        self.say(format!("#{id}: the cookie store was not planted"));
+                    }
+                }
                 let closing = {
                     let mut s = self.state.lock();
                     match s.instances.get_mut(&id) {
@@ -461,11 +570,82 @@ impl Pool {
                     }
                 };
                 self.say(format!("#{id} {} running on D{device_id} (user {user}, display {display}) in {:.1} s", apk.package, t.elapsed().as_secs_f64()));
+                // The device's next install-and-start need not wait for this one's link.
+                drop(turn);
                 if closing {
                     self.cleanup(id);
+                } else if let (Some(link), Some(log)) = (&extras.link, log) {
+                    self.follow_link(id, (device_id, &apk.package), &dev, (user, display), link, &extras, log);
                 }
             }
             Err(e) => self.end(id, &format!("start: {e}")),
+        }
+    }
+
+    /// The launch's link, opened on the instance's display once the device's log says its app is
+    /// ready for it (or signed in) -- at once when nothing names either -- and again while nothing
+    /// says it was taken. Ends with the instance, or after [`extras::LINK_WAIT`].
+    ///
+    /// **One instance of an app on a device at a time**: most of an app's log lines name no user, so
+    /// a sign-in or a join logged while two instances of it wait would be either's. The link is
+    /// sent, and a line naming no user counted, only while this instance holds the device's turn
+    /// for the package; a line naming a user (an Activity's record, a data path) counts any time.
+    #[allow(clippy::too_many_arguments)]
+    fn follow_link(&self, id: InstanceId, (device_id, package): (DeviceId, &str), dev: &Device, (user, display): (u32, i32), link: &str, extras: &Extras, mut log: omni_warm::LogTail) {
+        let t = Instant::now();
+        let mut ready = extras.link_ready.is_none() && extras.signed_in.is_none();
+        let (mut signed_in, mut taken, mut sent_at, mut tries) = (false, false, None::<Instant>, 0u32);
+        let mut turn: Option<LinkTurn> = None;
+        let mut waited = false;
+        while t.elapsed() < extras::LINK_WAIT && !taken {
+            if !matches!(self.state.lock().instances.get(&id).map(|i| &i.state), Some(InstanceState::Running)) {
+                return;
+            }
+            for line in log.lines() {
+                let alone = turn.is_some();
+                ready |= extras::says(&line, extras.link_ready.as_deref(), user, alone);
+                if !signed_in && extras::says(&line, extras.signed_in.as_deref(), user, alone) {
+                    signed_in = true;
+                    self.say(format!("#{id}: signed in"));
+                }
+                if sent_at.is_some() && extras::says(&line, extras.link_taken.as_deref(), user, alone) {
+                    taken = true;
+                    self.say(format!("#{id}: the link was taken"));
+                }
+            }
+            let due = match sent_at {
+                None => ready || signed_in,
+                Some(at) => extras.link_taken.is_some() && !taken && at.elapsed() > extras::LINK_RETRY && tries < extras::LINK_TRIES,
+            };
+            if due && turn.is_none() {
+                let key = (device_id, package.to_string());
+                if self.link_turns.lock().insert(key.clone()) {
+                    turn = Some(LinkTurn { turns: &self.link_turns, key });
+                } else {
+                    if !waited {
+                        self.say(format!("#{id}: its link waits for the {package} beside it on D{device_id} to join"));
+                        waited = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(250));
+                    continue;
+                }
+            }
+            if due {
+                tries += 1;
+                match dev.shell_as(&extras::link_command(link, user, display), Some(0), Duration::from_secs(60)) {
+                    Ok(_) => self.say(format!("#{id}: link sent{}", if tries > 1 { format!(" (try {tries})") } else { String::new() })),
+                    Err(e) => self.say(format!("#{id}: the link: {e}")),
+                }
+                sent_at = Some(Instant::now());
+                if extras.link_taken.is_none() {
+                    return;
+                }
+            }
+            if sent_at.is_some_and(|at| tries >= extras::LINK_TRIES && at.elapsed() > extras::LINK_RETRY) {
+                self.say(format!("#{id}: the link was never taken"));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -528,18 +708,36 @@ impl Pool {
         self.state.lock().instances.retain(|_, i| !matches!(i.state, InstanceState::Ended(_)));
     }
 
-    /// Stop a device and end its instances.
+    /// Stop a device and end its instances, as the person asked: when it was the last one, the
+    /// pool is cold -- none warmed in its place, nor when the app opens next -- until a launch or
+    /// `warm`.
     ///
     /// # Errors
     /// No such device.
     pub fn kill(&self, id: DeviceId) -> Result<(), String> {
-        let (dev, child) = {
+        self.stop_device(id, true)
+    }
+
+    /// Stop a device and end its instances; `by_hand`, a kill (the last one makes the pool cold),
+    /// else the idle close.
+    fn stop_device(&self, id: DeviceId, by_hand: bool) -> Result<(), String> {
+        let (dev, child, last) = {
             let mut s = self.state.lock();
             let d = s.devices.get_mut(&id).ok_or_else(|| format!("no device D{id}"))?;
             d.state = DeviceState::Closing;
-            (d.device(), d.child.take())
+            let (dev, child) = (d.device(), d.child.take());
+            // Under the lock the ticker counts devices with: it never sees none and warms one.
+            let last = by_hand && !s.cold && !s.devices.values().any(|d| matches!(d.state, DeviceState::Booting | DeviceState::Ready));
+            if last {
+                s.cold = true;
+            }
+            (dev, child, last)
         };
         self.say(format!("device D{id} stopping"));
+        if last {
+            self.keep_cold(true);
+            self.say("that was the last Android: none is warmed again, nor when the app opens next, until a launch or `warm`");
+        }
         dev.stop();
         if let Some(mut child) = child {
             let t = Instant::now();
@@ -693,10 +891,10 @@ impl Pool {
         }
         // Apps that ended on their own (every 5 s): not on their display twice in a row.
         if n % 5 == 0 {
-            self.check_running();
+            self.check_running(n % 60 == 0);
         }
         // Idle devices out; a warm one in.
-        let (views, config) = {
+        let (views, config, cold) = {
             let s = self.state.lock();
             let views: Vec<IdleView> = s
                 .devices
@@ -704,20 +902,20 @@ impl Pool {
                 .filter(|(_, d)| matches!(d.state, DeviceState::Booting | DeviceState::Ready))
                 .map(|(id, d)| IdleView { id: *id, ready: d.state == DeviceState::Ready, running: s.live(*id).count(), idle_for: d.idle_since.map(|t| t.elapsed()) })
                 .collect();
-            (views, self.config.lock().clone())
+            (views, self.config.lock().clone(), s.cold)
         };
         for id in plan::to_close(&views, config.idle_close_minutes, config.keep_warm) {
             self.say(format!("device D{id} idle {} min: closing it", config.idle_close_minutes));
             let pool = Arc::clone(self);
-            let _ = std::thread::spawn(move || pool.kill(id));
+            let _ = std::thread::spawn(move || pool.stop_device(id, false));
         }
         // A user made ahead on each ready device that has none free (~10-15 s off the next launch).
         if n % 5 == 0 {
             self.spare_users();
         }
-        if config.warm_on_start {
+        if config.warm_on_start && !cold {
             for _ in 0..plan::to_warm(&views, config.keep_warm, config.max_devices) {
-                let id = self.warm();
+                let Some(id) = self.add_device(true) else { break };
                 self.say(format!("device D{id}: warming one, so the next launch starts at once"));
             }
         }
@@ -754,12 +952,35 @@ impl Pool {
         }
     }
 
-    fn check_running(self: &Arc<Self>) {
+    /// Whether each running instance's app is still on its display. The device's host says which
+    /// app processes run (`device::apps`, no guest process started); when every instance's is
+    /// there, that is taken as it -- except on a `full` round (each minute), when Android's
+    /// activities are read (`dumpsys`, ~1.5-1.9 s of a shell, dumpsys and grep translated) as they
+    /// are whenever an app process is not seen: an app whose activity left its display while its
+    /// process stays cached is ended within a minute or two, as before within 10 s.
+    fn check_running(self: &Arc<Self>, full: bool) {
         let devices: Vec<(DeviceId, Device)> = {
             let s = self.state.lock();
             s.devices.iter().filter(|(id, d)| d.state == DeviceState::Ready && s.live(**id).any(|(_, i)| i.state == InstanceState::Running)).map(|(id, d)| (*id, d.device())).collect()
         };
         for (device_id, dev) in devices {
+            if !full {
+                if let Ok(apps) = device::apps(&dev) {
+                    let mut s = self.state.lock();
+                    let mut running = s.instances.values_mut().filter(|i| i.device == device_id && i.state == InstanceState::Running).peekable();
+                    let mut all_there = true;
+                    let mut seen = Vec::new();
+                    while let Some(i) = running.next() {
+                        let process_of = |name: &str| name == i.apk.package || name.strip_prefix(i.apk.package.as_str()).is_some_and(|rest| rest.starts_with(':'));
+                        all_there &= i.user.is_some_and(|u| apps.iter().any(|(au, name)| *au == u && process_of(name)));
+                        seen.push(i);
+                    }
+                    if all_there {
+                        seen.into_iter().for_each(|i| i.missing = 0);
+                        continue;
+                    }
+                }
+            }
             let Ok(seen) = device::running(&dev) else { continue };
             let mut ended = Vec::new();
             {
@@ -776,5 +997,64 @@ impl Pool {
                 self.end(id, "the app stopped");
             }
         }
+    }
+}
+
+/// `pool.cold` beside the settings at `config_path`: there while the last device killed is the last
+/// word, so the app opens with none.
+fn cold_file(config_path: &Path) -> Option<PathBuf> {
+    Some(config_path.parent()?.join("pool.cold"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pool with no ticker and nothing adopted, its settings in `dir`, holding `n` ready devices
+    /// (directories of nothing: stopping one writes a file there).
+    fn pool(dir: &Path, n: u32) -> Arc<Pool> {
+        let pool = Arc::new(Pool::new(Config::default(), Some(dir.join("app.conf")), PathBuf::from("omnidroid")));
+        let mut s = pool.state.lock();
+        for _ in 0..n {
+            let id = s.next_device;
+            s.next_device += 1;
+            s.devices.insert(id, DeviceRec { dir: dir.join(format!("omni-warm-{id}")), child: None, state: DeviceState::Ready, born: Instant::now(), idle_since: Some(Instant::now()), installed: BTreeMap::new(), users: Vec::new(), busy: Arc::default() });
+        }
+        drop(s);
+        pool
+    }
+
+    #[test]
+    fn killing_the_last_android_keeps_the_app_cold_until_a_warm() {
+        let dir = std::env::temp_dir().join(format!("omni-pool-cold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = pool(&dir, 2);
+        p.kill(1).unwrap();
+        assert!(!p.cold(), "another Android is up");
+        p.kill(2).unwrap();
+        assert!(p.cold(), "the last one killed");
+        assert!(dir.join("pool.cold").exists(), "kept for the next time the app opens");
+        assert_eq!(p.add_device(true), None, "the ticker warms none");
+        assert!(pool(&dir, 0).cold(), "the app opens cold");
+        // Not booted (the pool is quitting), but asked for: warm again.
+        p.stopping.store(true, std::sync::atomic::Ordering::Release);
+        p.warm();
+        assert!(!p.cold());
+        assert!(!dir.join("pool.cold").exists());
+        assert!(!pool(&dir, 0).cold(), "the app opens warm again");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_idle_close_does_not_make_the_app_cold() {
+        let dir = std::env::temp_dir().join(format!("omni-pool-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = pool(&dir, 1);
+        p.stop_device(1, false).unwrap();
+        assert!(!p.cold());
+        assert!(!dir.join("pool.cold").exists());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

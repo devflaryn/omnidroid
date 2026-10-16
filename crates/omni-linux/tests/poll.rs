@@ -234,6 +234,44 @@ fn an_edge_triggered_timerfd_is_reported_at_each_expiry() {
     assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 0);
 }
 
+/// This thread's processor time.
+#[cfg(unix)]
+fn thread_cpu() -> Duration {
+    unsafe extern "C" {
+        fn clock_gettime(clock: i32, ts: *mut [i64; 2]) -> i32;
+    }
+    const CLOCK_THREAD_CPUTIME_ID: i32 = if cfg!(target_os = "macos") { 16 } else { 3 };
+    let mut ts = [0i64; 2];
+    // SAFETY: a valid clock id and a two-word timespec.
+    assert_eq!(unsafe { clock_gettime(CLOCK_THREAD_CPUTIME_ID, &raw mut ts) }, 0);
+    Duration::new(ts[0] as u64, ts[1] as u32)
+}
+
+/// **An expired timer that is not reported again is not a reason to wake**: an edge-triggered
+/// timerfd reported and not read is ready, but its expiry is behind it. Taken as the time to look
+/// again, every wait woke at once and looked again until the timeout -- a busy loop (system_server's
+/// ConnectivityService at ~6% of a core in one `epoll_pwait` a second, 2026-10-16).
+#[cfg(unix)]
+#[test]
+fn a_wait_beside_an_expired_unread_timer_sleeps() {
+    let (p, mut t, s) = process();
+    let fd = p.syscall(&mut t, nr::TIMERFD_CREATE, [CLOCK_MONOTONIC, EFD_NONBLOCK, 0, 0, 0, 0]);
+    // itimerspec { interval 0, value 1 ms }: one expiry.
+    for (i, v) in [0u64, 0, 0, 1_000_000].iter().enumerate() {
+        p.mem.write_u64(s + i as u64 * 8, *v).unwrap();
+    }
+    assert_eq!(p.syscall(&mut t, nr::TIMERFD_SETTIME, [fd, 0, s, 0, 0, 0]), 0);
+    let ep = p.syscall(&mut t, nr::EPOLL_CREATE1, [0, 0, 0, 0, 0, 0]);
+    epoll_add(&p, &mut t, s, ep, fd, EPOLLIN | EPOLLET, 1);
+    std::thread::sleep(Duration::from_millis(5));
+    assert_eq!(wait_once(&p, &mut t, s, ep, 0).0, 1, "the expiry, once");
+    let (cpu, wall) = (thread_cpu(), Instant::now());
+    assert_eq!(wait_once(&p, &mut t, s, ep, 300).0, 0, "not again");
+    let (cpu, wall) = (thread_cpu() - cpu, wall.elapsed());
+    assert!(wall >= Duration::from_millis(290), "waited out its timeout: {wall:?}");
+    assert!(cpu < Duration::from_millis(60), "slept rather than looked again and again: {cpu:?} of processor time in {wall:?}");
+}
+
 /// `EPOLLONESHOT`: reported once, then nothing until `EPOLL_CTL_MOD` re-arms it.
 #[test]
 fn a_oneshot_entry_waits_for_its_rearm() {

@@ -75,6 +75,9 @@ use crate::vm::OsError;
 /// This backend is real.
 pub(super) const AVAILABLE: bool = true;
 
+/// A data fault through a tagged address reaches the handlers untagged (`on_bad_access`).
+pub(super) const REPORTS_UNTAGGED_ADDRESSES: bool = true;
+
 // ---------------------------------------------------------------------------------------------
 // Mach declarations (none of these are in `libc`, or only deprecated there).
 // ---------------------------------------------------------------------------------------------
@@ -338,6 +341,7 @@ extern "C" fn trampoline_dispatch(slot: *mut Slot) {
         }
         FaultOutcome::NotOurs => {
             DECLINED.fetch_add(1, Ordering::Relaxed);
+            super::note_decline(fault.address, fault.instruction_pointer);
             OUTCOME_DECLINED
         }
     };
@@ -717,6 +721,11 @@ fn on_bad_access(thread: MachPort, code: i64, address: u64) -> KernReturn {
     if code != KERN_INVALID_ADDRESS && code != KERN_PROTECTION_FAILURE {
         return KERN_FAILURE;
     }
+    // XNU reports a fault through a tagged pointer with its tag (measured: a store through
+    // `p | 0x02 << 56` to a PROT_NONE page reports that address, in the Mach code and `far` alike),
+    // while the MMU ignored the tag for the access itself (`vm::host_ignores_top_byte`). The handlers
+    // are given what was accessed ([`REPORTS_UNTAGGED_ADDRESSES`]). No user address reaches bit 56.
+    let address = if crate::vm::host_ignores_top_byte() { address & 0x00FF_FFFF_FFFF_FFFF } else { address };
     // SAFETY: only this thread touches the server state.
     let Some(server) = (unsafe { (*SERVER.0.get()).as_mut() }) else { return KERN_FAILURE };
     let Some(id) = thread_id(thread) else { return KERN_FAILURE };

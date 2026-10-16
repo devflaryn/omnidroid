@@ -603,6 +603,13 @@ uint32_t od_set_fastmem_mask_by_and(uint32_t on);
  * Returns the value in force; a no-op returning 0 on arm64. */
 uint32_t od_set_tbi_unmasked(uint32_t on);
 
+/* Patch 0105 (arm64 only): non-zero leaves Top Byte Ignore's mask (56-bit mirrored fastmem) to the
+ * host MMU in blocks emitted from now on: no `ubfx` before a guest access, and the low window's
+ * test ignores bits 56-63. Only for a host whose kernel enables TBI for user data accesses, and
+ * whose fault handler clears the tag of a reported address (macOS reports it tagged). Returns the
+ * value in force (1 or 0); 0 and a no-op on x64. */
+uint32_t od_set_fastmem_host_tbi(uint32_t on);
+
 /* Patch 0041 (x64 only): guest instructions that met a tagged address while the mask was off,
  * and are emitted masked since, in this process. 0 on arm64. */
 uint64_t od_tbi_sites_noted(void);
@@ -635,6 +642,13 @@ uint32_t od_set_fast_dispatch_inline(uint32_t on);
 uint32_t od_set_shrink_tables(uint32_t on);
 
 void od_jit_effective_config(void* jit, od_effective_config* out);
+/* arm64 (patch 0102): the bytes of translated code the jit's own cache holds now, and has emitted
+ * in all; from any thread. 0 and 0 elsewhere (the x64 backend's are its shared cache's). */
+void od_jit_code_bytes(void* jit, uint64_t* in_use, uint64_t* emitted);
+/* arm64 (patch 0104): from any thread, if the jit's thread has been inside an `SVC` callback for at
+ * least `parked_at_least_ns`, give back its cache's translated code (a clear made when it next
+ * runs). The bytes given back; 0 when not parked so long, or elsewhere. */
+uint64_t od_jit_discard_parked(void* jit, uint64_t parked_at_least_ns);
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);
 

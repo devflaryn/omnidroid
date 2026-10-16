@@ -1114,3 +1114,63 @@ head is now read from the block map, as the eviction and invalidation paths read
 s26 and s32's crash: the game's host died of an access violation minutes after "restored blocks never
 entered forgotten", with snapshots, mostly on four E-cores (more regions evicted). Test:
 `a_restored_loop_forgotten_unverified_leaves_no_dead_head` (SIGSEGV before, passes after).
+
+### 0102 — arm64: a clear gives back the code memory, and a cache says what it holds
+
+arm64, each thread's own cache. `ClearCache` set the emit offset back to the end of the prelude and
+kept every page the blocks had been in, dirty: a cache only ever grew to its high-water mark, and
+the system's host process on the M4 held 327 MB resident and 534 MB compressed of translations in
+346 caches (2026-10-16, `vmmap`). Now a clear gives the pages above the prelude back --
+`MADV_FREE_REUSABLE` on macOS (footprint drops at once; `MADV_DONTNEED` frees nothing there),
+`MADV_DONTNEED` on Linux -- and on macOS emission marks them `MADV_FREE_REUSE` a megabyte ahead
+before writing them again, so the footprint counts them once more. A clear happens outside
+generated code (at a run's edge, or in `Emit` called from the dispatcher, whose prelude is kept), so
+nothing executes a page while it is given back. `Jit::OdCodeBytesInUse`/`OdCodeBytesEmitted`
+(atomics, any thread; shim `od_jit_code_bytes`) let `omni-cpu` sum a process's caches, which turns
+`omni-linux`'s code trim (`clear_code_cache` asks each thread's jit to clear) on for arm64 hosts.
+
+### 0103 — arm64: a register allocator without searches, made cheaply for every block
+
+arm64 register allocator, what x64's 0077/0080/0092 did there. Sampled in the system's host process
+while system_server started (M4, 2026-10-16), **76% of its busy time was translation**, most of it
+the allocator: `UpdateAllUses` walked all 129 host locations (32 GPRs, 32 FPRs, the flags, 64 spill
+slots) after every IR instruction, `ValueLocation`/`ValueInfo` searched every location's values for
+each argument (and, in asserts that a value is not yet defined, to the end every time),
+`AssertAllUnlocked` walked all 129 again, and every block's `RegAlloc` seeded a Mersenne Twister from
+`std::random_device` (a system call) and copied both register orders twice. Now: an IR value carries
+the one-byte location hint of 0080 (its index here: GPRs 0-31, FPRs 32-63, the flags 64, spill slots
+from 65), set where it is defined or moved and checked before it is trusted; `UpdateAllUses` visits
+the locations the instruction touched (an argument's use counted, a value defined, moved or spilled
+there); the "not yet defined" and "all unlocked" asserts and the IR `VerificationPass` run with
+`OMNI_JIT_VERIFY=1`; the orders are borrowed spans and the eviction pick is xorshift from a counter;
+and "was this value defined in the block" is a flag on the IR instruction (in padding) instead of a
+hash set filled and asked per block.
+The code emitted is the same but for which register a full file evicts (random before and after).
+
+### 0104 — arm64: a parked thread's translated code given back
+
+arm64, each thread's own cache. A clear (0102) is made by the jit's thread at the edge of a run, so
+a thread that waits in a system call -- a binder looper, a daemon's event loop, most of the
+hundreds in the system's host process -- kept every page it had translated for as long as it
+waited. While the thread is inside the `SVC` callback the shim now publishes where it will return
+(an atomic, with since when); `Jit::OdDiscardParked`, from another thread and under the jit's
+invalidation lock, raises a clear and the `CacheInvalidation` halt, looks again that the thread is
+still parked at that address, and gives back every page of translated code but the prelude and
+the two pages from the return address -- the rest of the `SVC`'s block. On return the thread runs
+that rest, whose `CheckHalt` terminal sends it to the dispatcher in the prelude; the run ends and
+the clear is made, after the discard (both hold the lock). Shim `od_jit_discard_parked`;
+`omni-linux`'s code trim asks it every minute of threads parked two minutes (`OMNI_CODE_PARKED_S`).
+
+### 0105 — arm64: Top Byte Ignore left to the host
+
+arm64, the direct path under Top Byte Ignore (56 address bits, mirrored -- how `omni-linux` runs,
+for scudo's tagged heap pointers). The mask was a `ubfx` before every guest load and store, the
+low window's (0030) `tst` then testing the masked address. A host whose kernel enables TBI for user
+data accesses -- macOS and Linux on arm64 -- takes a tagged address to the untagged one by itself.
+With the process-wide `live_fastmem_host_tbi` set (shim `od_set_fastmem_host_tbi`, for blocks
+emitted from then on) the access uses the guest address as it is, and the low window's test is
+`tst addr, #0x00ffffff00000000`: below 2^32 whatever the tag, the base plus the tagged offset being
+the window's host address with the tag on top. One instruction, and one cycle of address latency,
+fewer per access. The embedder vouches for its fault path: XNU reports a fault through a tagged
+address tagged, so `omni-platform`'s macOS fault layer clears bits 56-63 before its handlers see it
+(`fault::reports_untagged_addresses`); `omni-linux` turns the switch on only where both hold.

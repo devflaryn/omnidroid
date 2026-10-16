@@ -749,8 +749,19 @@ fn sys_munmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     Ok(0)
 }
 
-fn sys_mprotect(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+fn sys_mprotect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let probed = smc_probe(p, a[0], a[1], Some(a[2] as u32));
+    // **RELRO sealed by the dynamic linker** (`PROT_READ` of a file mapping, asked by `linker64`
+    // itself): beside the library's `.data` in one host page, it need not make every write there
+    // trap (`omni_mem`'s `set_sealed_read_only`). Nothing writes RELRO once it is sealed.
+    const PROT_READ: u64 = 1;
+    if a[2] == PROT_READ && a[1] > 0 {
+        let addr = crate::guest::untag(a[0]);
+        let by_linker = p.mm.name_at(t.pc).is_some_and(|(name, _)| name.ends_with(b"/linker64"));
+        if by_linker && p.mm.name_at(addr).is_some() {
+            p.mem.space().set_sealed_read_only(addr as usize, a[1] as usize);
+        }
+    }
     p.mm.protect(a[0], a[1], a[2] as u32)?;
     if probed {
         p.invalidate_code(crate::guest::untag(a[0]), a[1]);

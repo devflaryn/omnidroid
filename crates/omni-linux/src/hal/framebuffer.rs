@@ -32,6 +32,20 @@ pub struct Framebuffer {
     /// Where the composer can present a frame of share images itself (`present_zero`): the
     /// display window's swapchain, while it has one.
     sink: Mutex<Option<Arc<dyn ZeroSink>>>,
+    /// Where the composer can write a frame's pixels itself (`CpuSink`): the display window's
+    /// image, while it has one that takes rows (macOS's `IOSurface`).
+    cpu_sink: Mutex<Option<Arc<dyn CpuSink>>>,
+}
+
+/// **A window the composer writes a frame's rows into directly**: one pass from the layer's region
+/// to what the window shows, instead of a framebuffer frame made and then copied into the window by
+/// the display window's thread. The framebuffer's own frame is then made only when a reader asks
+/// (`Framebuffer::present_external`).
+pub trait CpuSink: Send + Sync {
+    /// `fill` gets the window's next image -- `height` rows of `width` **BGRA** pixels, `stride`
+    /// bytes apart -- and writes every pixel; true once it is shown. False: nothing was called, and
+    /// the frame goes the usual way.
+    fn present_rows(&self, width: u32, height: u32, fill: &mut dyn FnMut(&mut [u8], usize)) -> bool;
 }
 
 /// **A window that shows frames composed on the GPU from share images** (`present_zero`,
@@ -69,7 +83,19 @@ impl Framebuffer {
             presented: Condvar::new(),
             spares: Mutex::new(Vec::new()),
             sink: Mutex::new(None),
+            cpu_sink: Mutex::new(None),
         }
+    }
+
+    /// Give the composer a window to write frames' rows into ([`CpuSink`]), or take it away.
+    pub fn set_cpu_sink(&self, sink: Option<Arc<dyn CpuSink>>) {
+        *self.cpu_sink.lock() = sink;
+    }
+
+    /// The window the composer can write frames' rows into, if any.
+    #[must_use]
+    pub fn cpu_sink(&self) -> Option<Arc<dyn CpuSink>> {
+        self.cpu_sink.lock().clone()
     }
 
     /// Give the composer a window to present share images to, or take it away.

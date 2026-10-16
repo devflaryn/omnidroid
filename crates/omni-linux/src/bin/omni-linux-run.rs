@@ -361,26 +361,24 @@ fn main() -> ExitCode {
         }
     }
     // OMNI_SCREENSHOT=<path>: the display's framebuffer, as a PNG, every few seconds
-    // (`OMNI_SCREENSHOT_MS`, default 5000), written whole (a rename) so a reader never sees half.
+    // (`OMNI_SCREENSHOT_MS`, default 5000) and when a reader asks (`<path>.want`,
+    // `displays::keep_screenshot`), written whole (a rename) so a reader never sees half.
     if let (Some(fb), Ok(path)) = (framebuffer.clone(), std::env::var("OMNI_SCREENSHOT")) {
         let every = std::env::var("OMNI_SCREENSHOT_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(5000);
         std::thread::spawn(move || {
             let (mut seen, mut since) = (0, std::time::Instant::now());
             let mut last_line = std::time::Instant::now();
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(every.max(100)));
-                let frames = fb.frames();
+            let counter = std::sync::Arc::clone(&fb);
+            let never = std::sync::atomic::AtomicBool::new(false);
+            omni_linux::displays::keep_screenshot(&fb, std::path::Path::new(&path), std::time::Duration::from_millis(every.max(100)), &never, || {
                 // Presented frames, and the rate since the previous line (at most one line in 5 s).
+                let frames = counter.frames();
                 if frames != seen && last_line.elapsed() >= std::time::Duration::from_secs(5) {
                     let fps = (frames - seen) as f64 / since.elapsed().as_secs_f64();
                     eprintln!("[display] {frames} frames presented ({fps:.2}/s)");
                     (seen, since, last_line) = (frames, std::time::Instant::now(), std::time::Instant::now());
                 }
-                let partial = format!("{path}.part");
-                if std::fs::write(&partial, fb.png()).is_ok() {
-                    let _ = std::fs::rename(&partial, &path);
-                }
-            }
+            });
         });
     }
     if let Some(caps) = caps {
@@ -428,6 +426,38 @@ fn main() -> ExitCode {
             std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
             let top: Vec<String> = omni_linux::process::syscall_stats().into_iter().take(8).map(|(n, c, ms)| format!("{n} {c}x {ms}ms")).collect();
             eprintln!("[syscalls] {name} {}s: {}", every, top.join(", "));
+        });
+    }
+    // OMNI_FAULT_STATS=<seconds>: the host faults this process's handlers examined, resolved and
+    // declined over each period (a guest page's first touch, a write to a watched page, a fault the
+    // guest meant) -- each a Mach exception and a redirect on macOS.
+    if let Some(every) = std::env::var("OMNI_FAULT_STATS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        let name = argv.iter().find_map(|a| String::from_utf8_lossy(a).strip_prefix("--nice-name=").map(String::from)).unwrap_or_else(|| "system".into());
+        omni_platform::fault::record_declines(true);
+        std::thread::spawn(move || {
+            let mut was = omni_platform::fault::stats();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(every.max(1)));
+                let now = omni_platform::fault::stats();
+                let per = |a: u64, b: u64| (a - b) / every.max(1);
+                // Where the declined ones were, by 64 KiB of guest memory, most first.
+                let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+                for (address, _) in omni_platform::fault::recent_declines() {
+                    *at.entry(address & !0xffff).or_default() += 1;
+                }
+                let mut top: Vec<(usize, usize)> = at.into_iter().collect();
+                top.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                let top: Vec<String> = top.iter().take(6).map(|(a, n)| format!("{n}x {}", omni_linux::process::describe_host_address(*a))).collect();
+                eprintln!(
+                    "[faults] {name} {}: {}/s examined, {}/s resolved, {}/s declined; declined at: {}",
+                    std::process::id(),
+                    per(now.examined, was.examined),
+                    per(now.resolved, was.resolved),
+                    per(now.declined, was.declined),
+                    top.join(", ")
+                );
+                was = now;
+            }
         });
     }
     // OMNI_MEM_TRACE=<seconds>: this host process's commit charge beside its program's guest

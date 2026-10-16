@@ -5,6 +5,8 @@
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 
+#include <cstdlib>
+
 #include <limits>
 
 #include "dynarmic/backend/arm64/a64_jitstate.h"
@@ -494,7 +496,15 @@ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
         Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
     }
-    Optimization::VerificationPass(ir_block);
+    // Omnidroid patch 0103: the IR's consistency check only when asked for (`OMNI_JIT_VERIFY=1`),
+    // as on x64 (patch 0077): it asserts and changes nothing.
+    static const bool verify = [] {
+        const char* v = std::getenv("OMNI_JIT_VERIFY");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (verify) {
+        Optimization::VerificationPass(ir_block);
+    }
 
     return ir_block;
 }

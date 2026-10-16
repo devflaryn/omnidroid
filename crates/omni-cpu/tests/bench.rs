@@ -88,6 +88,23 @@ fn memory_loop(data: usize, iterations: u64) -> Vec<u32> {
     program
 }
 
+/// **Pointer chasing**: four dependent loads an iteration through a word that points to itself, so
+/// each load's address is the previous one's value -- what the direct path adds to an address is
+/// on the critical path (an object graph walked field by field). The host may predict the value
+/// (Apple silicon does), which hides the load's own latency but not what is added to the address.
+fn chase_loop(data: usize, iterations: u64) -> Vec<u32> {
+    let mut program = mov64(0, data as u64);
+    program.push(str_imm(0, 0, 0));
+    program.extend(mov64(1, iterations));
+    let loop_start = program.len();
+    program.extend([ldr_imm(0, 0, 0), ldr_imm(0, 0, 0), ldr_imm(0, 0, 0), ldr_imm(0, 0, 0)]);
+    program.push(subs_imm(1, 1, 1));
+    let here = program.len();
+    program.push(b_cond(1, loop_start as i32 - here as i32));
+    program.push(ret(30));
+    program
+}
+
 /// A loop with **no** guest memory access at all: five register operations per iteration.
 ///
 /// This is the workload where `GetSetElimination` earns its keep, so it is the one that says what
@@ -272,24 +289,35 @@ fn the_precise_get_set_elimination() {
 /// **What Top Byte Ignore costs on every direct access.** `omni-linux` runs with
 /// `top_byte_ignore` (56-bit fastmem, mirrored: a `shl`/`shr` pair before each access to drop the
 /// tag) against the 64-bit identity mapping, where the guest address is used as it is.
+///
+/// MEASURED on an M4 (2026-10-16): the mask is free where the address is not on the critical path
+/// (the first two loops; a +-20% bimodal median on `mixed` follows the loop's code alignment, not
+/// the configuration) and +15% on `chase_loop` (1.46 -> 1.69 ns/iter), which patch 0105 (the tag
+/// left to the host's MMU) gives back: 1.45-1.47. Apple silicon predicts a self-pointing load's
+/// value, so `chase_loop` understates a real chain; `low_window.rs`'s
+/// `the_cost_of_the_window_on_pointer_chasing` follows a random cycle: 6.60 -> 4.41 ns for four
+/// dependent loads without a window, 8.66 -> 7.32 in the low window.
 #[test]
 #[ignore = "measurement, not a test"]
 fn the_cost_of_top_byte_ignore() {
     let _serial = serialized();
     println!("\n== Top Byte Ignore (n = {N} per configuration) ==");
-    let workloads: [(&str, u64, fn(usize, u64) -> Vec<u32>); 2] = [
+    let workloads: [(&str, u64, fn(usize, u64) -> Vec<u32>); 3] = [
         ("memory-heavy, 5 insns/iter, 2 accesses", 5, memory_loop),
         ("mixed, 12 insns/iter, 2 accesses", 12, mixed_loop),
+        ("pointer chasing, 6 insns/iter, 4 dependent loads", 6, chase_loop),
     ];
     for (workload, per_iteration, build) in workloads {
         println!("  {workload}:");
-        for (label, tbi, mask, by_and) in [
-            ("64-bit identity               ", false, true, false),
-            ("TBI, shl/shr mask (default)   ", true, true, false),
-            ("TBI, one `and` (0040)         ", true, true, true),
-            ("TBI off the direct path (TBI=0)", true, false, false),
+        for (label, tbi, mask, by_and, host) in [
+            ("64-bit identity               ", false, true, false, false),
+            ("TBI, shl/shr mask (default)   ", true, true, false, false),
+            ("TBI, one `and` (0040)         ", true, true, true, false),
+            ("TBI off the direct path (TBI=0)", true, false, false, false),
+            ("TBI left to the host (0105)    ", true, true, false, true),
         ] {
             omni_cpu::dynarmic::set_fastmem_mask_by_and(by_and);
+            omni_cpu::dynarmic::set_fastmem_host_tbi(host);
             let guest = Guest::with_options(DynarmicOptions { top_byte_ignore: tbi, tbi_direct_mask: mask, ..Default::default() });
             let entry = guest.load(&build(guest.data, ITERATIONS));
             guest.write_u64(guest.data, 1);
@@ -309,6 +337,7 @@ fn the_cost_of_top_byte_ignore() {
         }
     }
     omni_cpu::dynarmic::set_fastmem_mask_by_and(false);
+    omni_cpu::dynarmic::set_fastmem_host_tbi(false);
     // What a tagged access costs where the direct path does not mask (TBI=0): a host fault and the
     // slow path, each time. The same memory-heavy loop through a tagged pointer.
     const TAGGED_ITERATIONS: u64 = 20_000;

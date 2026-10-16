@@ -83,6 +83,15 @@ pub static VSYNC_PERIOD_NS: AtomicI32 = AtomicI32::new(16_666_666);
 /// became the whole system's: a ceiling under 60 fps.
 pub static VSYNC_PACE: AtomicBool = AtomicBool::new(true);
 
+/// **`present_rows=0|1`** (lever; on by default): a frame of one opaque layer over the display is
+/// written straight into the display window's image when the window takes rows
+/// (`framebuffer::CpuSink`, macOS), instead of into the framebuffer for the window's thread to copy.
+pub static PRESENT_ROWS: AtomicBool = AtomicBool::new(true);
+
+/// **`present_over_black=1`** (lever, the default): [`present_single`] also takes a premultiplied
+/// layer over black solid colours (a SurfaceView's backgrounds), as the copy it composes to.
+pub static PRESENT_OVER_BLACK: AtomicBool = AtomicBool::new(true);
+
 /// The last vsync's time on the guest's clock (ns), for a present fence's signal time.
 static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
 
@@ -269,6 +278,8 @@ const HANDLE_INTS: usize = 14;
 const RGBA_8888: i32 = 1;
 const RGBX_8888: i32 = 2;
 const BGRA_8888: i32 = 5;
+/// 16 bits a pixel, `R5 G6 B5` little-endian: expanded to RGBA as the composer reads it.
+const RGB_565: i32 = 4;
 const IMPLEMENTATION_DEFINED: i32 = 0x22;
 
 /// The display's one configuration: its id and size. A resize is a new id, so that nothing
@@ -589,6 +600,8 @@ struct LayerState {
     z: i32,
     transform: Option<common::Transform>,
     color: Option<[f32; 4]>,
+    /// Buffers latched onto it so far: a new frame in the same slot is a new count.
+    latched: u64,
 }
 
 impl LayerState {
@@ -605,7 +618,7 @@ impl LayerState {
             return false;
         }
         let (Some(buffer), Some(crop)) = (self.slot.and_then(|s| self.buffers.get(&s)), &self.crop) else { return false };
-        matches!(buffer.format, RGBA_8888 | RGBX_8888 | BGRA_8888 | IMPLEMENTATION_DEFINED)
+        matches!(buffer.format, RGBA_8888 | RGBX_8888 | BGRA_8888 | IMPLEMENTATION_DEFINED | RGB_565)
             && crop.left >= 0.0
             && crop.top >= 0.0
             && crop.right > crop.left
@@ -649,6 +662,11 @@ struct State {
     /// again rather than ~3.7 MB allocated (and faulted in, zeroed) per buffer per frame.
     scratch_layers: HashMap<i64, Vec<u8>>,
     scratch_out: Vec<u8>,
+    /// The last frame the composer composed itself, as [`device_signature`] has it; a device frame
+    /// with the same one is already the framebuffer's, and is not composed again.
+    composed: Vec<u64>,
+    /// Device frames found unchanged and not composed again.
+    frames_unchanged: u64,
 }
 
 pub struct Client {
@@ -762,6 +780,18 @@ impl Client {
     fn present(&self, screen: &Screen) {
         let mut st = screen.state.lock();
         if st.device_frame {
+            // **An unchanged frame is not composed again.** SurfaceFlinger presents every display
+            // whenever any display has a new frame, so the hidden display 0 (and every instance's
+            // display) was composed again at the game's rate with nothing on it changed -- ~1 ms
+            // and two 3.6 MB copies a frame at 1280x720 (M4, 2026-10-16). Any layer property,
+            // buffer latched (a new frame in the same slot too), composition or the display's size
+            // changes the signature.
+            let signature = device_signature(&st, screen.mode());
+            if signature == st.composed && screen.framebuffer.frames() > 0 {
+                st.frames_unchanged += 1;
+                return;
+            }
+            st.composed = signature;
             st.frames_device += 1;
             log_paths(&st);
             let mut order: Vec<(i32, i64)> = st.layers.keys().map(|l| (st.device.get(l).map_or(0, |d| d.z), *l)).collect();
@@ -777,7 +807,13 @@ impl Client {
                 }
             }
             let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
-            if super::compose::ZERO.load(Ordering::Relaxed) {
+            // One opaque layer over the whole display (a game's SurfaceView): its rows straight
+            // into the framebuffer's next frame.
+            if !super::compose::BGRA_OUT.load(Ordering::Relaxed) && present_single(&st, screen) {
+                return;
+            }
+            let any_565 = order.iter().any(|(_, l)| st.device.get(l).and_then(|d| d.slot.and_then(|s| d.buffers.get(&s))).is_some_and(|b| b.format == RGB_565));
+            if super::compose::ZERO.load(Ordering::Relaxed) && !any_565 {
                 // The copying path's buffers are not needed (~17 MB at 1575x890).
                 if !st.scratch_out.is_empty() || !st.scratch_layers.is_empty() {
                     st.scratch_out = Vec::new();
@@ -800,7 +836,8 @@ impl Client {
                     // The app's copy into the buffer lands first, as a release fence is waited on
                     // (and a region the release left stale is filled: `region_lazy`).
                     crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
-                    crate::gpu::share::ensure_region(&b.shm, u64::from(b.stride) * 4);
+                    let bpp = if b.format == RGB_565 { 2 } else { 4 };
+                    crate::gpu::share::ensure_region(&b.shm, u64::from(b.stride) * bpp);
                     let need = b.stride as usize * b.height as usize * 4;
                     let mut bytes = spare.remove(&l).unwrap_or_default();
                     if fast {
@@ -808,7 +845,15 @@ impl Client {
                     } else {
                         bytes = vec![0u8; need];
                     }
-                    if b.shm.read_at(&mut bytes, b.pixels_at).is_ok() {
+                    let read = if b.format == RGB_565 {
+                        // Read into the back half, expanded to RGBA from the front: each pixel's
+                        // two bytes are read before its four are written over them.
+                        let half = need / 2;
+                        b.shm.read_at(&mut bytes[half..], b.pixels_at).map(|_| super::compose::expand_565_in_place(&mut bytes, half))
+                    } else {
+                        b.shm.read_at(&mut bytes, b.pixels_at).map(|_| ())
+                    };
+                    if read.is_ok() {
                         pixels.insert(l, bytes);
                     }
                 }
@@ -841,6 +886,7 @@ impl Client {
             return;
         }
         st.frames_client += 1;
+        st.composed.clear();
         log_paths(&st);
         let Some(target) = st.current_target.and_then(|slot| st.targets.get(&slot)) else { return };
         if !matches!(target.format, RGBA_8888 | RGBX_8888 | IMPLEMENTATION_DEFINED) {
@@ -856,11 +902,31 @@ impl Client {
         // (A client target is never left stale -- the composer never takes it from a share image --
         // but whatever reads a region makes sure: `region_lazy`.)
         crate::gpu::share::ensure_region(&target.shm, u64::from(target.stride) * 4);
-        let mut pixels = vec![0u8; target.stride as usize * height as usize * 4];
+        let stride = target.stride;
+        // The target's rows straight from the region's host view into the framebuffer's next
+        // frame: one copy, nothing allocated (it was a 3.6 MB buffer a frame, zeroed, read into and
+        // copied again). Under `OMNI_COMPOSER_TRACE=2`, or without a view, as before.
+        static FRAME_TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let traced = *FRAME_TRACE.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("2"));
+        let need = stride as usize * height as usize * 4;
+        if !traced {
+            let (shm, pixels_at) = (Arc::clone(&target.shm), target.pixels_at);
+            let view = shm.bytes(pixels_at, need).filter(|b| b.len() >= need);
+            if let Some(src) = view {
+                drop(st);
+                let (row, pitch) = (width as usize * 4, stride as usize * 4);
+                screen.framebuffer.present_with(width, height, false, |dst| {
+                    for y in 0..height as usize {
+                        dst[y * row..(y + 1) * row].copy_from_slice(&src[y * pitch..y * pitch + row]);
+                    }
+                });
+                return;
+            }
+        }
+        let mut pixels = vec![0u8; need];
         if target.shm.read_at(&mut pixels, target.pixels_at).is_err() {
             return;
         }
-        let stride = target.stride;
         // OMNI_COMPOSER_TRACE=2: each frame presented, its slot and two pixels (centre, corner).
         static FRAMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *FRAMES.get_or_init(|| std::env::var("OMNI_COMPOSER_TRACE").as_deref() == Ok("2")) {
@@ -894,13 +960,13 @@ fn layer_of<'a>(st: &State, l: i64, data: Option<&'a [u8]>) -> Option<super::com
     } else {
         let (b, data, c) = (d.slot.and_then(|s| d.buffers.get(&s))?, data?, d.crop.as_ref()?);
         if d.one_to_one() {
-            Source::Pixels { data, stride: b.stride as usize, opaque: b.format == RGBX_8888, crop_x: c.left as usize, crop_y: c.top as usize }
+            Source::Pixels { data, stride: b.stride as usize, opaque: matches!(b.format, RGBX_8888 | RGB_565), crop_x: c.left as usize, crop_y: c.top as usize }
         } else {
             Source::Mapped {
                 data,
                 stride: b.stride as usize,
                 rows: b.height as usize,
-                opaque: b.format == RGBX_8888,
+                opaque: matches!(b.format, RGBX_8888 | RGB_565),
                 bgra: b.format == BGRA_8888,
                 crop: (c.left, c.top, c.right, c.bottom),
                 transform: d.transform.map_or(0, |t| t.0 as u32),
@@ -1132,6 +1198,142 @@ fn present_in_place(st: &State, screen: &Screen, order: &[(i32, i64)], bgra: boo
     screen.framebuffer.present_with(width, height, bgra, |out| super::compose::compose_into(out, width as usize, height as usize, &layers, opts));
 }
 
+/// **A frame of one opaque layer covering the display, shown 1:1** -- a game's SurfaceView, with
+/// the chrome left out -- is its buffer's rows: read straight from the region into the
+/// framebuffer's next frame (expanded from RGB565, or alpha made opaque, as [`super::compose`]
+/// would), one pass instead of three (read the layer, compose it, copy the frame in). False when
+/// the frame is anything else: it is composed as usual.
+///
+/// Also such a layer drawn premultiplied over nothing but black solid colours, one of them opaque
+/// over the whole display -- the "Background for SurfaceView" layers SurfaceFlinger puts under a
+/// SurfaceView (Super Mechs): over opaque black, [`super::compose`]'s premultiplied blend at plane
+/// alpha 1 is the layer's colour with alpha 1, byte for byte, which is the copy with its alpha made
+/// opaque.
+fn present_single(st: &State, screen: &Screen) -> bool {
+    let Mode { width, height, .. } = screen.mode();
+    let mut visible: Vec<(i32, i64, Composition)> =
+        st.layers.iter().filter(|(l, _)| !st.hidden.contains(l)).map(|(l, c)| (st.device.get(l).map_or(0, |d| d.z), *l, *c)).collect();
+    visible.sort_unstable();
+    let Some(&(_, top, c)) = visible.last() else { return false };
+    if c != Composition::DEVICE {
+        return false;
+    }
+    let below = &visible[..visible.len() - 1];
+    let over_black = !below.is_empty() && PRESENT_OVER_BLACK.load(Ordering::Relaxed) && black_backdrop(st, below, width, height);
+    if !below.is_empty() && !over_black {
+        return false;
+    }
+    let l = &top;
+    let Some(d) = st.device.get(l) else { return false };
+    let (Some(b), Some(f), Some(crop)) = (d.slot.and_then(|s| d.buffers.get(&s)), &d.frame, &d.crop) else { return false };
+    let premultiplied = matches!(d.blend, None | Some(common::BlendMode::PREMULTIPLIED));
+    let opaque = matches!(b.format, RGBX_8888 | RGB_565) || over_black;
+    if !d.one_to_one()
+        || (f.left, f.top, f.right, f.bottom) != (0, 0, width as i32, height as i32)
+        || d.alpha.is_some_and(|a| a < 254.5 / 255.0)
+        || !(opaque || d.blend == Some(common::BlendMode::NONE))
+        || (over_black && !premultiplied && d.blend != Some(common::BlendMode::NONE))
+        || !matches!(b.format, RGBA_8888 | RGBX_8888 | IMPLEMENTATION_DEFINED | RGB_565)
+    {
+        return false;
+    }
+    let bpp = if b.format == RGB_565 { 2 } else { 4 };
+    let (cx, cy) = (crop.left as usize, crop.top as usize);
+    let (stride, w, h) = (b.stride as usize, width as usize, height as usize);
+    if cx + w > stride || cy + h > b.height as usize {
+        return false;
+    }
+    crate::gpu::native::wait_written(&b.shm, std::time::Duration::from_millis(50));
+    crate::gpu::share::ensure_region(&b.shm, (stride * bpp) as u64);
+    let need = stride * b.height as usize * bpp;
+    let single = Single { shm: Arc::clone(&b.shm), pixels_at: b.pixels_at, need, stride, cx, cy, w, h, bpp, opaque };
+    // Straight into the window's image when it takes rows (macOS): the framebuffer's frame is made
+    // from the region again only if a reader asks for it.
+    if let Some(sink) = screen.framebuffer.cpu_sink().filter(|_| PRESENT_ROWS.load(Ordering::Relaxed)) {
+        let mut written = false;
+        let shown = single.with_pixels(|src| sink.present_rows(width, height, &mut |dst, pitch| {
+            single.write(src, dst, pitch, true);
+            written = true;
+        }));
+        if shown == Some(true) && written {
+            let lazy = single.clone();
+            screen.framebuffer.present_external(width, height, Arc::new(move |dst: &mut [u8]| {
+                let _ = lazy.with_pixels(|src| lazy.write(src, dst, lazy.w * 4, false));
+            }));
+            return true;
+        }
+    }
+    single
+        .with_pixels(|src| screen.framebuffer.present_with(width, height, false, |dst| single.write(src, dst, w * 4, false)))
+        .is_some()
+}
+
+/// Whether `below` (z order, the frame's visible layers under its top one) adds nothing to a
+/// premultiplied layer over them but an opaque black: every one a solid colour whose colour is
+/// black (its alpha anything: black premultiplied is black), at least one of them covering the
+/// display with alpha 1.
+fn black_backdrop(st: &State, below: &[(i32, i64, Composition)], width: u32, height: u32) -> bool {
+    let solid_black = |l: &i64, c: Composition| {
+        c == Composition::SOLID_COLOR && st.device.get(l).and_then(|d| d.color).is_some_and(|k| k[0] == 0.0 && k[1] == 0.0 && k[2] == 0.0)
+    };
+    let opaque_cover = |l: &i64| {
+        st.device.get(l).is_some_and(|d| {
+            let alpha = d.color.map_or(0.0, |k| k[3]) * d.alpha.unwrap_or(1.0);
+            alpha >= 254.5 / 255.0
+                && d.frame.as_ref().is_some_and(|f| f.left <= 0 && f.top <= 0 && f.right >= width as i32 && f.bottom >= height as i32)
+        })
+    };
+    below.iter().all(|(_, l, c)| solid_black(l, *c)) && below.iter().any(|(_, l, _)| opaque_cover(l))
+}
+
+/// One opaque layer over the whole display, 1:1 ([`present_single`]): its region, and where in it
+/// the display's pixels are.
+#[derive(Clone)]
+struct Single {
+    shm: Arc<Shm>,
+    pixels_at: u64,
+    need: usize,
+    stride: usize,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    bpp: usize,
+    opaque: bool,
+}
+
+impl Single {
+    /// `f` of the region's pixels: its host view, else a copy read from it; `None` if unreadable.
+    fn with_pixels<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        let pixels = match self.shm.bytes(self.pixels_at, self.need) {
+            Some(bytes) if bytes.len() >= self.need => LayerPixels::Borrowed(bytes),
+            _ => {
+                let mut v = vec![0u8; self.need];
+                self.shm.read_at(&mut v, self.pixels_at).ok()?;
+                LayerPixels::Read(v)
+            }
+        };
+        Some(f(pixels.bytes()))
+    }
+
+    /// The display's rows from `src` into `dst`, `pitch` bytes apart: RGBA as the composer makes
+    /// it (RGB565 expanded, an opaque format's alpha 1), or opaque BGRA for a window (`bgra`).
+    fn write(&self, src: &[u8], dst: &mut [u8], pitch: usize, bgra: bool) {
+        let row = self.w * 4;
+        for y in 0..self.h {
+            let at = ((self.cy + y) * self.stride + self.cx) * self.bpp;
+            let from = &src[at..at + self.w * self.bpp];
+            let out = &mut dst[y * pitch..y * pitch + row];
+            match (self.bpp, bgra) {
+                (2, false) => super::compose::expand_565_row(from, out),
+                (2, true) => super::compose::expand_565_row_bgra(from, out),
+                (_, false) => super::compose::copy_row(out, from, false, self.opaque),
+                (_, true) => super::compose::copy_row(out, from, true, true),
+            }
+        }
+    }
+}
+
 /// `OMNI_COMPOSER_TRACE=layers`: the frame's layers, bottom first, each time their list or their
 /// geometry changes -- what each is (its buffer's name), where, and whether the composer can take it.
 fn trace_on() -> bool {
@@ -1227,8 +1429,35 @@ fn log_client_reason(st: &State, hidden: &std::collections::HashSet<i64>) {
 /// Every 600 frames: how many were the composer's own and how many SurfaceFlinger's.
 fn log_paths(st: &State) {
     if (st.frames_device + st.frames_client) % 600 == 0 {
-        eprintln!("[composer] frames composed here {}, by SurfaceFlinger {}", st.frames_device, st.frames_client);
+        eprintln!("[composer] frames composed here {}, by SurfaceFlinger {}; unchanged, not composed again {}", st.frames_device, st.frames_client, st.frames_unchanged);
     }
+}
+
+/// What a device frame is made of: the display's size, the composer's levers that shape its
+/// pixels, and every layer's composition, visibility and properties with the buffer it shows (its
+/// region and how many buffers were latched onto it).
+fn device_signature(st: &State, mode: Mode) -> Vec<u64> {
+    let mut sig = vec![u64::from(mode.width), u64::from(mode.height)];
+    sig.push(u64::from(super::compose::BGRA_OUT.load(Ordering::Relaxed)) | u64::from(super::compose::ZERO.load(Ordering::Relaxed)) << 1 | u64::from(crate::gpu::share::on()) << 2);
+    let mut layers: Vec<(&i64, &Composition)> = st.layers.iter().collect();
+    layers.sort_unstable_by_key(|(l, _)| **l);
+    for (l, c) in layers {
+        sig.extend([*l as u64, c.0 as u64, u64::from(st.hidden.contains(l))]);
+        let Some(d) = st.device.get(l) else { continue };
+        let buffer = d.slot.and_then(|s| d.buffers.get(&s)).map_or(0, |b| Arc::as_ptr(&b.shm) as u64);
+        sig.extend([d.z as u64, d.slot.map_or(u64::MAX, |s| s as u64), buffer, d.latched]);
+        if let Some(f) = &d.frame {
+            sig.extend([f.left, f.top, f.right, f.bottom].map(|v| v as u64));
+        }
+        if let Some(c) = &d.crop {
+            sig.extend([c.left, c.top, c.right, c.bottom].map(|v| u64::from(v.to_bits())));
+        }
+        sig.extend([d.blend.map_or(u64::MAX, |b| b.0 as u64), d.alpha.map_or(u64::MAX, |a| u64::from(a.to_bits())), d.transform.map_or(u64::MAX, |t| t.0 as u64)]);
+        if let Some(c) = d.color {
+            sig.extend(c.map(|v| u64::from(v.to_bits())));
+        }
+    }
+    sig
 }
 
 /// A layer's buffer a gralloc handle names.
@@ -1352,6 +1581,7 @@ impl IComposerClientServer for Client {
                             _ => {}
                         }
                         d.slot = Some(buffer.slot);
+                        d.latched += 1;
                     }
                     if let Some(f) = &layer.display_frame {
                         d.frame = Some(f.clone());
@@ -1713,13 +1943,15 @@ mod tests {
         let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
         let ctx = Ctx { call: &call };
         let layer = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        // Each frame a colour of its own: an unchanged frame is not composed again.
+        let green = std::cell::Cell::new(0.0f32);
         let frame = |present_or_validate: bool, present: bool| DisplayCommand {
             display: DISPLAY,
             layers: vec![LayerCommand {
                 layer,
                 composition: Some(ParcelableComposition { composition: Composition::SOLID_COLOR }),
                 display_frame: Some(common::Rect { left: 0, top: 0, right: 64, bottom: 32 }),
-                color: Some(Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                color: Some(Color { r: 1.0, g: { green.set(green.get() + 0.125); green.get() }, b: 0.0, a: 1.0 }),
                 ..Default::default()
             }],
             present_or_validate_display: present_or_validate,
@@ -1750,6 +1982,99 @@ mod tests {
         assert_eq!((fb.frames(), fences_in(&r)), (before + 2, 1), "presented at once, with its fence");
         crate::lever::apply("composer_skip_validate=0").unwrap();
         crate::lever::apply("composer_fences=0").unwrap();
+    }
+
+    /// A premultiplied layer over the whole display, over black solid colours one of which is
+    /// opaque over the display ("Background for SurfaceView"), is the single-layer path's copy with
+    /// its alpha made opaque -- the same bytes every composition path makes -- and the backdrop is
+    /// recognised as such only when nothing under the top layer could show.
+    #[test]
+    fn a_premultiplied_layer_over_black_backgrounds_is_its_copy_made_opaque() {
+        use super::super::compose::{compose_into, Blend, Layer, Opts, Source};
+        use super::*;
+        let (w, h) = (24usize, 8usize);
+        // Every alpha, valid premultiplied pixels and some that are not (colour above alpha).
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let src: Vec<u8> = (0..w * h * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let shm = crate::shm::Shm::create("single-test").unwrap();
+        let single = Single { shm, pixels_at: 0, need: src.len(), stride: w, cx: 0, cy: 0, w, h, bpp: 4, opaque: true };
+        let mut copied = vec![0u8; w * h * 4];
+        single.write(&src, &mut copied, w * 4, false);
+        let layers = [
+            Layer { source: Source::Color([0.0, 0.0, 0.0, 1.0]), frame: (0, 0, w as i32, h as i32), blend: Blend::Premultiplied, alpha: 1.0 },
+            Layer { source: Source::Color([0.0, 0.0, 0.0, 0.5]), frame: (0, 0, 8, 16), blend: Blend::Premultiplied, alpha: 1.0 },
+            Layer { source: Source::Pixels { data: &src, stride: w, opaque: false, crop_x: 0, crop_y: 0 }, frame: (0, 0, w as i32, h as i32), blend: Blend::Premultiplied, alpha: 1.0 },
+        ];
+        for fast in [false, true] {
+            for runs in [false, true] {
+                let mut composed = vec![0u8; w * h * 4];
+                compose_into(&mut composed, w, h, &layers, Opts { fast, runs, bgra: false });
+                assert!(composed == copied, "fast={fast} runs={runs}");
+            }
+        }
+        let mut copied_bgra = vec![0u8; w * h * 4];
+        single.write(&src, &mut copied_bgra, w * 4, true);
+        let mut composed = vec![0u8; w * h * 4];
+        compose_into(&mut composed, w, h, &layers, Opts { fast: true, runs: true, bgra: true });
+        assert!(composed == copied_bgra, "bgra");
+
+        // The backdrop test, on a frame's state.
+        let mut st = State::default();
+        let solid = |frame: (i32, i32, i32, i32), color: [f32; 4]| LayerState {
+            frame: Some(common::Rect { left: frame.0, top: frame.1, right: frame.2, bottom: frame.3 }),
+            color: Some(color),
+            ..LayerState::default()
+        };
+        st.device.insert(1, solid((0, 0, w as i32, h as i32), [0.0, 0.0, 0.0, 1.0]));
+        st.device.insert(2, solid((0, 0, 8, 16), [0.0, 0.0, 0.0, 0.0]));
+        let below = [(0, 1, Composition::SOLID_COLOR), (1, 2, Composition::SOLID_COLOR)];
+        assert!(black_backdrop(&st, &below, w as u32, h as u32));
+        assert!(!black_backdrop(&st, &below[1..], w as u32, h as u32), "no opaque cover: the display's black shows through as alpha");
+        st.device.insert(2, solid((0, 0, 8, 16), [0.0, 0.0, 0.01, 0.2]));
+        assert!(!black_backdrop(&st, &below, w as u32, h as u32), "a colour that is not black");
+        st.device.insert(2, solid((0, 0, 8, 16), [0.0, 0.0, 0.0, 1.0]));
+        st.device.insert(1, solid((0, 0, w as i32, h as i32 - 1), [0.0, 0.0, 0.0, 1.0]));
+        assert!(!black_backdrop(&st, &below, w as u32, h as u32), "the cover falls short of the display");
+        st.device.insert(1, solid((0, 0, w as i32, h as i32), [0.0, 0.0, 0.0, 1.0]));
+        assert!(!black_backdrop(&st, &[(0, 1, Composition::SOLID_COLOR), (1, 2, Composition::DEVICE)], w as u32, h as u32), "a buffer layer under the top one");
+    }
+
+    /// A device frame with nothing changed is not composed again; a changed layer is.
+    #[test]
+    fn an_unchanged_frame_is_not_composed_again() {
+        use super::super::aidl::android_hardware_graphics_composer3::{Color, LayerCommand, ParcelableComposition};
+        use super::*;
+        let fb = Arc::new(Framebuffer::new(64, 32));
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::clone(&fb));
+        let client = Client::new(Arc::clone(&composer.broker), Arc::clone(&composer.screens), Arc::new(AtomicBool::new(true)));
+        let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
+        let ctx = Ctx { call: &call };
+        let layer = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        let frame = |layers: Vec<LayerCommand>| DisplayCommand { display: DISPLAY, layers, validate_display: true, present_display: true, ..Default::default() };
+        let red = LayerCommand {
+            layer,
+            composition: Some(ParcelableComposition { composition: Composition::SOLID_COLOR }),
+            display_frame: Some(common::Rect { left: 0, top: 0, right: 64, bottom: 32 }),
+            color: Some(Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+            ..Default::default()
+        };
+        client.execute_commands(&ctx, vec![frame(vec![red.clone()])]).unwrap();
+        let first = fb.frames();
+        assert!(first > 0);
+        // SurfaceFlinger presents again with nothing changed on this display (another display drew).
+        client.execute_commands(&ctx, vec![frame(Vec::new())]).unwrap();
+        assert_eq!(fb.frames(), first, "the same frame: not composed again");
+        let blue = LayerCommand { color: Some(Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), ..red };
+        client.execute_commands(&ctx, vec![frame(vec![blue])]).unwrap();
+        assert_eq!(fb.frames(), first + 1, "a changed layer: composed");
+        assert_eq!(&fb.pixels()[..4], &[0, 0, 255, 255]);
     }
 
     /// A present fence's time is the first vsync at or after the present, on the vsync's phase.

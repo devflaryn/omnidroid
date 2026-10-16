@@ -47,10 +47,12 @@
 //! (`TYPE_NULL`, [`Input::set_own_pointer`]), so the host's is hidden already; without a hold it
 //! would still move, leave the window, and be somewhere else at the release. So the press captures
 //! the host's cursor where it was pressed ([`Out::Capture`]), the raw motion moves the **app's**
-//! pointer (absolute positions kept on the display, as a device's pointer is), and the release --
-//! where the app's pointer is -- is followed by a move back to where it was pressed, where the app
-//! kept its cursor; the host's cursor is given back there, never having moved. The camera turns as
-//! on a device; the cursor stays put, as on the desktop client.
+//! pointer (absolute positions kept on the display, as a device's pointer is, each move carrying
+//! the raw motion as its relative axes -- so the camera still turns once the pointer is at the
+//! display's edge), and the release is where the app's pointer is. **The pointer stays there**: the
+//! host's cursor is put at the same place ([`Out::Warp`]) and given back. It is never moved back to
+//! where it was pressed: that move, landing in the frame of the release, was one more camera turn
+//! of minus the whole drag, and Roblox's camera snapped back to where the drag began (2026-10-12).
 //!
 //! # Coalesced, not queued
 //!
@@ -92,6 +94,8 @@ pub type Packet = Vec<(u16, u16, i32)>;
 pub enum Out {
     /// Put the host's cursor at the window's centre (held there while captured).
     Center,
+    /// Put the host's cursor at this window pixel (where a camera drag left the app's pointer).
+    Warp(i32, i32),
     /// Send to the keyboard.
     Keyboard(Packet),
     /// Send to the relative mouse (the pointer captured).
@@ -152,15 +156,24 @@ pub struct Input {
     own_pointer: bool,
     /// A camera drag being held (see "The camera drag" in the module's documentation).
     drag: Option<Drag>,
+    /// A camera drag just ended: where it was pressed, and when it ended. The host's cursor was
+    /// held there, and the window may still report it there once it is given back -- a move the
+    /// app's pointer must not make (see "The camera drag").
+    settle: Option<((i32, i32), Instant)>,
 }
+
+/// How long after a camera drag a reported move to where it was pressed is the held cursor's.
+const SETTLE: Duration = Duration::from_millis(300);
 
 /// A secondary-button drag the host holds the cursor for.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Drag {
-    /// Where it was pressed, in display pixels: where the pointer goes back to.
+    /// Where it was pressed, in display pixels (where the host's cursor is held).
     pressed: (i32, i32),
     /// The app's pointer, moved by the raw motion, kept on the display.
     at: (f64, f64),
+    /// Raw motion in display pixels not yet sent as the relative axes (unclamped).
+    rel: (f64, f64),
     /// Display pixels per window pixel, at the press.
     scale: (f64, f64),
 }
@@ -204,6 +217,7 @@ impl Input {
             every,
             own_pointer: false,
             drag: None,
+            settle: None,
         }
     }
 
@@ -244,7 +258,7 @@ impl Input {
         if wanted {
             // What the free pointer has down is let go first: the app's pointer changes source. A
             // camera drag ends with it; its capture is kept for the app's.
-            let mut out = self.end_drag(false);
+            let mut out = self.end_drag(false, Instant::now());
             out.extend(self.release_pointer_buttons());
             self.pending = None;
             if self.focused && !self.held {
@@ -277,13 +291,12 @@ impl Input {
         self.wanted && self.held
     }
 
-    /// End a camera drag: the button released where the app's pointer is (if `release`), the
-    /// pointer back where it was pressed, and the host's cursor given back unless the app holds
-    /// the capture.
-    fn end_drag(&mut self, release: bool) -> Vec<Out> {
+    /// End a camera drag: the button released where the app's pointer is (if `release`), and the
+    /// host's cursor given back there unless the app holds the capture. The app's pointer stays
+    /// where the drag left it (see "The camera drag").
+    fn end_drag(&mut self, release: bool, now: Instant) -> Vec<Out> {
         let Some(drag) = self.drag.take() else { return Vec::new() };
         let mut out = Vec::new();
-        let now = Instant::now();
         if release {
             let at = drag.at();
             let down: Vec<u16> = std::mem::take(&mut self.pointer_buttons).into_iter().collect();
@@ -293,14 +306,15 @@ impl Input {
                 out.push(Out::Pointer(packet));
             }
         }
-        // Back where it was pressed: the app kept its cursor there for the drag.
-        let back = self.position(drag.pressed.0, drag.pressed.1, now);
-        if !back.is_empty() {
-            out.push(Out::Pointer(back));
-        }
         self.pending = None;
+        self.settle = Some((drag.pressed, now));
         if self.held && !self.wanted {
             self.held = false;
+            if self.focused {
+                // The host's cursor where the app's pointer is (never over another window).
+                let window = |v: f64, scale: f64| if scale > 0.0 { (v / scale).round() as i32 } else { v.round() as i32 };
+                out.push(Out::Warp(window(drag.at.0, drag.scale.0), window(drag.at.1, drag.scale.1)));
+            }
             out.push(Out::Capture(false));
         }
         out
@@ -346,13 +360,23 @@ impl Input {
                 }
             }
             WindowEvent::PointerMoved { x, y } if !self.relative() => {
-                self.pending = Some(at(x, y));
+                let p = at(x, y);
+                if let Some((pressed, ended)) = self.settle {
+                    if now.saturating_duration_since(ended) < SETTLE && (p.0 - pressed.0).abs() <= 1 && (p.1 - pressed.1).abs() <= 1 {
+                        // The held cursor reported as it is given back, not a move of the person's.
+                        return out;
+                    }
+                    self.settle = None;
+                }
+                self.pending = Some(p);
                 out.extend(self.tick(now));
             }
             WindowEvent::PointerMotion { dx, dy } if self.held && !self.wanted && self.drag.is_some() => {
                 let drag = self.drag.as_mut().expect("dragging");
                 let clamp = |v: f64, max: u32| v.clamp(0.0, f64::from(max.saturating_sub(1)));
-                drag.at = (clamp(drag.at.0 + f64::from(dx) * drag.scale.0, display.0), clamp(drag.at.1 + f64::from(dy) * drag.scale.1, display.1));
+                let (mx, my) = (f64::from(dx) * drag.scale.0, f64::from(dy) * drag.scale.1);
+                drag.at = (clamp(drag.at.0 + mx, display.0), clamp(drag.at.1 + my, display.1));
+                drag.rel = (drag.rel.0 + mx, drag.rel.1 + my);
                 self.pending = Some(drag.at());
                 out.extend(self.tick(now));
             }
@@ -365,7 +389,7 @@ impl Input {
                 // The last motion first, then the release where the app's pointer is.
                 self.last_move = None;
                 out.extend(self.tick(now));
-                out.extend(self.end_drag(true));
+                out.extend(self.end_drag(true, now));
             }
             WindowEvent::PointerDown { button, .. } | WindowEvent::PointerUp { button, .. } if self.drag.is_some() => {
                 // Another button during a camera drag: where the app's pointer is.
@@ -405,7 +429,8 @@ impl Input {
                     // pointer, the window focused -- the host's cursor is held where it was pressed
                     // and the app's pointer moves by the raw motion.
                     if down && button == PointerButton::Secondary && self.own_pointer && self.focused && !self.wanted && !self.held && self.pointer_buttons.len() == 1 {
-                        self.drag = Some(Drag { pressed: (px, py), at: (f64::from(px), f64::from(py)), scale });
+                        self.drag = Some(Drag { pressed: (px, py), at: (f64::from(px), f64::from(py)), rel: (0.0, 0.0), scale });
+                        self.settle = None;
                         out.push(Out::Capture(true));
                     }
                 } else if self.mouse_buttons.remove(&code) {
@@ -441,7 +466,7 @@ impl Input {
             WindowEvent::PointerCaptureLost => {
                 if self.drag.is_some() {
                     // Taken from the window (the focus went): the drag ends where it is.
-                    out.extend(self.end_drag(true));
+                    out.extend(self.end_drag(true, now));
                 }
                 self.held = false;
                 out.extend(self.release_mouse_buttons());
@@ -455,7 +480,7 @@ impl Input {
                     }
                 } else {
                     out.extend(self.release_keys());
-                    out.extend(self.end_drag(true));
+                    out.extend(self.end_drag(true, now));
                     out.extend(self.release_pointer_buttons());
                     out.extend(self.release_mouse_buttons());
                     if self.held {
@@ -497,7 +522,21 @@ impl Input {
         }
         match self.pending.take() {
             Some((x, y)) => {
-                let packet = self.position(x, y, now);
+                let mut packet = self.position(x, y, now);
+                if let Some(drag) = self.drag.as_mut() {
+                    // The raw motion as the relative axes, whole pixels, the rest kept for the next.
+                    let (rx, ry) = (drag.rel.0.trunc(), drag.rel.1.trunc());
+                    drag.rel = (drag.rel.0 - rx, drag.rel.1 - ry);
+                    if rx != 0.0 {
+                        packet.push((EV_REL, REL_X, rx as i32));
+                    }
+                    if ry != 0.0 {
+                        packet.push((EV_REL, REL_Y, ry as i32));
+                    }
+                    if !packet.is_empty() {
+                        self.last_move = Some(now);
+                    }
+                }
                 if packet.is_empty() { Vec::new() } else { vec![Out::Pointer(packet)] }
             }
             None => Vec::new(),
@@ -663,10 +702,11 @@ mod tests {
     }
 
     /// A secondary drag over a view that draws its own pointer holds the host's cursor: the raw
-    /// motion moves the app's pointer (kept on the display), the release is where that pointer is,
-    /// and the pointer goes back where it was pressed before the cursor is given back.
+    /// motion moves the app's pointer (kept on the display) and is its relative axes (not kept),
+    /// the release is where that pointer is, and the pointer stays there -- never moved back to the
+    /// press, a move that turned Roblox's camera back where it began.
     #[test]
-    fn a_camera_drag_holds_the_cursor_and_gives_it_back_where_it_was_pressed() {
+    fn a_camera_drag_holds_the_cursor_and_leaves_the_pointer_where_it_went() {
         let (mut input, t0) = (Input::new(Duration::from_millis(8)), Instant::now());
         let press = WindowEvent::PointerDown { button: PointerButton::Secondary, x: 100, y: 50 };
         // Not over a view drawing its own pointer: an ordinary drag.
@@ -681,15 +721,26 @@ mod tests {
         assert!(input.captured(true).is_empty(), "no 'the app holds the mouse' title for a drag");
         assert!(input.dragging());
         // Raw motion moves the app's pointer, coalesced; absolute moves are not the pointer now.
-        assert_eq!(input.event(&WindowEvent::PointerMotion { dx: 30, dy: -10 }, t1, ONE, DISPLAY), [Out::Pointer(abs(130, 40))]);
+        let rel = |x: i32, y: i32| -> Vec<(u16, u16, i32)> { [(EV_REL, REL_X, x), (EV_REL, REL_Y, y)].into_iter().filter(|e| e.2 != 0).collect() };
+        let moved = |x: i32, y: i32, rx: i32, ry: i32| Out::Pointer(abs(x, y).into_iter().chain(rel(rx, ry)).collect());
+        assert_eq!(input.event(&WindowEvent::PointerMotion { dx: 30, dy: -10 }, t1, ONE, DISPLAY), [moved(130, 40, 30, -10)]);
         assert!(input.event(&WindowEvent::PointerMotion { dx: -5000, dy: 0 }, t1 + Duration::from_millis(1), ONE, DISPLAY).is_empty(), "coalesced");
-        // The release: the last motion (kept on the display), the release there, back to the press.
+        // The release: the last motion (the pointer kept on the display, the motion not), the release
+        // there, the host's cursor put there and given back -- no move back to the press.
         let out = input.event(&WindowEvent::PointerUp { button: PointerButton::Secondary, x: 100, y: 50 }, t1 + Duration::from_millis(2), ONE, DISPLAY);
-        assert_eq!(
-            out,
-            [Out::Pointer(abs(0, 40)), Out::Pointer(vec![(EV_KEY, BTN_RIGHT, 0)]), Out::Pointer(abs(100, 50)), Out::Capture(false)]
-        );
+        assert_eq!(out, [moved(0, 40, -5000, 0), Out::Pointer(vec![(EV_KEY, BTN_RIGHT, 0)]), Out::Warp(0, 40), Out::Capture(false)]);
         assert!(!input.dragging() && !input.held());
+        // The window reporting the held cursor where it was pressed, as it gives it back: not a move.
+        assert!(input.event(&WindowEvent::PointerMoved { x: 100, y: 50 }, t1 + Duration::from_millis(3), ONE, DISPLAY).is_empty());
+        assert_eq!(input.tick(t1 + Duration::from_millis(50)), []);
+        // At the display's edge the pointer stops, the camera's motion does not.
+        input.event(&press, t1 + Duration::from_millis(100), ONE, DISPLAY);
+        input.captured(true);
+        input.event(&WindowEvent::PointerMotion { dx: -500, dy: 0 }, t1 + Duration::from_millis(200), ONE, DISPLAY);
+        assert_eq!(input.event(&WindowEvent::PointerMotion { dx: -7, dy: 0 }, t1 + Duration::from_millis(300), ONE, DISPLAY), [Out::Pointer(rel(-7, 0))]);
+        input.event(&WindowEvent::PointerUp { button: PointerButton::Secondary, x: 100, y: 50 }, t1 + Duration::from_millis(301), ONE, DISPLAY);
+        // A move of the person's own after a drag is the pointer's again.
+        assert_eq!(input.event(&WindowEvent::PointerMoved { x: 300, y: 300 }, t1 + Duration::from_secs(2), ONE, DISPLAY), [Out::Pointer(abs(300, 300))]);
         // Losing the focus mid-drag ends it the same way.
         input.event(&press, t1 + Duration::from_secs(1), ONE, DISPLAY);
         input.captured(true);

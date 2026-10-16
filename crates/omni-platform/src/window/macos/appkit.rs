@@ -1033,12 +1033,43 @@ const RGBX: u32 = 5;
 /// new contents over a quarter of a second otherwise.
 ///
 /// A window already closed (a `Presenter` outliving it) takes nothing and answers `Ok`.
+/// The sublayer the window's frames are shown in, made at the first present.
+fn image_layer(native: &Native) -> Option<&Retained<CALayer>> {
+    let backing = native.view.layer()?;
+    Some(native.image_layer.get_or_init(|| {
+        let layer = CALayer::new();
+        layer.setFrame(backing.bounds());
+        layer.setAutoresizingMask(CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable);
+        layer.setOpaque(true);
+        backing.addSublayer(&layer);
+        layer
+    }))
+}
+
+/// **A frame in an `IOSurface`** (`surface.rs`) becomes the sublayer's contents, stretched as
+/// `present_rgba`'s image is; the layer retains the surface.
+pub(super) fn present_surface(id: u64, surface: *mut core::ffi::c_void) -> WindowResult<()> {
+    with_live(id, |native| {
+        let Some(layer) = image_layer(native) else {
+            return Err(WindowError::AppKit { operation: "present_surface", api: "-[NSView layer]", detail: "the view has no layer to show the image in".to_owned() });
+        };
+        CATransaction::begin();
+        CATransaction::setDisableActions(true);
+        // SAFETY: an `IOSurfaceRef` is a Core Foundation object, toll-free an Objective-C one,
+        // which `contents` takes (and retains); the caller keeps its own reference.
+        unsafe { layer.setContents(Some(&*surface.cast::<AnyObject>())) };
+        CATransaction::commit();
+        Ok(())
+    })
+    .unwrap_or(Ok(()))
+}
+
 pub(super) fn present_rgba(id: u64, rgba: &[u8], width: u32, height: u32) -> WindowResult<()> {
     let failed = |api: &'static str, detail: &str| WindowError::AppKit { operation: "present_rgba", api, detail: detail.to_owned() };
     with_live(id, |native| {
-        let Some(backing) = native.view.layer() else {
+        if native.view.layer().is_none() {
             return Err(failed("-[NSView layer]", "the view has no layer to show the image in"));
-        };
+        }
         let (w, h) = (width as usize, height as usize);
         // SAFETY: `rgba` holds `w * h * 4` bytes (the seam checked), which `CFDataCreate` copies;
         // every object created is released below once the image holds what it needs.
@@ -1058,14 +1089,7 @@ pub(super) fn present_rgba(id: u64, rgba: &[u8], width: u32, height: u32) -> Win
         if image.is_null() {
             return Err(failed("CGImageCreate", "the image was refused"));
         }
-        let layer = native.image_layer.get_or_init(|| {
-            let layer = CALayer::new();
-            layer.setFrame(backing.bounds());
-            layer.setAutoresizingMask(CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable);
-            layer.setOpaque(true);
-            backing.addSublayer(&layer);
-            layer
-        });
+        let layer = image_layer(native).expect("the view has a layer (looked at above)");
         CATransaction::begin();
         CATransaction::setDisableActions(true);
         // SAFETY: a `CGImageRef` is a Core Foundation object, toll-free an Objective-C one, which

@@ -123,6 +123,9 @@ use crate::vm::OsError;
 /// This backend is real.
 pub(super) const AVAILABLE: bool = true;
 
+/// No Windows host ignores the top byte.
+pub(super) const REPORTS_UNTAGGED_ADDRESSES: bool = false;
+
 /// `EXCEPTION_RECORD::ExceptionInformation[0]` for an access violation, as documented: 0 read,
 /// 1 write, 8 data-execution-prevention. Any other value is a shape we have not seen and is
 /// declined rather than guessed at.

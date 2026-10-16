@@ -100,10 +100,46 @@ impl Split {
         }
     }
 
+    /// [`host_protection`](Self::host_protection), **lenient toward read-only parts beside a
+    /// writable one** ([`lenient_read_only`]): on a host page that has a writable part, a
+    /// `ReadExecute` part -- and a `Read` part that `sealed(i)` says is a library's sealed RELRO --
+    /// does not forbid writes. The guest's own view keeps every part's protection; what changes is
+    /// that a write to such a part, which a correct program never makes (code and RELRO are
+    /// `mprotect`ed writable before they are written), is not refused -- while every access to the
+    /// page's writable part stops trapping. A plain read-only part (a heap page a collector
+    /// protects to catch writes) stays enforced. MEASURED (M4, 2026-10-16, `OMNI_SPLIT_REPORT`):
+    /// Adobe AIR's JIT (Super Mechs) put code (`rx`) and data (`rw`) in one 16 KiB host page and its
+    /// writes trapped ~10,800 times a second; libc's `.data` beside its RELRO (`r r r rw`) ~600 a
+    /// second in each system process -- each trap a host fault and three Mach exceptions.
+    pub(crate) fn host_protection_lenient(&self, strict_none: bool, sealed: impl Fn(usize) -> bool) -> Protection {
+        if !self.parts.iter().any(|p| matches!(p, Part::Mapped(q) if q.is_writable())) {
+            return self.host_protection(strict_none);
+        }
+        let relaxed = Split {
+            parts: self
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| match *p {
+                    Part::Mapped(Protection::ReadExecute) => Part::Mapped(Protection::ReadWrite),
+                    Part::Mapped(Protection::Read) if sealed(i) => Part::Mapped(Protection::ReadWrite),
+                    q => q,
+                })
+                .collect(),
+        };
+        relaxed.host_protection(strict_none)
+    }
+
     /// Whether some `Mapped` part allows an access the host protection refuses: the page traps,
     /// and a served access needs its alias.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn traps(&self, strict_none: bool) -> bool {
-        let host = bits(self.host_protection(strict_none));
+        self.traps_under(self.host_protection(strict_none))
+    }
+
+    /// Whether some `Mapped` part allows an access host protection `host` refuses.
+    pub(crate) fn traps_under(&self, host: Protection) -> bool {
+        let host = bits(host);
         self.parts.iter().any(|part| match *part {
             Part::Mapped(p) => {
                 let (r, w) = bits(p);
@@ -164,6 +200,10 @@ pub(crate) struct SubPages {
     pub(crate) aliased: BTreeSet<usize>,
     /// Guest ranges whose unmapped and PROT_NONE parts must fault (`[start, end)`).
     pub(crate) strict: Vec<(usize, usize)>,
+    /// Guest ranges a library's RELRO was sealed read-only over (`[start, end)`): their read-only
+    /// parts beside a writable part are lenient ([`Split::host_protection_lenient`]). Forgotten
+    /// where they are unmapped or mapped over.
+    pub(crate) sealed: Vec<(usize, usize)>,
     /// Accesses served, by host page.
     pub(crate) served: HashMap<usize, u64>,
 }
@@ -173,7 +213,7 @@ impl SubPagesHandle {
         Self {
             count: AtomicUsize::new(0),
             aliases: RwLock::new(HashMap::new()),
-            state: Mutex::new(SubPages { parts_per_page, split: BTreeMap::new(), aliased: BTreeSet::new(), strict: Vec::new(), served: HashMap::new() }),
+            state: Mutex::new(SubPages { parts_per_page, split: BTreeMap::new(), aliased: BTreeSet::new(), strict: Vec::new(), sealed: Vec::new(), served: HashMap::new() }),
             served_total: AtomicU64::new(0),
         }
     }
@@ -232,6 +272,13 @@ impl SubPagesHandle {
     }
 }
 
+/// `OMNI_SUBPAGE_LENIENT_RO=0`: read-execute parts and sealed RELRO beside a writable part forbid
+/// writes on their host page as before ([`Split::host_protection_lenient`]); on by default.
+pub(crate) fn lenient_read_only() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_SUBPAGE_LENIENT_RO").as_deref() != Ok("0"))
+}
+
 /// `OMNI_STRICT_PROT_NONE=1`: every PROT_NONE 4 KiB part is enforced, even beside accessible parts
 /// of its host page (each access to those then traps). Off by default; per range, see
 /// `GuestSpace::set_strict_gaps`.
@@ -272,6 +319,27 @@ mod tests {
         assert!(split(&[Part::Mapped(Read), Part::StrictHole]).traps(true));
         // Execute alone never traps: guest code is fetched in software.
         assert!(!split(&[Part::Mapped(Read), Part::Mapped(ReadExecute)]).traps(true));
+    }
+
+    /// Beside a writable part, read-only and read-execute parts do not forbid writes on the host,
+    /// and the page stops trapping; without a writable part nothing is relaxed.
+    #[test]
+    fn read_only_parts_beside_a_writable_one_are_lenient() {
+        let none = |_| false;
+        let jit = split(&[Part::Mapped(ReadExecute), Part::Mapped(ReadExecute), Part::Mapped(ReadExecute), Part::Mapped(ReadWrite)]);
+        assert_eq!(jit.host_protection(false), Read);
+        assert!(jit.traps(false), "strictly, the data part's writes trap");
+        assert_eq!(jit.host_protection_lenient(false, none), ReadWrite);
+        assert!(!jit.traps_under(jit.host_protection_lenient(false, none)), "leniently, nothing traps");
+        let relro = split(&[Part::Mapped(Read), Part::Mapped(Read), Part::Mapped(Read), Part::Mapped(ReadWrite)]);
+        assert_eq!(relro.host_protection_lenient(false, none), Read, "a read-only part not sealed RELRO is enforced");
+        assert_eq!(relro.host_protection_lenient(false, |i| i < 3), ReadWrite, "sealed RELRO is lenient");
+        assert_eq!(relro.host_protection_lenient(false, |i| i < 2), Read, "one part not sealed: enforced");
+        let text = split(&[Part::Mapped(ReadExecute), Part::Mapped(Read)]);
+        assert_eq!(text.host_protection_lenient(false, |_| true), Read, "no writable part: nothing relaxed");
+        let guarded = split(&[Part::Mapped(ReadExecute), Part::Mapped(Protection::None), Part::Mapped(ReadWrite)]);
+        assert_eq!(guarded.host_protection_lenient(true, none), Protection::None, "a strict PROT_NONE part still counts");
+        assert_eq!(guarded.host_protection_lenient(false, none), ReadWrite);
     }
 
     #[test]

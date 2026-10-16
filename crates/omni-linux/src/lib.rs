@@ -8,6 +8,7 @@ pub mod alloc_trace;
 pub mod apex;
 pub mod app_session;
 pub mod binder;
+pub(crate) mod oslock;
 pub mod boot_image;
 pub mod browser;
 pub mod clipboard;

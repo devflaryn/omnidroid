@@ -1045,10 +1045,37 @@ impl Presenter {
         {
             self.inner.present_bgra(bgra, width, height)
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.present_bgra(&bgra[..needed], width, height)
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
         {
             let rgba: Vec<u8> = bgra[..needed].chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect();
             self.inner.present_rgba(&rgba, width, height)
+        }
+    }
+
+    /// **A frame written straight into the window**: `fill` gets the window's next image -- `height`
+    /// rows of `width` **BGRA** pixels, `stride` bytes apart -- and writes every pixel (alpha is
+    /// ignored); the window then shows it, stretched as [`present_rgba`](Self::present_rgba)'s. One
+    /// pass instead of a frame made and then copied in. `Ok(false)`: not on this host (macOS only:
+    /// an `IOSurface`), or no image could be had -- the caller presents another way; nothing was
+    /// called.
+    ///
+    /// # Errors
+    ///
+    /// As [`Window::present_rgba`].
+    pub fn present_rows(&self, width: u32, height: u32, fill: &mut dyn FnMut(&mut [u8], usize)) -> WindowResult<bool> {
+        validate_extent(width, height, "present_rows")?;
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.present_rows(width, height, fill)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = fill;
+            Ok(false)
         }
     }
 

@@ -1020,6 +1020,21 @@ extern "C" {
     /// `jit` must be live and `out` a valid, writable `OdStats`.
     pub fn od_jit_stats(jit: *mut c_void, out: *mut OdStats);
 
+    /// arm64 (vendored patch 0102): the bytes of translated code the jit's own cache holds now,
+    /// and has emitted in all; from any thread. 0 and 0 elsewhere.
+    ///
+    /// # Safety
+    /// `jit` must be live and both pointers writable.
+    pub fn od_jit_code_bytes(jit: *mut c_void, in_use: *mut u64, emitted: *mut u64);
+
+    /// arm64 (vendored patch 0104): from any thread, if the jit's thread has been inside an `SVC`
+    /// callback for at least `parked_at_least_ns`, give back its cache's translated code (cleared
+    /// when it next runs). The bytes given back.
+    ///
+    /// # Safety
+    /// `jit` must be live.
+    pub fn od_jit_discard_parked(jit: *mut c_void, parked_at_least_ns: u64) -> u64;
+
     /// Zero the callback-entry counters, so a specific loop can be measured.
     ///
     /// # Safety
@@ -1113,6 +1128,15 @@ extern "C" {
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_tbi_unmasked(on: u32) -> u32;
+
+    /// Patch 0105 (arm64 only): non-zero leaves Top Byte Ignore's mask (56-bit mirrored fastmem)
+    /// to the host MMU in blocks emitted from now on -- no `ubfx` before a guest access. Only for a
+    /// host that ignores the top byte of a user data address and whose fault handler clears the
+    /// tag of a reported fault address. Returns the value in force (1 or 0); 0 and a no-op on x64.
+    ///
+    /// # Safety
+    /// None beyond an ordinary FFI call: it stores one process-wide atomic.
+    pub fn od_set_fastmem_host_tbi(on: u32) -> u32;
 
     /// Patch 0041 (x64 only): guest instructions (by location) that met a tagged address while
     /// Top Byte Ignore's mask was off, and are emitted masked since, in this process. 0 on arm64.

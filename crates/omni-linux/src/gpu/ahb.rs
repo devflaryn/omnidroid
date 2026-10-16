@@ -5,7 +5,8 @@
 //! The host GPU cannot use the buffer's `shm` region itself, so the image is **linear and
 //! host-visible**, a mirror of the region's pixels (D3a design, "Gralloc buffers on the host GPU"):
 //! before a submit, a region whose content generation moved is copied in; after a submit, the
-//! host waits for the queue and copies every GPU-writable mirror out, bumping the generation.
+//! host waits for the queue and copies every GPU-writable mirror out, bumping the generation -- but
+//! never an app's frame, which RenderEngine only samples ([`app_frame`]), nor over newer pixels.
 use std::ffi::CStr;
 use std::sync::Arc;
 
@@ -194,7 +195,7 @@ pub(crate) fn import(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: 
             return Err(CallError::Args);
         }
         let _ = img.format;
-        (img.extent.height, img.writable)
+        (img.extent.height, img.writable && !app_frame(&shm))
     };
     let d = vk::Device::from_raw(device);
     let mut req = vk::MemoryRequirements::default();
@@ -266,8 +267,41 @@ fn upload(m: &mut AhbMemory) {
     m.generation = now;
 }
 
-/// Copy the mirror's pixels out into the region, and bump its generation.
+/// Whether the buffer is an app's frame: one of a BLAST BufferQueue's buffers, which gralloc names
+/// for its window (`VRI[<title>]#<n>(BLAST Consumer)<n>`, `SurfaceView[...](BLAST Consumer)<n>`).
+/// Its producer writes it (through its swapchain's releases, `native::release`); SurfaceFlinger's
+/// RenderEngine, which imports it here, only samples it -- although ANGLE makes every imported
+/// image a colour attachment, so its usage alone says writable.
+///
+/// Such a mirror is never copied back. When it was, every RenderEngine submit wrote each app
+/// frame's mirror -- what the buffer held when RenderEngine last sampled it -- over the region,
+/// after the app's newer frame had landed or while it landed, and bumped the generation past it:
+/// the composer, and RenderEngine's next upload, then took a frame from a turn of the buffer queue
+/// before. Seen 2026-10-16 on macOS as frames going back and forth: Talking Tom Camp (an RGB_565
+/// layer, so composed by SurfaceFlinger every frame) and, beside it, Super Mechs, whose buffers
+/// RenderEngine had sampled for a few frames once (their generations rose by 4 a turn, not 1).
+fn app_frame(shm: &Shm) -> bool {
+    let mut name = [0u8; 128];
+    if shm.read_at(&mut name, crate::hal::gralloc::NAME_AT).is_err() {
+        return false;
+    }
+    let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+    name.windows(16).any(|w| w == b"(BLAST Consumer)")
+}
+
+/// Copy the mirror's pixels out into the region, and bump its generation -- unless the region moved
+/// on since the mirror last matched it (another writer's newer frame, which the mirror's older
+/// pixels must not cover), or a copy into it is on its way.
 fn download(m: &mut AhbMemory) {
+    let pending = {
+        let mut g = [0u8; 8];
+        let _ = m.shm.read_at(&mut g, super::native::PENDING_GENERATION_AT);
+        u64::from_le_bytes(g)
+    };
+    let now = generation(&m.shm);
+    if now != m.generation || pending > now {
+        return;
+    }
     for y in 0..u64::from(m.height) {
         // SAFETY: as in `upload`.
         let row = unsafe { std::slice::from_raw_parts((m.mapped + (y * m.row_pitch) as usize) as *const u8, m.row_bytes as usize) };
@@ -311,4 +345,80 @@ pub(crate) fn forget_memory(gpu: &Gpu, memory: u64) {
 pub(crate) fn forget_device(gpu: &Gpu, device: u64) {
     gpu.ahb_memory.lock().retain(|_, m| m.device != device);
     gpu.ahb_images.lock().retain(|_, i| i.device != device);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::native::PENDING_GENERATION_AT;
+    use crate::hal::gralloc::{NAME_AT, PIXELS_AT};
+
+    /// A 4x2 RGBA region named `name`, at content generation `generation`, every byte 0x11.
+    fn region(name: &str, generation: u64) -> Arc<Shm> {
+        let shm = Shm::create("ahb_test").expect("region");
+        shm.set_len(PIXELS_AT + 4 * 2 * 4).expect("size");
+        let mut n = name.as_bytes().to_vec();
+        n.push(0);
+        shm.write_at(&n, NAME_AT).expect("name");
+        shm.write_at(&generation.to_le_bytes(), CONTENT_GENERATION_AT).expect("generation");
+        shm.write_at(&generation.to_le_bytes(), PENDING_GENERATION_AT).expect("generation");
+        shm.write_at(&[0x11; 32], PIXELS_AT).expect("pixels");
+        shm
+    }
+
+    /// A mirror of `shm` holding generation `generation`, its pixels `mirror` (every byte 0x22).
+    fn mirror(shm: &Arc<Shm>, mirror: &mut [u8; 32], generation: u64) -> AhbMemory {
+        AhbMemory {
+            device: 1,
+            image: 1,
+            mapped: mirror.as_mut_ptr() as usize,
+            row_pitch: 16,
+            row_bytes: 16,
+            height: 2,
+            shm: Arc::clone(shm),
+            stride_bytes: 16,
+            pixels_at: PIXELS_AT,
+            generation,
+            writable: true,
+        }
+    }
+
+    fn pixels(shm: &Shm) -> [u8; 32] {
+        let mut p = [0u8; 32];
+        shm.read_at(&mut p, PIXELS_AT).expect("pixels");
+        p
+    }
+
+    #[test]
+    fn an_apps_buffer_queue_frame_is_one_renderengine_only_samples() {
+        for name in ["VRI[MainActivity]#0(BLAST Consumer)0", "SurfaceView[com.outfit7.talkingtomcamp/com.outfit7.talkingtomcamp.MainActivity]#1(BLAST Consumer)1"] {
+            assert!(app_frame(&region(name, 1)), "{name}");
+        }
+        for name in ["FramebufferSurface", "ScreenCapture", ""] {
+            assert!(!app_frame(&region(name, 1)), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_mirror_goes_back_only_over_the_pixels_it_was_made_from() {
+        // In step with the region: the GPU's pixels go out, and the generation moves on.
+        let shm = region("FramebufferSurface", 5);
+        let mut px = [0x22u8; 32];
+        let mut m = mirror(&shm, &mut px, 5);
+        download(&mut m);
+        assert_eq!((pixels(&shm), generation(&shm), m.generation), ([0x22; 32], 6, 6));
+
+        // The region holds a newer frame (another writer's): the mirror's older pixels stay out.
+        let shm = region("FramebufferSurface", 7);
+        let mut m = mirror(&shm, &mut px, 5);
+        download(&mut m);
+        assert_eq!((pixels(&shm), generation(&shm)), ([0x11; 32], 7));
+
+        // A copy into the region is on its way: not covered either.
+        let shm = region("FramebufferSurface", 5);
+        shm.write_at(&6u64.to_le_bytes(), PENDING_GENERATION_AT).expect("pending");
+        let mut m = mirror(&shm, &mut px, 5);
+        download(&mut m);
+        assert_eq!((pixels(&shm), generation(&shm)), ([0x11; 32], 5));
+    }
 }

@@ -63,8 +63,9 @@ const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 const APP_USAGE: &str = "\
 usage: omnidroid                    open the omnidroid app: warm Androids, any APK run on them
        omnidroid <app.apk> [xN]     open it and launch N instances of that APK
+       omnidroid <app.apk> [xN] --cookie <c> --place <id>   ... with a plugin's options (`roblox`)
 
-In the app: run <apk> [xN], close <#id>, warm, kill <D#>, shell, plugins, settings, mcp, help.
+In the app: run <apk> [xN] [plugin options], close <#id>, warm, kill <D#>, shell, plugins, settings, mcp, help.
 Coding agents drive it through its MCP server (`mcp on` in the app, then `mcp status`).
 Its settings: <app-data>/../app.conf (OMNI_APP_CONFIG). The one-shot commands scripts use: `omnidroid help commands`.";
 
@@ -199,17 +200,15 @@ fn with_hint(message: String) -> String {
     }
 }
 
-/// The app's first launch from its arguments: `<apk> [xN | N]`.
-fn app_launch(rest: &[String]) -> Result<Option<(PathBuf, u32)>, String> {
-    match rest {
-        [] => Ok(None),
-        [apk] => Ok(Some((PathBuf::from(apk), 1))),
-        [apk, n] => {
-            let count = n.trim_start_matches(['x', 'X']).parse::<u32>().ok().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("not a count of 1 to 64: {n}"))?;
-            Ok(Some((PathBuf::from(apk), count)))
-        }
-        _ => Err("omnidroid [<app.apk> [xN]]".into()),
-    }
+/// The app's first launch from its arguments: `<apk> [xN | N] [plugin options]`.
+fn app_launch(rest: &[String]) -> Result<Option<(PathBuf, u32, Vec<String>)>, String> {
+    let Some((apk, after)) = rest.split_first() else { return Ok(None) };
+    let (count, options) = app::plugged::split_count(after);
+    let count = match count {
+        None => 1,
+        Some(n) => n.trim_start_matches(['x', 'X']).parse::<u32>().ok().filter(|n| (1..=64).contains(n)).ok_or_else(|| format!("not a count of 1 to 64: {n}"))?,
+    };
+    Ok(Some((PathBuf::from(apk), count, options)))
 }
 
 fn main() -> ExitCode {
@@ -230,6 +229,10 @@ fn main() -> ExitCode {
             }
         };
         return app::serve(port);
+    }
+    // The pool every window shares, started by the first one (`app::host`).
+    if command.as_deref() == Some("host") {
+        return app::host::run(app::host::Mode::Windows);
     }
     if command.as_deref() == Some("app") {
         return match app_launch(&rest) {
@@ -779,6 +782,13 @@ fn aosp_work_dir(tmpdir_named: bool, temp_is_tmpfs: bool, app_data: Option<&Path
 }
 
 /// Whether `dir` is mounted as a tmpfs (`/proc/mounts`; false where there is none).
+/// The host process an `omni-shm-<pid>-<n>` (or `omni-shm-probe-<pid>`) file is a region of.
+fn shm_owner(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("omni-shm-")?;
+    let rest = rest.strip_prefix("probe-").unwrap_or(rest);
+    rest.split('-').next()?.parse().ok()
+}
+
 fn is_tmpfs(dir: &Path) -> bool {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return false };
     let dir = dir.to_string_lossy();
@@ -890,11 +900,15 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
     if !options.fresh_device {
         run.env("OMNI_R_GOLDEN", session_dir.join("omni-golden"));
     }
-    // Graphics buffers a finished session handed between its processes (`omni-shm-*`).
+    // Graphics buffers a finished session handed between its processes (`omni-shm-*`): only those
+    // of processes gone -- the session dir is every device's, and a running device's are its own
+    // (removing them failed every app its Android started after: "failed to complete startup").
     for dir in [session_dir.clone(), PathBuf::from("/dev/shm")] {
         if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("omni-shm-")) {
-                let _ = std::fs::remove_file(e.path());
+            for e in entries.flatten() {
+                if shm_owner(&e.file_name().to_string_lossy()).is_some_and(|pid| !omni_platform::process::is_alive(pid)) {
+                    let _ = std::fs::remove_file(e.path());
+                }
             }
         }
     }
@@ -917,6 +931,15 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_memory_file_names_the_process_it_is_of() {
+        assert_eq!(shm_owner("omni-shm-78932-17"), Some(78932));
+        assert_eq!(shm_owner("omni-shm-78932-17-1791910224000000000"), Some(78932));
+        assert_eq!(shm_owner("omni-shm-probe-412"), Some(412));
+        assert_eq!(shm_owner("omni-shm-stale-test-9"), None);
+        assert_eq!(shm_owner("omni-crossing-9-1"), None);
+    }
 
     #[test]
     fn parse_aosp_reads_root_and_modules() {
@@ -977,7 +1000,11 @@ mod tests {
         assert_eq!(rest, ["--apk", "a.apk", "--minutes", "1"]);
         let (command, rest) = split(&["/x/Some App.APK", "x3"]);
         assert_eq!((command.as_deref(), rest.as_slice()), (Some("app"), &["/x/Some App.APK".to_string(), "x3".into()][..]));
-        assert_eq!(app_launch(&rest), Ok(Some((PathBuf::from("/x/Some App.APK"), 3))));
+        assert_eq!(app_launch(&rest), Ok(Some((PathBuf::from("/x/Some App.APK"), 3, vec![]))));
+        let with = ["r.apk", "x2", "--cookie", "farm4", "--place", "1"].map(String::from);
+        assert_eq!(app_launch(&with), Ok(Some((PathBuf::from("r.apk"), 2, with[2..].to_vec()))));
+        let bare = ["r.apk", "--place", "1"].map(String::from);
+        assert_eq!(app_launch(&bare), Ok(Some((PathBuf::from("r.apk"), 1, bare[1..].to_vec()))));
         assert_eq!(split(&[]).0.as_deref(), Some("app"), "nothing opens the app");
         assert!(app_launch(&["a.apk".into(), "x0".into()]).is_err());
         let o = parse_aosp(["/x/Some App.APK".to_string(), "--minutes".into(), "5".into()].into_iter()).expect("a bare APK path is --apk");

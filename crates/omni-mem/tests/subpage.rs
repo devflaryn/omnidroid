@@ -66,6 +66,39 @@ fn two_parts_of_one_host_page_keep_two_protections() {
     assert!(s.is_trapping(at), "a read-write part under a read-only host page traps");
 }
 
+/// Code beside data in one host page (a JIT's): the read-execute part does not forbid writes on the
+/// host, so the data part's writes do not trap; the guest still sees each part's protection.
+#[test]
+fn code_beside_data_does_not_trap() {
+    if !overlay_expected() {
+        return;
+    }
+    let (s, at) = one_page();
+    s.protect(at, GUEST_PAGE, Protection::ReadExecute).unwrap();
+    assert_eq!(s.region_at(at).unwrap().protection, Protection::ReadExecute);
+    assert_eq!(s.region_at(at + GUEST_PAGE).unwrap().protection, Protection::ReadWrite);
+    assert!(!s.is_trapping(at + GUEST_PAGE), "the data part is written without a trap");
+}
+
+/// A library's RELRO sealed read-only beside its `.data`: once said sealed, its host page does not
+/// trap; an unsealed read-only part does (above); and an unmap forgets the seal.
+#[test]
+fn sealed_relro_beside_data_does_not_trap_and_an_unmap_forgets_it() {
+    if !overlay_expected() {
+        return;
+    }
+    let (s, at) = one_page();
+    s.set_sealed_read_only(at, GUEST_PAGE);
+    s.protect(at, GUEST_PAGE, Protection::Read).unwrap();
+    assert_eq!(s.region_at(at).unwrap().protection, Protection::Read, "the guest sees it read-only");
+    assert!(!s.is_trapping(at + GUEST_PAGE), "the data part is written without a trap");
+    s.unmap(at, host_page()).unwrap();
+    let again = s.map_anonymous(Placement::Fixed(at), host_page(), Protection::ReadWrite, CommitPolicy::Eager).unwrap();
+    assert_eq!(again, at);
+    s.protect(at, GUEST_PAGE, Protection::Read).unwrap();
+    assert!(s.is_trapping(at), "a new mapping there is not sealed");
+}
+
 #[test]
 fn a_page_made_uniform_again_leaves_the_overlay() {
     if !overlay_expected() {

@@ -26,6 +26,9 @@ use super::{FaultError, FaultHandler, FaultRegistration, FaultResult, FaultStats
 /// This backend is structural.
 pub(super) const AVAILABLE: bool = false;
 
+/// Nothing reaches a handler.
+pub(super) const REPORTS_UNTAGGED_ADDRESSES: bool = false;
+
 /// The platform this backend was compiled for, for error messages.
 fn platform() -> &'static str {
     if cfg!(target_os = "linux") {

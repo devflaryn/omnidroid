@@ -86,6 +86,10 @@ dynarmic/
                and ../patches/0099-x64-a-snapshot-past-its-cap-keeps-its-oldest-regions.patch
                and ../patches/0100-x64-describe-code-address.patch
                and ../patches/0101-x64-a-forgotten-loop-s-head-read-after-its-links.patch
+               and ../patches/0102-arm64-a-clear-gives-back-the-code-memory.patch
+               and ../patches/0103-arm64-a-register-allocator-without-searches.patch
+               and ../patches/0104-arm64-a-parked-thread-s-code-given-back.patch
+               and ../patches/0105-arm64-top-byte-ignore-left-to-the-host.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

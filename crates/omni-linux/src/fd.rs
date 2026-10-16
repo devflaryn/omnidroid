@@ -512,8 +512,15 @@ fn write_file(file: &OpenFile, bytes: &[u8]) -> Result<usize, Errno> {
         FileKind::Host { file, sysroot: false, .. } => file.write(bytes).map_err(|_| EIO),
         FileKind::Host { .. } | FileKind::Stdin => Err(EBADF),
         FileKind::Dev(DevNode::Kmsg) => {
-            // One record per write, "<level>tag: message", shown as the kernel log would be.
-            eprintln!("K/{}", String::from_utf8_lossy(bytes).trim_end());
+            // One record per write, "<level>tag: message", shown as the kernel log would be --
+            // but libselinux's "Unknown class service_manager" only once: servicemanager writes it
+            // for every service looked up (the image's policy classes are not served here), ~7 a
+            // second while games run, most of what was left of the device's log (2026-10-16).
+            static UNKNOWN_CLASS_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let unknown_class = bytes.windows(24).any(|w| w == b"Unknown class service_ma");
+            if !unknown_class || !UNKNOWN_CLASS_SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("K/{}{}", String::from_utf8_lossy(bytes).trim_end(), if unknown_class { " (said once)" } else { "" });
+            }
             Ok(bytes.len())
         }
         FileKind::Dev(_) => Ok(bytes.len()),

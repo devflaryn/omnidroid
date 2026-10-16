@@ -454,6 +454,8 @@ pub fn take_args(plugins: &[&Plugin], command: &str, args: Vec<String>) -> Resul
 pub struct Session {
     pub env: Vec<(String, Option<String>)>,
     pub data_dir: Option<PathBuf>,
+    /// What the hooks said (`say`), as `[<plugin>] <text>`: printed too.
+    pub said: Vec<String>,
 }
 
 impl Session {
@@ -518,7 +520,10 @@ fn read_directives(plugin: &str, out: &str, session: &mut Session) -> Result<(),
             }
             "unset" if !rest.is_empty() => session.env.push((rest.to_string(), None)),
             "data-dir" if !rest.is_empty() => session.data_dir = Some(PathBuf::from(rest)),
-            "say" => println!("Omnidroid [{plugin}]: {rest}"),
+            "say" => {
+                println!("Omnidroid [{plugin}]: {rest}");
+                session.said.push(format!("[{plugin}] {rest}"));
+            }
             "error" => return Err(format!("[{plugin}] {rest}")),
             _ => println!("{line}"),
         }

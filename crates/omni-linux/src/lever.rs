@@ -20,6 +20,10 @@
 //!   constant rather than a `shl`/`shr` pair (patch 0040, `omni_cpu::dynarmic::
 //!   set_fastmem_mask_by_and`; the same address), then every process's translations are dropped.
 //!   Off by default; `OMNI_JIT_TBI_AND=1` from the start.
+//! - `jit_hosttbi=0|1`: Top Byte Ignore's mask left to the host MMU (patch 0105, arm64 hosts that
+//!   ignore the top byte and whose fault layer reports the untagged address: macOS on Apple
+//!   silicon; `crate::process::set_host_tbi`): no `ubfx` before a guest access. On by default where
+//!   available; `OMNI_JIT_HOST_TBI=0` from the start. Every process's translations are dropped.
 //! - `jit_compact=0|1|2|3`: smaller translated code (patch 0061, `omni_cpu::dynarmic::
 //!   set_compact_code`), bits: `1` one shared memory-abort check behind every fastmem site (-21%
 //!   bytes a block on `libc.so`, speed unchanged in the bench), `2` links that leave through their
@@ -56,6 +60,14 @@
 //! - `compose_zero=0|1`: the composer's layers read where they are in their gralloc regions and
 //!   composed straight into the framebuffer's next frame, by the run path
 //!   (`crate::hal::compose::ZERO`): two to three fewer 5.6 MB copies a frame. Off by default.
+//! - `relayout_dedupe=0|1`: a window relayout that repeats the last one in all but its sequence
+//!   number is completed and not delivered (`crate::binder::RELAYOUT_DEDUPE`). On by default.
+//! - `present_rows=0|1`: a frame of one opaque layer written by the composer straight into the
+//!   display window's image (`crate::hal::composer::PRESENT_ROWS`, macOS). On by default.
+//! - `present_over_black=0|1`: a full-display premultiplied layer over black solid colours only
+//!   (SurfaceFlinger's "Background for SurfaceView") presented as that layer's copy made opaque --
+//!   the same bytes composition makes -- by the single-layer path
+//!   (`crate::hal::composer::PRESENT_OVER_BLACK`). On by default.
 //! - `present_bgra=0|1`: the frame composed as BGRA, and the Win32 window takes it shared rather
 //!   than swizzling a copy (`crate::hal::compose::BGRA_OUT`). Off by default.
 //! - `present_gpu=0|1`: the display window presented through a Vulkan swapchain (a copy into
@@ -102,6 +114,10 @@
 //! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
 //!   (1, the default) rather than over the app thread's connection (0; `OMNI_REMOTE_DIRECT=0`)
 //!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
+//! - `remote_carry=0|1`: an app's binder ioctl carries the memory the driver will read of it and
+//!   takes the driver's writes back with its result (1; `OMNI_REMOTE_CARRY=1`) rather than
+//!   answering each read and write over its connection (0, the default) (`crate::remote::CARRY`,
+//!   chosen on the app's side; `OMNI_REMOTE_STATS` counts what was carried).
 //! - `binder_host_pool=0|1`: a host service's binder calls run on kept, reused threads (1) or on a
 //!   new thread each (0, the default; `OMNI_BINDER_HOST_POOL`) (`crate::binder::HOST_POOL`).
 //!
@@ -259,6 +275,19 @@ pub fn apply(line: &str) -> Option<String> {
                 omni_cpu::dynarmic::tagged_accesses()
             ))
         }
+        "jit_hosttbi" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            let kept = crate::process::set_host_tbi(on);
+            let live = crate::process::all_live();
+            for p in &live {
+                p.trim_code();
+            }
+            Some(format!("jit_hosttbi={}: {} processes' translations dropped", u8::from(kept), live.len()))
+        }
         "jit_tbiand" => {
             let on = match value.trim() {
                 "1" => true,
@@ -304,6 +333,33 @@ pub fn apply(line: &str) -> Option<String> {
             let lever = if name.trim() == "compose_zero" { &crate::hal::compose::ZERO } else { &crate::hal::compose::BGRA_OUT };
             lever.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("{}={}", name.trim(), u8::from(on)))
+        }
+        "relayout_dedupe" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::binder::RELAYOUT_DEDUPE.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("relayout_dedupe={}", u8::from(on)))
+        }
+        "present_rows" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::composer::PRESENT_ROWS.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("present_rows={}", u8::from(on)))
+        }
+        "present_over_black" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::hal::composer::PRESENT_OVER_BLACK.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("present_over_black={}", u8::from(on)))
         }
         "vsync_hz" => {
             let hz: u32 = value.trim().parse().ok()?;
@@ -355,6 +411,15 @@ pub fn apply(line: &str) -> Option<String> {
             };
             crate::remote::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("remote_direct={}: apps' memory {}", u8::from(on), if on { "read and written directly, the connection where that cannot be" } else { "asked for over each thread's connection" }))
+        }
+        "remote_carry" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::remote::CARRY.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("remote_carry={}", u8::from(on)))
         }
         "poll_keyed" => {
             let on = match value.trim() {
@@ -585,6 +650,11 @@ pub fn start() {
         let on = v.trim() != "0";
         crate::remote::DIRECT.store(on, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[lever] OMNI_REMOTE_DIRECT: remote_direct={}", u8::from(on));
+    }
+    if let Ok(v) = std::env::var("OMNI_REMOTE_CARRY") {
+        let on = v.trim() != "0";
+        crate::remote::CARRY.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_REMOTE_CARRY: remote_carry={}", u8::from(on));
     }
     let Some(path) = std::env::var_os("OMNI_LEVER_FILE").map(PathBuf::from) else { return };
     let _ = std::thread::Builder::new().name("omni-lever".into()).spawn(move || {

@@ -40,3 +40,6 @@ crates/dynarmic-sys/vendor/dynarmic/src/dynarmic/backend/*/mig/
 # The AOSP sysroot (tools/make_sysroot.py): Google's image, not ours to redistribute
 /sysroot/
 .claude/
+
+# Generated report (not part of the record)
+/REPORT.pdf

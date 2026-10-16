@@ -31,6 +31,13 @@ inline std::atomic<std::uint64_t> invalidation_page_probes{0};
 /// jit in the process, for measurement (`od_invalidation_ranges_checked`).
 inline std::atomic<std::uint64_t> invalidation_ranges_checked{0};
 
+/// Omnidroid patch 0105: non-zero leaves Top Byte Ignore's mask (56 bits, mirrored) to the host MMU
+/// in blocks emitted from now on -- a host whose kernel enables TBI for user data accesses (macOS and
+/// Linux on arm64) reaches the untagged address through a tagged one by itself -- saving the `ubfx`
+/// before every guest access. The low window's test then ignores bits 56-63 too. The embedder owns
+/// the consequence: a fault through a tagged address reports it tagged (`od_set_fastmem_host_tbi`).
+inline std::atomic<std::uint32_t> live_fastmem_host_tbi{0};
+
 /// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
 /// the kernel and gives them straight back.
 ///
