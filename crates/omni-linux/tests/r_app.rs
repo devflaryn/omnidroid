@@ -246,7 +246,9 @@ fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool
     let idle = omni_linux::device::idle_apps_key_suffix();
     // `-kh`: a kiosk device with its own home (`omni_linux::device::KIOSK_HOME`) is another.
     let kh = omni_linux::device::kiosk_home_key_suffix(kiosk);
-    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}{kh}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    // `-ol`: a device whose image has no inert overlays (`omni_linux::device::INERT_OVERLAYS`).
+    let ol = omni_linux::device::overlays_key_suffix();
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}{kh}{ol}", stem(apk), if kiosk { "kiosk" } else { "ui" });
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
 }
 
@@ -716,7 +718,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key(), omni_linux::device::kiosk_home_key_suffix(kiosk))));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key(), omni_linux::device::kiosk_home_key_suffix(kiosk), omni_linux::device::overlays_key_suffix())));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");
@@ -779,14 +781,15 @@ fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
     // The unrooted key as it was before rooted devices existed (with the boot image's and the idle
     // apps' suffixes, which the switches' defaults add whatever the root).
     let (bootu, idle, kh) = (omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), omni_linux::device::kiosk_home_key_suffix(true));
-    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}{kh}")), "the unrooted key is unchanged");
+    let ol = omni_linux::device::overlays_key_suffix();
+    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}{kh}{ol}")), "the unrooted key is unchanged");
     let a = root_hash("root=1\nmodule=a\n", &[("a", "sha_a")], 29000, "bin");
     let b = root_hash("root=1\nmodule=a\nmodule=b\n", &[("a", "sha_a"), ("b", "sha_b")], 29000, "bin");
     let rooted = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&a));
     let rooted_b = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&b));
     assert_ne!(plain, rooted, "rooted differs from unrooted");
     assert_ne!(rooted, rooted_b, "the module set changes the key");
-    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}{kh}")));
+    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}{kh}{ol}")));
     assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
     // The denylist is part of the staged profile text, so it keys another saved/warm device.
     let profile = |deny: &[&str]| {
