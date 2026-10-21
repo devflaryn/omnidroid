@@ -540,16 +540,26 @@ fn main() -> ExitCode {
         }
     }
     for command in &then {
+        // `#after <name>=<value>` as a shell's first line: it starts once the property has that
+        // value, the host's own wait (`PropertyService::wait_for`, woken by the change) -- not a
+        // guest loop that runs getprop and sleeps a second, which saw `sys.boot_completed` up to a
+        // second late (0.5 s on average, every boot). `OMNI_THEN_AFTER=0`: the line is a comment.
+        let (after, command) = match command.strip_prefix("#after ").and_then(|rest| rest.split_once('\n')) {
+            Some((cond, rest)) if std::env::var("OMNI_THEN_AFTER").as_deref() != Ok("0") => {
+                (cond.trim().split_once('=').map(|(k, v)| (k.to_string(), v.to_string())), rest.to_string())
+            }
+            _ => (None, command.clone()),
+        };
         let config = SpawnConfig {
             sysroot: sysroot.clone(),
             instance_dir: instance.clone(),
-            argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.as_bytes().to_vec()],
+            argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.into_bytes()],
             envp: envp.iter().filter(|e| !e.starts_with(b"CLASSPATH=")).cloned().collect(),
             stdout: Output::Host,
             stderr: Output::Host,
             trace: false,
         };
-        match Process::spawn_as(config, 2000) {
+        let run = |config: SpawnConfig| match Process::spawn_as(config, 2000) {
             Ok(sh) => {
                 std::thread::spawn(move || {
                     let status = sh.run();
@@ -557,6 +567,16 @@ fn main() -> ExitCode {
                 });
             }
             Err(e) => eprintln!("[then] {e}"),
+        };
+        match after {
+            None => run(config),
+            Some((name, value)) => {
+                let props = omni_linux::props::PropertyService::global(p.vfs.sysroot());
+                std::thread::spawn(move || {
+                    props.wait_for(&name, &value, std::time::Duration::from_secs(20 * 60));
+                    run(config);
+                });
+            }
         }
     }
     if let Some(dir) = control {

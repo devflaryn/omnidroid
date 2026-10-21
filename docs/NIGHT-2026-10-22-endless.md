@@ -81,6 +81,37 @@ Side effect found: the owner's pool runs `cargo test` in this checkout, so it bu
 this branch's code (a `-md-kh` device appeared at 01:07; healthy, its home displayed, no crash).
 From s5 on the work moves to a worktree (`C:\oe`) and this checkout is back on `main`.
 
+## s5 -- system_server without the zygote's class preload (NOT KEPT, reverted)
+
+`OMNI_SYSTEM_PRELOAD=0` left `/system/etc/preloaded-classes` out of the system's host process too
+(apps' hosts already have none). Interleaved, same build:
+
+| | system_server entered | boot_completed (log) | warm ready | all hosts private | machine CPU to ready+60 s |
+|---|---|---|---|---|---|
+| preload (A1-A3) | ~5.0-5.1 s | 13.4 / 13.4 / 13.4 s | 13.7 s x3 | 1296.9 / 1291.9 / 1291.1 MB | 170.0 / 170.1 / 170.9 core-s |
+| none (B4-B6) | ~4.0-4.1 s | 13.4 / 13.4 / 13.4 s | 13.7 s x3 | 1292.7 / 1285.7 / 1293.4 MB | 164.5 / 171.5 / 169.3 core-s |
+
+system_server starts 1 s sooner and boots no sooner: the classes it uses are loaded later instead,
+and the home's start gates boot_completed. RAM and CPU inside the noise. Reverted.
+
+What it showed: boot_completed landed on the same 13.4 s every run, and warm ready on 13.7 s --
+the setup script polled `sys.boot_completed` with `sleep 1` (s6).
+
+## s6 -- the boot script started by the host's property wait (KEPT)
+
+The setup script's `until [ "$(getprop sys.boot_completed)" = 1 ]; do sleep 1; done` saw the boot
+up to a second late. A `--then` shell whose first line is `#after <name>=<value>` now starts once
+the property service (host side, woken by the change) has it; `BOOTED` begins with
+`#after sys.boot_completed=1` and keeps its loop for an older runner. `OMNI_THEN_AFTER=0` turns it
+off. Interleaved, same build:
+
+| | LOCKED_BOOT_COMPLETED | `[r] boot_completed` | warm ready |
+|---|---|---|---|
+| polled (A1-A3) | ~13.2 / 13.0 / 13.0 s | 13.5 / 13.4 / 13.5 s | 13.8 / 13.7 / 13.8 s |
+| host wait (B1-B3) | ~13.0 / 12.8 / 12.9 s | 13.2 / 13.1 / 13.2 s | 13.5 / 13.4 / 13.5 s |
+
+**-0.3 s to warm ready (3/3)**, and every later step of an app session's script with it.
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a

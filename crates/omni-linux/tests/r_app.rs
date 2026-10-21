@@ -191,8 +191,10 @@ fn resizable_script() -> &'static str {
     }
 }
 
-/// Until Android says it has booted (`sys.boot_completed`), at most 20 minutes.
-const BOOTED: &str = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
+/// Until Android says it has booted (`sys.boot_completed`), at most 20 minutes: the runner starts
+/// the shell once the property is set (`#after`, omni-linux-run's own wait); the loop is for a
+/// runner without it.
+const BOOTED: &str = "#after sys.boot_completed=1\ni=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
                       echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
 
 /// A new device's settings, as its owner would set them once: set up, the screen kept on, no
