@@ -1,0 +1,92 @@
+# Perf ledger -- 2026-10-22, branch `perf/endless-1022` (Windows, i7, RTX 4060)
+
+Owner's brief: keep finding ways to boot faster, use less RAM and CPU, be smaller and faster,
+until stopped. Rules as before (`perf-night-rules`): side branch only, `main` untouched; a change is
+kept when its measurement says so, each commit with its numbers.
+
+## Method
+
+- **Warm boot**: `tools/boot_bench.py --warm` (the saved warm device, timed to `[r] warm ready`
+  from the log's own clock).
+- **Steady state** (new, scratch `steady.ps1`): boot the saved warm device, wait 60 s past warm
+  ready, then sum the private bytes of every host process of the instance and their CPU over 30 s.
+- Builds go to `CARGO_TARGET_DIR=C:\odt` (`OMNIDROID_DYNARMIC_BUILD_DIR=C:\od-endless`): the
+  owner's pool was open the whole time and holds `target\release`. `omnidroid aosp` runs
+  `cargo test`, so a source edited during a bench is compiled into it (s2's first run) -- edits
+  only between benches.
+- The owner's own pool (one warm Android, idle) ran beside every measurement.
+
+## Baseline (main a08bf02a)
+
+| | warm ready (log) | from launch (wall) |
+|---|---|---|
+| saved warm device, 3 boots | 15.3 / 17.2 / 16.7 s | 16.4 / 19.0 / 18.0 s |
+| new warm device (make + save + boot) | 39.1 s quiet, then 15.2 s | 58.8 s |
+
+Where a saved boot's 15 s go (s1 log): init's boot commands to 2.1 s (apexd 0.46 s, bpfloader
+0.37 s, init_user0 0.26 s); zygote preloads 17,758 classes in 1.2 s; system_server from 5.2 s
+(StartServices 5.6 s: PackageManager 1.9 s of it, 170 packages from its cache in 1.1 s; app data
+1.5 s); first app at ~10.9 s; boot_completed 15.0 s.
+
+## s1 -- decompressed APEXes linked, not copied (KEPT, 40595a5e)
+
+237 of a saved device's 248 MB were its own copy of the 21 decompressed APEXes, copied again into
+every boot. The host cache is now read-only and hard-linked; `copy_device` links read-only files.
+fsutil shows the cache file linked from both saved devices. Boot time unchanged (15.0-16.8 s).
+**-237 MB of disk per saved device and per running device.**
+
+## s2 -- the kiosk device's own home (KEPT, 0856b2ab)
+
+FallbackHome (Settings) was the kiosk home: 223 MB private, per device and per pool user.
+`com.omnidroid.home` (8 KB APK, `device/src/home/`), software-drawn.
+
+| run (ABBA) | private, all hosts | warm ready | CPU (30 s, % of a core) |
+|---|---|---|---|
+| A FallbackHome | 1519.8 / 1468.7 / 1467.8 MB | 16.4 / 15.0 / 16.1 s | 12.9 / 8.2 / 9.2 |
+| B own home, GPU-drawn | 1403.9 / 1407.8 / 1403.3 MB | 15.2 / 15.0 / 14.9 s | 9.0 / 9.5 / 9.0 |
+| own home, software-drawn | 1301.1 / 1299.6 / 1294.5 / 1296.8 MB | 15.3 / 15.0 / 15.0 / 15.0 s | 8.4 / 8.9 / 8.3 / 9.2 |
+
+**-170..-220 MB per warm Android** (home process 223 -> 72 MB), warm ready no later. The probe APK
+launched on it draws (screenshot). Not run: a pool with users (the owner's pool held the machine's
+one pool); each pool user's home is this app too, so the saving repeats per user.
+
+## s3 -- translation snapshots on a warm boot (MEASURED, left to the owner)
+
+`OMNI_JIT_SNAPSHOT=1` against the default, same build (s2's), interleaved after one fill run:
+
+| | warm ready | private, all hosts | system host | available |
+|---|---|---|---|---|
+| snapshots (F1-F3) | 12.8 / 12.8 / 12.7 s | 1409 / 1431 / 1436 MB | 934-956 MB | 17.9-18.1 GB |
+| default (N1-N3) | 15.0 / 14.9 / 15.0 s | 1293 / 1302 / 1293 MB | 830-837 MB | 18.1-18.2 GB |
+
+**-2.2 s (-15%) to warm ready, +115..+140 MB private** (all of it the system host), 756 MB of
+snapshot files on disk. The same trade the 2026-10-10 report left for the owner (+190 MB, the
+world 10 s sooner); not switched.
+
+## s4 -- inert overlays left out (KEPT, 1c394aca)
+
+54 of the kiosk device's 134 packages were overlays that never apply (emulator skins for the
+framework and SystemUI, cutout emulations, a font, the notes role -- all `[ ]` in `cmd overlay
+list` -- telephony's, the navigation bar's on a kiosk). `OMNI_DEVICE_OVERLAYS=all` keeps them.
+
+| run (ABBA) | warm ready | cached packages | StartPackageManagerService | all hosts private |
+|---|---|---|---|---|
+| A kept | 15.0 / 15.0 / 14.9 s | 171 | 2162 / 1944 / 1975 ms | 1300.9 / 1305.9 / 1307.6 MB |
+| B left out | 13.7 / 13.7 / 13.7 s | 117 | 1777 / 1756 / 1769 ms | 1297.1 / 1295.1 / 1302.2 MB |
+
+**-1.3 s to warm ready (3/3 pairs)**, system host ~-8 MB. A saved device is now a 7 MiB copy
+(`[r] device saved ... 7 MiB in 319 ms`, s1's links).
+
+Side effect found: the owner's pool runs `cargo test` in this checkout, so it built and booted
+this branch's code (a `-md-kh` device appeared at 01:07; healthy, its home displayed, no crash).
+From s5 on the work moves to a worktree (`C:\oe`) and this checkout is back on `main`.
+
+## Found, not acted on (yet)
+
+- System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
+  second forever -- cheap, a stub daemon would cost more than it saves.
+- JIT at boot (`OMNI_JIT_TIME=5`): the system host translates 1.13 M blocks by warm ready, 3.1 s
+  frontend + 7.5 s emission; each app process 120-210 k blocks, 1.1-1.9 s. Guest libraries are at
+  random addresses per process (`/proc/self/maps`), so blocks are not shared between processes.
+- An idle app host gives its translations back (home: 57 -> 2 MiB of code in ~1 min); idle app
+  processes sit at ~72 MB private (35 MiB committed by the sweep's count).
