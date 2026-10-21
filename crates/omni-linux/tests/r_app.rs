@@ -61,6 +61,8 @@ const NOT_SAVED: &[&str] = &[".omni-binds", ".omni-loopback", "data/local/tmp"];
 /// Copy the device at `from` into `to` (made), less `NOT_SAVED`: the bytes copied. The directories
 /// are made first, then the files copied by four threads, the largest first (a saved device of a
 /// large game is ~840 files, 14 of them 627 of its 778 MB: one thread per big file instead of one after another).
+/// A file read-only on the host (the decompressed APEXes, `omni_linux::apex::predecompress`) is
+/// linked, not copied: no device writes it, and each of them is ~237 MB of every device.
 fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
     fn walk(from: &Path, to: &Path, rel: &Path, files: &mut Vec<(u64, std::path::PathBuf)>) -> std::io::Result<()> {
         std::fs::create_dir_all(to.join(rel))?;
@@ -89,6 +91,10 @@ fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some((_, r)) = files.get(i) else { return };
+                let shared = std::fs::metadata(from.join(r)).is_ok_and(|m| m.permissions().readonly());
+                if shared && std::fs::hard_link(from.join(r), to.join(r)).is_ok() {
+                    continue;
+                }
                 match std::fs::copy(from.join(r), to.join(r)) {
                     Ok(n) => {
                         bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
