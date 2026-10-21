@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The kiosk device's home: a black window and nothing else (OmniKioskHome.java says why).
+     Not hardware accelerated: its window is drawn once in software, so its process never brings
+     up the GPU driver (~90 MiB of a drawing app process; the composer never shows it anyway). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.omnidroid.home">
+    <application android:label="Home" android:allowBackup="false" android:directBootAware="true"
+        android:hasFragileUserData="false" android:extractNativeLibs="false"
+        android:hardwareAccelerated="false">
+        <activity android:name=".OmniKioskHome" android:exported="true" android:directBootAware="true"
+            android:launchMode="singleTask" android:stateNotNeeded="true" android:excludeFromRecents="true"
+            android:resumeWhilePausing="true" android:screenOrientation="unspecified"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboard|keyboardHidden|navigation|density|fontScale|locale|layoutDirection|uiMode"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

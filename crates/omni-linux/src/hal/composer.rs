@@ -358,7 +358,8 @@ pub fn edid(port: u8, name: &str) -> Vec<u8> {
 
 /// The windows left out of what is presented (this module's "Only the app"), by the start of their
 /// buffers' window name: SystemUI's bars and screen decorations (rounded corners, cutout), the
-/// launcher's taskbar, and Settings' `FallbackHome` (the home of a device without a launcher).
+/// launcher's taskbar, Settings' `FallbackHome` (the home of a device without a launcher) and the
+/// kiosk device's own home (`OmniKioskHome`, `crate::device::KIOSK_HOME`).
 ///
 /// Not the crash dialog (`AppErrorDialog`, titled `Application Error: <process>`), though it is no
 /// more the app's: a view root names its buffers after the last dot-separated part of its window's
@@ -367,7 +368,7 @@ pub fn edid(port: u8, name: &str) -> Vec<u8> {
 /// Responding: com.roblox.client`), shown because waiting or closing is the person's choice, and
 /// that of any window of the app whose title ends in `.client`. A crashed app's display gets a
 /// card instead ([`Composer::set_card`]), which covers the dialog with the rest.
-const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer", "FallbackHome"];
+const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer", "FallbackHome", "OmniKioskHome"];
 
 /// Whether a buffer of this name (`hal::gralloc`'s metadata page) is one of the windows left out
 /// ([`CHROME`]): a view root's BufferQueue is named `VRI[<name>]#<n>(BLAST Consumer)<n>`, the name

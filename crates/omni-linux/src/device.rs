@@ -49,6 +49,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
     ("/vendor/overlay/omni-device-overlay.apk", include_bytes!("../device/vendor/overlay/omni-device-overlay.apk")),
+    // The kiosk device's home, in place of Settings' FallbackHome (`KIOSK_HOME`, `device/src/home/`).
+    ("/vendor/app/OmniHome/OmniHome.apk", include_bytes!("../device/vendor/app/OmniHome/OmniHome.apk")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
@@ -221,6 +223,31 @@ pub fn idle_apps_out() -> bool {
 pub fn idle_apps_key_suffix() -> &'static str {
     if idle_apps_out() {
         "-idleout"
+    } else {
+        ""
+    }
+}
+
+/// **The kiosk device's own home** (`/vendor/app/OmniHome`, `device/src/home/`): a black window,
+/// where Settings' FallbackHome was the home of a device without a launcher. FallbackHome brought
+/// up all of Settings -- a host process of ~220 MiB private on every warm device, and one more for
+/// every pool user (its own home), for a window the composer never shows -- and its statsd retries
+/// (`crate::socket`'s sink). Only the kiosk device has it (the others have Launcher3, and two homes
+/// would ask which); `OMNI_KIOSK_HOME=0` leaves it out (FallbackHome again).
+pub const KIOSK_HOME: &str = "/vendor/app/OmniHome";
+
+/// Whether this device has [`KIOSK_HOME`].
+#[must_use]
+pub fn kiosk_home() -> bool {
+    std::env::var("OMNI_DEVICE_APPS").as_deref() == Ok("kiosk") && std::env::var("OMNI_KIOSK_HOME").as_deref() != Ok("0")
+}
+
+/// What the name of a saved device (`kiosk` or not) carries when it has [`KIOSK_HOME`] (`-kh`),
+/// else nothing: a device saved with FallbackHome as its home is another device.
+#[must_use]
+pub fn kiosk_home_key_suffix(kiosk: bool) -> &'static str {
+    if kiosk && std::env::var("OMNI_KIOSK_HOME").as_deref() != Ok("0") {
+        "-kh"
     } else {
         ""
     }
@@ -410,8 +437,11 @@ pub fn left_out() -> Vec<&'static str> {
 fn apps_left_out() -> Vec<&'static str> {
     let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() != Ok("1")).then_some(KIOSK_IME);
     let idle: &[&str] = if idle_apps_out() { IDLE_APPS_LEFT_OUT } else { &[] };
+    // The kiosk home is the device's own file, not the image's: out of every other device.
+    let home = (!kiosk_home()).then_some(KIOSK_HOME);
+    let ime = ime.into_iter().chain(home);
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
-        Ok("full") => Vec::new(),
+        Ok("full") => vec![KIOSK_HOME],
         Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).chain(idle).copied().chain(ime).collect(),
         Ok("lean-hw") => LEAVES_OUT.iter().chain(idle).copied().chain(ime).collect(),
         _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(idle).copied().chain(ime).collect(),
