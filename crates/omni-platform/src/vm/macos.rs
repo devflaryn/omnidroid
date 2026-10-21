@@ -314,6 +314,22 @@ pub(super) const fn supports_alias() -> bool {
     true
 }
 
+/// `mmap` of a file privately may end inside its last page: the bytes past the end read as zero.
+pub(super) const fn private_view_may_end_in_last_page() -> bool {
+    true
+}
+
+/// A mapping holds the file, not its name: renaming or deleting it (or its directory) is not refused.
+pub(super) const fn mapped_file_may_be_renamed() -> bool {
+    true
+}
+
+/// `mmap(MAP_SHARED)` may run past the file's end; a page wholly past it is `SIGBUS` until the file
+/// grows over it, then the file's (the unified buffer cache).
+pub(super) const fn shared_view_may_pass_end_of_file() -> bool {
+    true
+}
+
 /// `mach_vm_remap(copy = FALSE, VM_FLAGS_ANYWHERE)` shares the source's memory object at an
 /// address the kernel chooses; then the alias is made read-write, whatever the source allows. No one
 /// can reach it before this returns. Not in the registry, and not mirrored to the hypervisor seam:
@@ -721,7 +737,10 @@ pub(super) fn share_file_for_mapping(file: std::fs::File, name: &Path) -> VmResu
     let shown = || name.display().to_string();
     let len = file_len(fd.as_raw_fd())
         .map_err(|code| open_error(name, MapExecutability::NonExecutable, code))?;
-    if len == 0 {
+    // An empty file too where its views follow it as it grows: `mmap(MAP_SHARED)` of a 0-byte file
+    // succeeds, and once `ftruncate` grows it a store through the view reaches the file (M4,
+    // 2026-10-20) -- what a new icing array file is when it is mapped.
+    if len == 0 && !shared_view_may_pass_end_of_file() {
         return Err(VmError::EmptyFile { path: shown() });
     }
     // A shared writable view needs a descriptor open for writing (`mmap` answers `EACCES`
@@ -1092,6 +1111,10 @@ impl MappableFile {
 
     pub(super) fn is_shared(&self) -> bool {
         self.shared
+    }
+
+    pub(super) fn len_now(&self) -> u64 {
+        file_len(self.fd.as_raw_fd()).unwrap_or(self.len)
     }
 }
 

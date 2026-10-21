@@ -437,6 +437,14 @@ impl MappableFile {
     pub fn is_shared(&self) -> bool {
         self.0.is_shared()
     }
+
+    /// Length of the file in bytes now, which a shared file's length can have grown from since it
+    /// was opened (another descriptor's `ftruncate` or `write`); [`len`](Self::len) when it cannot
+    /// be read. What a view past the file's end ([`shared_view_may_pass_end_of_file`]) reaches.
+    #[must_use]
+    pub fn len_now(&self) -> u64 {
+        self.0.len_now()
+    }
 }
 
 impl fmt::Debug for MappableFile {
@@ -820,6 +828,40 @@ pub fn supports_alias() -> bool {
     backend::supports_alias()
 }
 
+/// Whether a view of a file from [`open_file_for_mapping`] may end **inside the file's last page**
+/// rather than at or before its last byte: the bytes past the end read as zero, and a store there
+/// (copy-on-write) never reaches the file -- what Linux's and macOS's `mmap` give a private mapping
+/// of a file. Linux and macOS; not Windows, where [`map_file`] keeps such a view to the file's bytes.
+/// What lets a guest's private file mapping be a view to its last byte on a host whose page is
+/// larger than the guest's (`omni-linux`'s `mm`), instead of a copy of its last host page.
+#[must_use]
+pub fn private_view_may_end_in_last_page() -> bool {
+    backend::private_view_may_end_in_last_page()
+}
+
+/// Whether a file [`open_file_for_mapping`] opened may still be renamed and deleted, and its
+/// directory too, while a view of it lives: on Linux and macOS a mapping holds the file, not its
+/// name; on Windows the file is open `FILE_SHARE_READ` only and the rename fails. What decides which
+/// of an instance's files may be views (`omni-linux`'s `mm`: installd renames an install's staging
+/// directory after PackageManager has read the APK in it).
+#[must_use]
+pub fn mapped_file_may_be_renamed() -> bool {
+    backend::mapped_file_may_be_renamed()
+}
+
+/// Whether a view of a file from [`share_file_for_mapping`] may run **whole pages past the file's
+/// end and follow the file as it grows**: a page wholly past the end faults (`SIGBUS`) until the
+/// file reaches it, and then holds the file's bytes -- Linux's `MAP_SHARED`. Such a file may be
+/// empty. macOS, whose fault reaches the CPU backend's fallback and so the guest; not Linux, where
+/// a host `SIGBUS` from JIT code is not turned into the guest's yet; not Windows, where a section
+/// cannot exceed its file without growing it. What lets a guest's shared mapping larger than its
+/// file see what is written to the file later (AppSearch's icing maps its files at their largest,
+/// new ones empty, and grows them).
+#[must_use]
+pub fn shared_view_may_pass_end_of_file() -> bool {
+    backend::shared_view_may_pass_end_of_file()
+}
+
 /// Map `[src, src + size)` a second time, where the host chooses, read-write whatever the source
 /// allows; returns the new address. The second mapping is the same memory.
 ///
@@ -902,7 +944,9 @@ pub fn open_file_for_mapping(
 ///
 /// # Errors
 ///
-/// [`VmError::EmptyFile`] for a zero-length file, which cannot have a section;
+/// [`VmError::EmptyFile`] for a zero-length file, which cannot have a section -- but where a
+/// view may pass the file's end ([`shared_view_may_pass_end_of_file`]), whose views fault until
+/// it grows;
 /// [`VmError::SectionCreate`] -- `ERROR_ACCESS_DENIED` (5) for a handle without write access;
 /// [`VmError::FileOpen`] if the file's length cannot be read.
 pub fn share_file_for_mapping(file: std::fs::File, name: &Path) -> VmResult<MappableFile> {
@@ -958,7 +1002,9 @@ pub unsafe fn sync_view(file: &MappableFile, ptr: *mut u8, size: usize) -> VmRes
 /// later. A view of such a file may also end **inside the file's last page** rather than at its
 /// last byte, which is Linux's rule: the bytes past the end read as zero and a store there never
 /// reaches the file (measured). A view reaching any further page past the end is still
-/// [`VmError::ViewPastEndOfFile`].
+/// [`VmError::ViewPastEndOfFile`] -- but where [`shared_view_may_pass_end_of_file`] (macOS),
+/// whose pages past the end fault until the file grows over them. A view of any other file may end
+/// inside its last page too where [`private_view_may_end_in_last_page`] says so (Linux, macOS).
 ///
 /// A read-only or execute-read view of 4 MB measured 8–16 KB of commit charge (page tables only),
 /// and 16 concurrent 8 MB views of one file, every page touched, cost 0.254 MB of commit between
@@ -1007,9 +1053,12 @@ pub unsafe fn map_file(
         });
     }
     let end = file_offset.saturating_add(size as u64);
-    // A shared file's view may end inside the file's last page; any other file's view must end at
-    // or before its last byte, as it always has.
-    let limit = if file.is_shared() {
+    // A shared file's view may end inside the file's last page, and so may any other's where the
+    // host allows it ([`private_view_may_end_in_last_page`]); else it must end at or before the
+    // file's last byte, as it always has.
+    let limit = if file.is_shared() && backend::shared_view_may_pass_end_of_file() {
+        u64::MAX
+    } else if file.is_shared() || backend::private_view_may_end_in_last_page() {
         let page = page_size() as u64;
         file.len().div_ceil(page).saturating_mul(page)
     } else {

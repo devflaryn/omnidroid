@@ -692,6 +692,10 @@ impl MappableFile {
     pub(super) fn is_shared(&self) -> bool {
         self.shared
     }
+
+    pub(super) fn len_now(&self) -> u64 {
+        self.file.metadata().map_or(self.len, |m| m.len())
+    }
 }
 
 /// Open a file read-only for mapping.
@@ -760,7 +764,8 @@ pub(super) fn share_file_for_mapping(file: File, name: &Path) -> VmResult<Mappab
         executability: MapExecutability::NonExecutable,
         source: OsError(code),
     })?;
-    if len == 0 {
+    // An empty file's views would be wholly past its end (`shared_view_may_pass_end_of_file`).
+    if len == 0 && !shared_view_may_pass_end_of_file() {
         return Err(VmError::EmptyFile { path: shown() });
     }
     let writable = posix::opened_read_write(fd).map_err(|code| VmError::FileOpen {
@@ -1106,6 +1111,26 @@ mod tests {
 /// (a 16 KiB Linux) keeps its guest at the host's page until one is written (spec
 /// 2026-09-29-4k-guest-pages, "Out of scope").
 pub(super) const fn supports_alias() -> bool {
+    false
+}
+
+/// `mmap` of a file privately may end inside its last page: the bytes past the end read as zero.
+pub(super) const fn private_view_may_end_in_last_page() -> bool {
+    true
+}
+
+/// A mapping holds the file, not its name: renaming or deleting it (or its directory) is not refused.
+pub(super) const fn mapped_file_may_be_renamed() -> bool {
+    true
+}
+
+/// `mmap(MAP_SHARED)` may run past the file's end, but a page wholly past it is a host `SIGBUS`,
+/// and nothing turns one from JIT code into the guest's: dynarmic's POSIX handler takes `SIGSEGV`
+/// alone (its `SIGBUS` is `__APPLE__`-only, `exception_handler_posix.cpp`), so the fault seam
+/// passes it on and the whole host process dies. False until something does and `shared_map`'s
+/// `sharedgrow` passes on a Linux host; past the end, a shared mapping is anonymous meanwhile, as
+/// before.
+pub(super) const fn shared_view_may_pass_end_of_file() -> bool {
     false
 }
 

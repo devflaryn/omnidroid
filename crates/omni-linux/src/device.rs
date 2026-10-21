@@ -43,7 +43,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
     // The boot's own settings: no dexopt at install (the file says why).
     ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
-    // A spare app process's entry point (`device/src/spare/`; `crate::zygote`'s spare).
+    // Every app process's entry point and a spare app process's (`device/src/spare/`;
+    // `crate::zygote`'s `app_command` and spare).
     ("/vendor/framework/omni-spare.jar", include_bytes!("../device/vendor/framework/omni-spare.jar")),
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
@@ -465,5 +466,29 @@ mod tests {
         assert_eq!(get("ANDROID_STORAGE"), Some("/storage"));
         assert_eq!(get("ANDROID_ROOT"), Some("/system"));
         assert!(env.iter().all(|(n, v)| !n.is_empty() && !v.is_empty()));
+    }
+
+    /// Every overlay file `device/SHA256SUMS` pins is embedded as pinned -- the spare's jar among
+    /// them, whose dex holds the class every app process starts under (`crate::zygote`'s
+    /// `app_command`) and the spare's: a stale jar left every app unable to start, no test failing.
+    #[test]
+    fn the_embedded_files_are_the_ones_sha256sums_pins() {
+        use sha2::{Digest, Sha256};
+        let mut pinned = Vec::new();
+        for (sum, rel) in include_str!("../device/SHA256SUMS").lines().filter_map(|l| l.split_once(" *")) {
+            let Some((path, bytes)) = super::FILES.iter().find(|(p, _)| p.strip_prefix('/') == Some(rel)) else { continue };
+            assert_eq!(format!("{:x}", Sha256::digest(bytes)), sum, "{path} is not the file device/SHA256SUMS pins");
+            pinned.push(*path);
+        }
+        assert!(pinned.contains(&"/vendor/framework/omni-spare.jar"), "{pinned:?}");
+        let (_, jar) = super::FILES.iter().find(|(p, _)| *p == "/vendor/framework/omni-spare.jar").unwrap();
+        let at = std::env::temp_dir().join(format!("omni-spare-{}.jar", std::process::id()));
+        std::fs::write(&at, jar).unwrap();
+        let dex = omni_apk::Apk::open(&at).and_then(|a| a.read_named("classes.dex"));
+        let _ = std::fs::remove_file(&at);
+        let dex = dex.unwrap();
+        for class in [&b"Lcom/omnidroid/spare/App;"[..], b"Lcom/omnidroid/spare/Spare;"] {
+            assert!(dex.windows(class.len()).any(|w| w == class), "{} not in the jar's dex", String::from_utf8_lossy(class));
+        }
     }
 }

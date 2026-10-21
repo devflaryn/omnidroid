@@ -11,7 +11,8 @@
 //! * **Spoken to over HTTP** on 127.0.0.1: JSON-RPC (the MCP server's transport, `omni_mcp::http`),
 //!   on a port of its own -- `attach`, `state` (the snapshot, the settings and the log since the
 //!   last; without a window's `client`, a look that holds no lease), `line` (a command typed at a
-//!   window's prompt), `detach`.
+//!   window's prompt, or given to a one-shot command such as `omnidroid restart 3`: [`one_shot`]),
+//!   `detach`.
 //! * **Kept while a window is open or an agent uses it**: each window's `state` polls renew its
 //!   lease ([`LEASE`], two minutes). When the last window quits (or goes silent for that long), the
 //!   host still runs while the MCP server serves (`mcp_enabled`) or an instance is alive; once
@@ -28,7 +29,7 @@ use parking_lot::Mutex;
 
 use omni_mcp::json::{self, Json};
 use omni_mcp::mcp::{Dispatch, RpcError};
-use omni_pool::{Config, DeviceInfo, DeviceState, InstanceInfo, InstanceState, Pool};
+use omni_pool::{Config, DeviceInfo, DeviceState, InstanceInfo, InstanceState, Pool, RESTART_DELAY};
 
 use super::command::{self, Command};
 use super::mcp::McpServer;
@@ -108,6 +109,38 @@ pub fn ensure(exe: &std::path::Path) -> Result<String, String> {
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(format!("the pool did not answer in a minute; see {}", log_path.display()))
+}
+
+/// **A command for the pool from a shell** (`omnidroid restart 3`, `omnidroid autorestart on`): the
+/// line a window's prompt sends, sent without a window -- it holds no lease, and starts no pool --
+/// and the log lines the pool said doing it, printed. Exit status 2 for a line that is no command,
+/// 1 when no pool runs or the pool refused it.
+#[must_use]
+pub fn one_shot(line: &str) -> ExitCode {
+    if let Err(e) = command::parse(line) {
+        eprintln!("omnidroid: {e}");
+        return ExitCode::from(2);
+    }
+    let Some(url) = running() else {
+        eprintln!("omnidroid: no omnidroid pool runs on this computer (`omnidroid` opens the app, `omnidroid serve` runs it without a screen)");
+        return ExitCode::FAILURE;
+    };
+    match call(&url, "line", json::obj([("line", json::s(line))])) {
+        Ok(answer) => {
+            for l in answer.get("said").and_then(Json::as_array).unwrap_or_default() {
+                println!("{}", l.as_str().unwrap_or_default());
+            }
+            if answer.get("ok").and_then(Json::as_bool).unwrap_or(false) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("omnidroid: the pool at {url}: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// A host outlives the window that started it: a process group (Unix) or console (Windows) of its
@@ -201,29 +234,39 @@ impl Host {
 
     /// Whether a host started for the windows is done: every window gone, and nothing an agent is
     /// using -- no MCP server serving (`mcp_enabled`) and no instance still alive. Closing the
-    /// windows must not end the instances an agent started.
+    /// windows must not end the instances an agent started. Nor while an ended instance's window
+    /// still shows its card: the app's quit stops the devices (`stop_on_exit`), which would close
+    /// that window seconds after it opened -- the one report of the crash the person may get.
     fn done(&self) -> bool {
         if self.clients() > 0 || !(self.claimed.load(Ordering::Acquire) || self.started.elapsed() > UNCLAIMED) {
             return false;
         }
-        if self.mcp_url().is_some() {
+        if self.mcp_url().is_some() || self.pool.shows_cards() {
             return false;
         }
         let (_, instances) = self.pool.snapshot();
         !instances.iter().any(|i| !matches!(i.state, InstanceState::Ended(_)))
     }
 
-    /// One line typed at a window's prompt, done here: its answers go to the log every window shows.
-    pub fn line(&self, line: &str) {
+    /// One line typed at a window's prompt (or given to a one-shot command, [`one_shot`]), done
+    /// here: its answers go to the log every window shows. False when it was refused at once (a
+    /// one-shot command's exit status); what is done on a thread of its own (a launch with a
+    /// plugin's options, a device's stop, a shell command) reports there later.
+    pub fn line(&self, line: &str) -> bool {
         let pool = Arc::clone(&self.pool);
         match command::parse(line) {
-            Err(e) if e.is_empty() => {}
-            Err(e) => pool.say(e),
-            Ok(Command::Run(apk, n, options)) if options.is_empty() => {
-                if let Err(e) = pool.launch(&apk, n) {
-                    pool.say(format!("run: {e}"));
-                }
+            Err(e) if e.is_empty() => true,
+            Err(e) => {
+                pool.say(e);
+                false
             }
+            Ok(Command::Run(apk, n, options)) if options.is_empty() => match pool.launch(&apk, n) {
+                Ok(_) => true,
+                Err(e) => {
+                    pool.say(format!("run: {e}"));
+                    false
+                }
+            },
             // The plugins' hooks run first (a moment, or more): not on the window's call.
             Ok(Command::Run(apk, n, options)) => {
                 std::thread::spawn(move || {
@@ -231,23 +274,62 @@ impl Host {
                         pool.say(format!("run: {e}"));
                     }
                 });
+                true
             }
-            Ok(Command::Close(ids)) => {
-                for id in ids {
-                    if let Err(e) = pool.close(id) {
-                        pool.say(e);
-                    }
+            Ok(Command::Close(ids)) => ids.into_iter().fold(true, |ok, id| match pool.close(id) {
+                Ok(()) => ok,
+                Err(e) => {
+                    pool.say(e);
+                    false
                 }
-            }
+            }),
+            // An ended instance's window still showing its card closes too (`Pool::close`).
             Ok(Command::CloseAll) => {
                 let (_, instances) = pool.snapshot();
-                for i in instances.iter().filter(|i| !matches!(i.state, InstanceState::Ended(_))) {
+                for i in instances.iter().filter(|i| !matches!(i.state, InstanceState::Ended(_)) || i.screenshot.is_some()) {
                     let _ = pool.close(i.id);
                 }
+                true
+            }
+            // Every id tried, whatever an earlier one answered (`&`, not a short-circuiting `all`).
+            Ok(Command::Restart(ids)) => ids.into_iter().fold(true, |ok, id| restart(&pool, id) & ok),
+            // The instances on a window: running, or ended with its card shown. One closed (its window
+            // gone) stays closed; one restarting already keeps its countdown.
+            Ok(Command::RestartAll) => {
+                let (_, instances) = pool.snapshot();
+                let on_windows: Vec<u32> = instances.iter().filter(|i| i.state == InstanceState::Running || (matches!(i.state, InstanceState::Ended(_)) && i.screenshot.is_some())).map(|i| i.id).collect();
+                if on_windows.is_empty() {
+                    pool.say("restart all: no instance runs or shows its card");
+                }
+                on_windows.into_iter().fold(true, |ok, id| restart(&pool, id) & ok)
+            }
+            Ok(Command::AutoRestart(on, ids)) if ids.is_empty() => match pool.set_auto_restart(None, on) {
+                Ok(()) => true,
+                Err(e) => {
+                    pool.say(e);
+                    false
+                }
+            },
+            Ok(Command::AutoRestart(on, ids)) => ids.into_iter().fold(true, |ok, id| match pool.set_auto_restart(Some(id), on) {
+                Ok(()) => ok,
+                Err(e) => {
+                    pool.say(e);
+                    false
+                }
+            }),
+            Ok(Command::AutoRestartStatus) => {
+                let on = pool.config().auto_restart;
+                pool.say(format!("auto restart {} for every instance without its own (`autorestart on|off [#id...]`)", if on { "on" } else { "off" }));
+                let (_, instances) = pool.snapshot();
+                for i in instances.iter().filter(|i| i.auto_restart != on && !matches!(i.state, InstanceState::Ended(_))) {
+                    pool.say(format!("#{}: auto restart {} (its own)", i.id, if i.auto_restart { "on" } else { "off" }));
+                }
+                true
             }
             Ok(Command::Warm) => {
                 let id = pool.warm();
                 pool.say(format!("D{id}: warming"));
+                true
             }
             Ok(Command::Kill(ids)) => {
                 for id in ids {
@@ -258,6 +340,7 @@ impl Host {
                         }
                     });
                 }
+                true
             }
             Ok(Command::KillAll) => {
                 let (devices, _) = pool.snapshot();
@@ -265,6 +348,7 @@ impl Host {
                     let pool = Arc::clone(&pool);
                     std::thread::spawn(move || pool.kill(d.id));
                 }
+                true
             }
             Ok(Command::Shell(id, cmd)) => match pool.device(id) {
                 Some(dev) => {
@@ -277,28 +361,52 @@ impl Host {
                         }
                         Err(e) => pool.say(format!("D{id}: {e}")),
                     });
+                    true
                 }
-                None => pool.say(format!("no Android D{id}")),
+                None => {
+                    pool.say(format!("no Android D{id}"));
+                    false
+                }
             },
             Ok(Command::Plugins(args)) => match crate::plugins_lines(&args) {
-                Ok(lines) => lines.into_iter().for_each(|l| pool.say(l)),
-                Err(e) => pool.say(format!("plugins: {e}")),
+                Ok(lines) => {
+                    lines.into_iter().for_each(|l| pool.say(l));
+                    true
+                }
+                Err(e) => {
+                    pool.say(format!("plugins: {e}"));
+                    false
+                }
             },
             Ok(Command::Settings) => {
                 let c = pool.config();
                 for (key, what) in omni_pool::config::KEYS {
                     pool.say(format!("{key} = {}   ({what})", c.get(key).unwrap_or_default()));
                 }
+                true
             }
             Ok(Command::Set(key, value)) => match pool.set(&key, &value) {
-                Ok(()) if key.starts_with("mcp_") => self.mcp_follow(),
-                Ok(()) => {}
-                Err(e) => pool.say(e),
+                Ok(()) => {
+                    if key.starts_with("mcp_") {
+                        self.mcp_follow();
+                    }
+                    true
+                }
+                Err(e) => {
+                    pool.say(e);
+                    false
+                }
             },
-            Ok(Command::Mcp(what)) => self.mcp_command(&what),
-            Ok(Command::Clear) => pool.clear_ended(),
+            Ok(Command::Mcp(what)) => {
+                self.mcp_command(&what);
+                true
+            }
+            Ok(Command::Clear) => {
+                pool.clear_ended();
+                true
+            }
             // A window's own.
-            Ok(Command::Help | Command::Quit) => {}
+            Ok(Command::Help | Command::Quit) => true,
         }
     }
 
@@ -358,6 +466,18 @@ impl Host {
     }
 }
 
+/// `restart #id`: its app started again on its window once its card has counted down
+/// ([`RESTART_DELAY`]) -- the pool's log says so (`restart asked: in 5 s`) -- or why not.
+fn restart(pool: &Arc<Pool>, id: u32) -> bool {
+    match pool.restart(id, RESTART_DELAY) {
+        Ok(()) => true,
+        Err(e) => {
+            pool.say(e);
+            false
+        }
+    }
+}
+
 fn secs(d: Duration) -> Json {
     Json::Num(d.as_secs_f64())
 }
@@ -378,6 +498,7 @@ fn instance_state_text(s: &InstanceState) -> String {
         InstanceState::Starting => "starting".into(),
         InstanceState::Running => "running".into(),
         InstanceState::Closing => "closing".into(),
+        InstanceState::Restarting => "restarting".into(),
         InstanceState::Ended(why) => format!("ended:{why}"),
     }
 }
@@ -407,6 +528,10 @@ fn instance_json(i: &InstanceInfo) -> Json {
         ("screenshot", i.screenshot.as_ref().map_or(Json::Null, |p| json::s(p.display().to_string()))),
         ("state", json::s(instance_state_text(&i.state))),
         ("up", secs(i.up_for)),
+        ("details", Json::Array(i.details.iter().cloned().map(json::s).collect())),
+        ("auto_restart", Json::Bool(i.auto_restart)),
+        ("restarts", Json::Num(f64::from(i.restarts))),
+        ("restart_in", i.restart_in.map_or(Json::Null, secs)),
     ])
 }
 
@@ -468,9 +593,14 @@ fn instance_from(v: &Json) -> InstanceInfo {
             "starting" => InstanceState::Starting,
             "running" => InstanceState::Running,
             "closing" => InstanceState::Closing,
+            "restarting" => InstanceState::Restarting,
             s => InstanceState::Ended(s.strip_prefix("ended:").unwrap_or(s).to_string()),
         },
         up_for: duration(v.get("up")).unwrap_or_default(),
+        details: v.get("details").and_then(Json::as_array).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect(),
+        auto_restart: v.get("auto_restart").and_then(Json::as_bool).unwrap_or(false),
+        restarts: num(v, "restarts").unwrap_or(0.0) as u32,
+        restart_in: duration(v.get("restart_in")),
     }
 }
 
@@ -529,11 +659,17 @@ impl Dispatch for &Host {
                     ("logged", Json::Num(logged as f64)),
                 ]))
             }
+            // Without a window's id: a one-shot command's ([`one_shot`]), holding no lease. Answers
+            // whether it was done and the log lines said meanwhile (another's among them, at times).
             "line" => {
-                self.renew(client_id(params)?);
+                if let Ok(id) = client_id(params) {
+                    self.renew(id);
+                }
                 let line = params.get("line").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `line`"))?;
-                self.line(line);
-                Ok(Json::Null)
+                let (_, before) = self.pool.log_since(u64::MAX);
+                let ok = self.line(line);
+                let (said, _) = self.pool.log_since(before);
+                Ok(json::obj([("ok", Json::Bool(ok)), ("said", Json::Array(said.into_iter().map(json::s).collect()))]))
             }
             "detach" => {
                 let id = client_id(params)?;
@@ -764,10 +900,12 @@ impl Client {
 mod tests {
     use super::*;
 
+    /// A pool adopting none of the devices left running: the person's own pool keeps its devices,
+    /// and its apps' windows stay open.
     fn test_pool() -> Arc<Pool> {
         let mut config = Config::default();
         config.warm_on_start = false;
-        Pool::start(config, None, PathBuf::from("omnidroid"))
+        Pool::start_alone(config, None, PathBuf::from("omnidroid"))
     }
 
     #[test]
@@ -792,13 +930,47 @@ mod tests {
     }
 
     #[test]
+    fn restart_and_auto_restart_from_a_window_and_from_a_shell() {
+        let host = Host::new(test_pool());
+        let control = omni_mcp::http::serve(0, Arc::clone(&host)).unwrap();
+        let url = format!("http://127.0.0.1:{}{}", control.port, omni_mcp::http::PATH);
+        let mut a = Client::attach(&url).unwrap();
+        a.line("autorestart on").unwrap();
+        assert!(a.state().unwrap().config.auto_restart, "no ids: the pool's setting");
+        a.line("set auto_restart off").unwrap();
+        assert!(!a.state().unwrap().config.auto_restart, "the same setting, by its key");
+        // A one-shot command's line: no window's id; what the pool said doing it answered.
+        let one_shot = |line: &str| call(&url, "line", json::obj([("line", json::s(line))])).unwrap();
+        let said = |r: &Json| r.get("said").and_then(Json::as_array).unwrap_or_default().iter().filter_map(|l| l.as_str().map(str::to_string)).collect::<Vec<_>>();
+        let r = one_shot("restart #9");
+        assert_eq!(r.get("ok").and_then(Json::as_bool), Some(false), "no such instance");
+        assert!(said(&r).iter().any(|l| l.contains("#9")), "{:?}", said(&r));
+        let r = one_shot("autorestart off 9");
+        assert_eq!(r.get("ok").and_then(Json::as_bool), Some(false));
+        let r = one_shot("restart all");
+        assert_eq!(r.get("ok").and_then(Json::as_bool), Some(true), "nothing to restart is no refusal");
+        assert!(said(&r).iter().any(|l| l.contains("no instance runs")), "{:?}", said(&r));
+        let r = one_shot("autorestart");
+        assert!(said(&r).iter().any(|l| l.contains("auto restart off for every instance")), "{:?}", said(&r));
+        assert_eq!(a.state().unwrap().windows, 1, "a one-shot command is no window");
+        assert_eq!(a.detach().unwrap(), 0);
+        control.stop();
+        host.pool.shutdown(false);
+    }
+
+    #[test]
     fn states_read_back_as_they_were() {
         let d = DeviceInfo { id: 2, dir: PathBuf::from("/x/omni-warm-1"), state: DeviceState::Gone("boot: no".into()), up_for: Duration::from_secs(5), idle_for: None, installed: [("a.b".to_string(), "ff".to_string())].into(), instances: 1 };
         let back = device_from(&json::parse(&device_json(&d).to_string()).unwrap());
         assert_eq!((back.id, back.state, back.installed, back.idle_for, back.dir), (2, d.state.clone(), d.installed.clone(), None, d.dir.clone()));
-        let i = InstanceInfo { id: 7, device: 2, package: "p".into(), sha256: "s".into(), apk: PathBuf::from("/a.apk"), user: Some(10), display: Some(3), screenshot: None, state: InstanceState::Ended("closed".into()), up_for: Duration::from_millis(1500) };
+        let i = InstanceInfo { id: 7, device: 2, package: "p".into(), sha256: "s".into(), apk: PathBuf::from("/a.apk"), user: Some(10), display: Some(3), screenshot: None, state: InstanceState::Ended("native crash: SIGSEGV".into()), up_for: Duration::from_millis(1500), details: vec!["SIGSEGV at 0x8".into(), String::new()], auto_restart: true, restarts: 2, restart_in: None };
         let back = instance_from(&json::parse(&instance_json(&i).to_string()).unwrap());
         assert_eq!((back.id, back.user, back.display, back.state, back.up_for), (7, Some(10), Some(3), i.state.clone(), Duration::from_millis(1500)));
+        assert_eq!(back.details, i.details, "what happened, for every window");
+        assert_eq!((back.auto_restart, back.restarts, back.restart_in), (true, 2, None));
+        let i = InstanceInfo { state: InstanceState::Restarting, restart_in: Some(Duration::from_secs(3)), ..i };
+        let back = instance_from(&json::parse(&instance_json(&i).to_string()).unwrap());
+        assert_eq!((back.state, back.restart_in), (InstanceState::Restarting, Some(Duration::from_secs(3))), "a restart's countdown");
     }
 
     #[test]

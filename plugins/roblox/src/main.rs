@@ -237,7 +237,7 @@ fn aosp() -> Result<Answer, String> {
         let path = match (Path::new(&arg).is_file(), saved) {
             (true, _) => PathBuf::from(&arg),
             (false, Some(saved)) => saved,
-            (false, None) => return Err(format!("--cookie: no file `{arg}` (aosp takes a cookie file or a name `login` saved)")),
+            (false, None) => return Err(format!("--cookie: no file {} (aosp takes a cookie file or a name `login` saved, not the cookie's value)", shown(&arg))),
         };
         account_cookie(&path.to_string_lossy())?;
         let path = std::fs::canonicalize(&path).unwrap_or(path);
@@ -255,6 +255,27 @@ fn aosp() -> Result<Answer, String> {
 struct AccountCookie {
     value: String,
     account: String,
+}
+
+/// An argument at least this long may be a `.ROBLOSECURITY` value itself: a real one is several
+/// hundred characters.
+const VALUE_LEN: usize = 100;
+
+/// Whether `--cookie <arg>` may be a cookie's value -- long enough ([`VALUE_LEN`]), or carrying
+/// Roblox's warning (`_|WARNING:-DO-NOT-SHARE-THIS..`): never repeated in a message. The hook's
+/// errors reach the app's log, every window, the host's log file and the MCP server's answer; a
+/// value passed to `aosp` (which takes a file or a saved name) was printed whole there.
+fn may_be_value(arg: &str) -> bool {
+    arg.len() >= VALUE_LEN || arg.contains("_|WARNING")
+}
+
+/// `--cookie <arg>` as a message says it: quoted, or not at all when it may be a value.
+fn shown(arg: &str) -> String {
+    if may_be_value(arg) {
+        "(the argument, which may be a cookie's value, not shown)".to_string()
+    } else {
+        format!("`{arg}`")
+    }
 }
 
 /// `--cookie <file or value>`. An existing file is read; anything else long enough to be a cookie
@@ -278,9 +299,10 @@ fn account_cookie_in(arg: &str, cookies: Option<&Path>) -> Result<AccountCookie,
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         return Ok(AccountCookie { value, account: account_name(&stem) });
     }
-    if arg.len() < 100 {
+    if arg.len() < VALUE_LEN {
         return Err(format!(
-            "--cookie: no file `{arg}` (from {}{}), and it is too short to be a .ROBLOSECURITY value",
+            "--cookie: no file {} (from {}{}), and it is too short to be a .ROBLOSECURITY value",
+            shown(arg),
             std::env::current_dir().map_or_else(|_| "here".to_string(), |d| d.display().to_string()),
             cookies.map_or_else(String::new, |dir| format!(", or in {}", dir.display()))
         ));
@@ -559,6 +581,17 @@ mod tests {
         let by_name = account_cookie_in("farm 4", Some(&dir)).expect("a name found in the cookies folder");
         assert_eq!((by_name.value.as_str(), by_name.account.as_str()), (VALUE, "farm_4"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cookie_s_value_is_never_repeated_in_a_message() {
+        let long = format!("{VALUE}{}", "0".repeat(100));
+        for arg in [VALUE, long.as_str(), "x".repeat(VALUE_LEN).as_str()] {
+            assert!(!shown(arg).contains(arg) && !shown(arg).contains("WARNING"), "{}", shown(arg));
+        }
+        let short = account_cookie_in(VALUE, None).err().expect("no file, and too short for a value");
+        assert!(!short.contains(VALUE) && !short.contains("WARNING"), "{short}");
+        assert_eq!(shown("farm4"), "`farm4`", "a name is said");
     }
 
     #[test]

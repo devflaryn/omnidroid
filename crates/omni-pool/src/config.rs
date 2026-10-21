@@ -25,6 +25,10 @@ pub struct Config {
     /// The MCP server: on, and where it listens (127.0.0.1 only).
     pub mcp_enabled: bool,
     pub mcp_port: u16,
+    /// Start an instance's app again on its window ([`crate::pool::RESTART_DELAY`] after) when it
+    /// crashes -- not when it is closed on purpose. An instance's own setting overrides it
+    /// ([`crate::Pool::set_auto_restart`]).
+    pub auto_restart: bool,
     /// Lines of a newer version's keys, kept when saving.
     pub other: Vec<String>,
 }
@@ -42,6 +46,7 @@ impl Default for Config {
             device_ram_mb: 0,
             mcp_enabled: false,
             mcp_port: 7457,
+            auto_restart: false,
             other: Vec::new(),
         }
     }
@@ -59,6 +64,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("device_ram_mb", "each device's RAM in MiB; 0 the default"),
     ("mcp_enabled", "serve MCP for coding agents on 127.0.0.1 (true/false)"),
     ("mcp_port", "the MCP server's port"),
+    ("auto_restart", "start an app that crashed again on its window after 5 s (true/false)"),
 ];
 
 fn boolean(key: &str, v: &str) -> Result<bool, String> {
@@ -134,6 +140,7 @@ impl Config {
             "device_ram_mb" => self.device_ram_mb = number(key, value)?,
             "mcp_enabled" => self.mcp_enabled = boolean(key, value)?,
             "mcp_port" => self.mcp_port = number::<u16>(key, value).and_then(|p| if p == 0 { Err(format!("{key} wants a port above 0")) } else { Ok(p) })?,
+            "auto_restart" => self.auto_restart = boolean(key, value)?,
             _ => return Ok(false),
         }
         Ok(true)
@@ -153,6 +160,7 @@ impl Config {
             "device_ram_mb" => self.device_ram_mb.to_string(),
             "mcp_enabled" => self.mcp_enabled.to_string(),
             "mcp_port" => self.mcp_port.to_string(),
+            "auto_restart" => self.auto_restart.to_string(),
             _ => return None,
         })
     }
@@ -192,7 +200,7 @@ mod tests {
     #[test]
     fn the_defaults_are_the_ones_asked_for() {
         let c = Config::default();
-        assert_eq!((c.idle_close_minutes, c.keep_warm, c.warm_on_start, c.mcp_enabled), (5, 1, true, false));
+        assert_eq!((c.idle_close_minutes, c.keep_warm, c.warm_on_start, c.mcp_enabled, c.auto_restart), (5, 1, true, false, false));
     }
 
     #[test]
@@ -203,6 +211,7 @@ mod tests {
         c.set("idle_close_minutes", "0").unwrap();
         c.set("mcp_enabled", "on").unwrap();
         c.set("instance_size", "960x540").unwrap();
+        c.set("auto_restart", "yes").unwrap();
         assert!(!c.set("from_a_newer_version", "x").unwrap());
         c.other.push("from_a_newer_version = x".into());
         c.save(&path).unwrap();

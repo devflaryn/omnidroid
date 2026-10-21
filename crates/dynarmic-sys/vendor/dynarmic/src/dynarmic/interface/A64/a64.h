@@ -140,8 +140,57 @@ public:
     /// translated code but those holding the rest of that block. The thread finishes the block on
     /// return, the halt sends it to the dispatcher, and the clear is made at the edge of its run
     /// (after this returns: both hold the invalidation lock). The bytes given back; 0 if the
-    /// thread was no longer parked there.
+    /// thread was no longer parked there. Patch 0107: the per-block tables are given back too.
+    /// Patch 0108: 0 when they were given back already and the thread has not run since.
     std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
+
+    /// Omnidroid patch 0107 (arm64 backend only): the bytes this jit's per-block tables hold (the
+    /// block map, block, fastmem and link records, link heads, the guest-range index), as last
+    /// counted by its thread. Safe to call from any thread.
+    std::size_t OdTableBytes() const;
+
+    /// Omnidroid patch 0106 (arm64 backend only): a census of translated blocks, for measuring how
+    /// many threads translate the same code. `fn(ctx, location, host_bytes)` once per block; it
+    /// must not call into this jit or take a lock.
+    using OdBlockVisitor = void (*)(void* ctx, std::uint64_t location, std::uint32_t host_bytes);
+    /// Every block this jit's cache holds now (a location invalidated is not held). On the jit's
+    /// own thread outside Run; or, with `parked`, from another thread while the jit's thread is
+    /// parked in a callback that returns to `resume` and `parked` still says so once a halt is
+    /// raised, under the invalidation lock as OdDiscardParked (the thread leaves its run on waking,
+    /// and takes the lock before it emits again). False, and nothing read, when it was not parked.
+    bool OdForEachBlock(OdBlockVisitor fn, void* ctx, std::uint64_t resume = 0, const std::atomic<std::uint64_t>* parked = nullptr);
+    /// `fn` for every block emitted from now on, on the emitting thread at the end of its emission;
+    /// null stops it. Set before the jit first runs.
+    void OdSetEmitHook(OdBlockVisitor fn, void* ctx);
+
+    /// Omnidroid patch 0112 (arm64 backend only): what this jit's generated code reads per thread
+    /// at run time (its JitState) instead of immediates: the callbacks object every callback is
+    /// called on, the config the non-inline exclusives are given, the thread pointers' slots, and
+    /// this processor's reservation slots in the monitor (0 without one). Set when the jit is made
+    /// and kept by Reset. Not while the jit's thread may be inside Reset.
+    struct OdThreadValues {
+        std::uint64_t callbacks;
+        std::uint64_t conf;
+        std::uint64_t tpidr_el0;
+        std::uint64_t tpidrro_el0;
+        std::uint64_t exclusive_address;
+        std::uint64_t exclusive_value;
+    };
+    OdThreadValues OdGetThreadValues() const;
+
+    /// Omnidroid patch 0114 (arm64 backend only), a test hook: the block this jit's cache holds for
+    /// `location` (a LocationDescriptor's value), and each of its link sites, `fn(ctx, offset, kind)`
+    /// with `offset` from its entry point -- kind 0 a branch word (one instruction, `B` or `NOP`),
+    /// kind 1 a return-stack slot (8 aligned bytes of data, never executed). On the jit's own thread
+    /// outside Run.
+    struct OdBlockLinkInfo {
+        std::uint64_t entry_point;        ///< 0: the cache holds no block for `location`.
+        std::uint32_t host_bytes;
+        std::uint64_t unlinked_slot;      ///< What an unlinked slot holds (the dispatcher's entry).
+        std::uint64_t relink_maintained;  ///< Bytes of code this cache's relinks have handed to instruction-cache maintenance.
+    };
+    using OdLinkVisitor = void (*)(void* ctx, std::uint32_t offset, std::uint32_t kind);
+    OdBlockLinkInfo OdBlockLinks(std::uint64_t location, OdLinkVisitor fn, void* ctx) const;
 
 private:
     struct Impl;

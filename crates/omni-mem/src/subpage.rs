@@ -9,11 +9,13 @@
 //! path. Execute is never asked of the host: guest code is fetched through the CPU backend's
 //! callback, which asks the guest view.
 //!
-//! The invariants a space keeps for a tracked page: it is committed private anonymous memory; it
+//! The invariants a space keeps for a tracked page: it is committed private anonymous memory, or a
+//! file view while nothing in it traps (only a view holds [`foreign`](Split::foreign) parts); it
 //! has a live alias while it [`traps`](Split::traps) (and possibly after -- an alias goes only when
 //! its page is unmapped or replaced, SUBPAGE-ORDER); it leaves the overlay when it is
-//! [`uniform`](Split::uniform) again (the host page is then exactly that) or [`empty`](Split::empty)
-//! (the host page is unmapped); and every change to it bumps the space's generation.
+//! [`uniform`](Split::uniform) again with no foreign part (the host page is then exactly that) or
+//! [`empty`](Split::empty) (the host page is unmapped); and every change to it bumps the space's
+//! generation.
 //!
 //! This module is the pure part: what a page's parts mean. `space.rs` applies it to the host.
 
@@ -46,6 +48,11 @@ pub enum Part {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Split {
     pub(crate) parts: Vec<Part>,
+    /// Parts (bit `i`, part `i`) whose bytes are not their own: a never-touched `PROT_NONE`
+    /// reservation's parts on a host page that is another mapping's file view
+    /// (`GuestSpace::map_file_exact`). Each is `Mapped(Protection::None)`; it reads zero once it is
+    /// made accessible or the page stops being a view (`privatise`), as anonymous memory does.
+    pub(crate) foreign: u64,
 }
 
 /// Readable and writable bits of a protection; execute never matters to the host.
@@ -56,7 +63,19 @@ const fn bits(p: Protection) -> (bool, bool) {
 impl Split {
     /// `parts_per_page` parts, each `fill`.
     pub(crate) fn new(parts_per_page: usize, fill: Part) -> Self {
-        Self { parts: vec![fill; parts_per_page] }
+        debug_assert!(parts_per_page <= 64, "a part's bit is one of a u64's");
+        Self { parts: vec![fill; parts_per_page], foreign: 0 }
+    }
+
+    /// Parts `[from, to)` as a mask of bits.
+    pub(crate) fn mask(from: usize, to: usize) -> u64 {
+        let below = |n: usize| if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        below(to) & !below(from)
+    }
+
+    /// Whether part `i` is [`foreign`](Self::foreign).
+    pub(crate) fn is_foreign(&self, i: usize) -> bool {
+        self.foreign >> i & 1 != 0
     }
 
     /// `Some(p)` when every part is `Mapped(p)`: the page is uniform and leaves the overlay.
@@ -126,6 +145,7 @@ impl Split {
                     q => q,
                 })
                 .collect(),
+            foreign: self.foreign,
         };
         relaxed.host_protection(strict_none)
     }
@@ -149,12 +169,12 @@ impl Split {
         })
     }
 
-    /// The run of equal parts containing part `i`: (first index, count, part).
+    /// The run of equal parts containing part `i`, foreign or not alike: (first index, count, part).
     pub(crate) fn run_at(&self, i: usize) -> (usize, usize, Part) {
-        let part = self.parts[i];
-        let first = self.parts[..i].iter().rposition(|p| *p != part).map_or(0, |j| j + 1);
-        let last = self.parts[i..].iter().position(|p| *p != part).map_or(self.parts.len(), |j| i + j);
-        (first, last - first, part)
+        let key = |j: usize| (self.parts[j], self.is_foreign(j));
+        let first = (0..i).rev().find(|&j| key(j) != key(i)).map_or(0, |j| j + 1);
+        let last = (i..self.parts.len()).find(|&j| key(j) != key(i)).unwrap_or(self.parts.len());
+        (first, last - first, self.parts[i])
     }
 
     /// Set parts `[from, to)` to `part`.
@@ -293,7 +313,7 @@ mod tests {
     use Protection::{Read, ReadExecute, ReadWrite, ReadWriteExecute};
 
     fn split(parts: &[Part]) -> Split {
-        Split { parts: parts.to_vec() }
+        Split { parts: parts.to_vec(), foreign: 0 }
     }
 
     #[test]
@@ -370,5 +390,18 @@ mod tests {
         assert_eq!(s.run_at(2), (1, 2, Part::Mapped(ReadWrite)));
         assert_eq!(s.run_at(1), (1, 2, Part::Mapped(ReadWrite)));
         assert_eq!(s.run_at(3), (3, 1, Part::Hole));
+    }
+
+    /// A foreign part is a run of its own beside an equal part that is not; masks are exact.
+    #[test]
+    fn foreign_parts_are_runs_of_their_own() {
+        let mut s = Split::new(4, Part::Mapped(Protection::None));
+        s.foreign = Split::mask(0, 2);
+        assert_eq!(s.run_at(1), (0, 2, Part::Mapped(Protection::None)));
+        assert_eq!(s.run_at(2), (2, 2, Part::Mapped(Protection::None)));
+        assert!(s.is_foreign(0) && !s.is_foreign(2));
+        assert_eq!(Split::mask(1, 3), 0b110);
+        assert_eq!(Split::mask(0, 64), u64::MAX);
+        assert_eq!(Split::mask(2, 2), 0);
     }
 }

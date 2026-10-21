@@ -11,6 +11,16 @@ pub enum Command {
     /// `close <#id>... | all`.
     Close(Vec<u32>),
     CloseAll,
+    /// `restart <#id>... | all`: start instances' apps again on their windows once their cards have
+    /// counted down (`omni_pool::RESTART_DELAY`); `all`: every instance running or showing its card.
+    Restart(Vec<u32>),
+    RestartAll,
+    /// `autorestart on|off [#id... | all]`: start an app again when it crashes -- these instances'
+    /// own setting, or (no ids, or `all`: a one-shot command's way, `main`) the pool's, for every
+    /// instance without its own.
+    AutoRestart(bool, Vec<u32>),
+    /// `autorestart`: the pool's setting, and the instances whose own differs from it.
+    AutoRestartStatus,
     /// `warm`: boot one more device now.
     Warm,
     /// `kill <D#>... | all`: stop devices.
@@ -37,6 +47,8 @@ pub const HELP: &[&str] = &[
     "run <apk> [xN]       launch N instances of any APK (Tab completes the path)",
     "  ... --cookie <c> --place <id>   with a plugin's options (`plugins` lists them)",
     "close <#id>... | all close instances (or Delete on a selected one)",
+    "restart <#id>... | all  restart instances' apps on their windows (in 5 s; the card counts down)",
+    "autorestart on|off [#id...]  restart an app when it crashes (no ids: the pool's setting, for instances without their own)",
     "warm                 boot one more Android now",
     "kill <D#>... | all   stop Androids (or Delete on a selected one): after the last, none warms till run or warm",
     "shell <D#> <cmd>     a shell command on an Android, its output in the log",
@@ -55,6 +67,11 @@ fn device_id(word: &str) -> Option<u32> {
 /// `#3` or `3`.
 fn instance_id(word: &str) -> Option<u32> {
     word.trim_start_matches('#').parse().ok()
+}
+
+/// Instance ids (`#3` or `3`), each one, or what is not one.
+fn instance_ids(words: &[&str]) -> Result<Vec<u32>, String> {
+    words.iter().map(|w| instance_id(w).ok_or_else(|| format!("not an instance: {w}"))).collect()
 }
 
 /// A path as typed: quotes taken off, `~` expanded.
@@ -137,7 +154,26 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "close" | "c" => match words.as_slice() {
             ["all"] => Ok(Command::CloseAll),
             [] => Err("close #id... or close all".into()),
-            ids => ids.iter().map(|w| instance_id(w).ok_or_else(|| format!("not an instance: {w}"))).collect::<Result<_, _>>().map(Command::Close),
+            ids => instance_ids(ids).map(Command::Close),
+        },
+        "restart" => match words.as_slice() {
+            ["all"] => Ok(Command::RestartAll),
+            [] => Err("restart #id... or restart all".into()),
+            ids => instance_ids(ids).map(Command::Restart),
+        },
+        "autorestart" | "auto-restart" => match words.as_slice() {
+            [] => Ok(Command::AutoRestartStatus),
+            [on, ids @ ..] => {
+                let on = match on.to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => true,
+                    "off" | "false" | "no" | "0" => false,
+                    _ => return Err(format!("autorestart on|off [#id... | all], not `{on}`")),
+                };
+                match ids {
+                    ["all"] => Ok(Command::AutoRestart(on, Vec::new())),
+                    ids => instance_ids(ids).map(|ids| Command::AutoRestart(on, ids)),
+                }
+            }
         },
         "warm" | "w" => Ok(Command::Warm),
         "kill" | "k" => match words.as_slice() {
@@ -235,6 +271,20 @@ mod tests {
         assert_eq!(parse("plugins add --link plugins/x"), Ok(Command::Plugins(vec!["add".into(), "--link".into(), "plugins/x".into()])));
         assert_eq!(parse("q"), Ok(Command::Quit));
         assert!(parse("close x").is_err() && parse("frobnicate").is_err() && parse("set k").is_err());
+    }
+
+    #[test]
+    fn restart_and_auto_restart() {
+        assert_eq!(parse("restart #3"), Ok(Command::Restart(vec![3])));
+        assert_eq!(parse("restart 1 #2"), Ok(Command::Restart(vec![1, 2])));
+        assert_eq!(parse("restart all"), Ok(Command::RestartAll));
+        assert_eq!(parse("autorestart on"), Ok(Command::AutoRestart(true, vec![])), "no ids: the pool's setting");
+        assert_eq!(parse("autorestart off all"), Ok(Command::AutoRestart(false, vec![])), "the same, said");
+        assert_eq!(parse("autorestart off #2 3"), Ok(Command::AutoRestart(false, vec![2, 3])));
+        assert_eq!(parse("autorestart"), Ok(Command::AutoRestartStatus));
+        assert_eq!(parse("set auto_restart on"), Ok(Command::Set("auto_restart".into(), "on".into())));
+        assert!(parse("restart").is_err() && parse("restart x").is_err());
+        assert!(parse("autorestart maybe").is_err() && parse("autorestart on x").is_err());
     }
 
     #[test]

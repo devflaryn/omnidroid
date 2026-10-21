@@ -16,7 +16,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use omni_linux::app_session::{says, AppSession};
+use omni_linux::app_session::{says, AppDeaths, AppSession};
 use omni_warm as device;
 
 /// A link not answered by the session's `OMNI_R_LINK_TAKEN` in this long is sent again (an app can
@@ -165,7 +165,8 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
     // Activity is displayed (the start above waited for it).
     let ready_at_start = app_session.link_ready.is_none() && app_session.signed_in.is_none();
     let (mut sent_at, mut tries, mut joined, mut signed_in, mut ready, mut loaded) = (None::<Instant>, 0u32, false, false, ready_at_start, false);
-    let died = format!("Process {package} (pid ");
+    // Its main process's end, however the log tells it (`AppDeaths`).
+    let mut deaths = AppDeaths::default();
     let mut code = ExitCode::SUCCESS;
     while Instant::now() < deadline {
         for line in log.lines() {
@@ -185,7 +186,7 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
                 loaded = true;
                 say("what the link opened is loaded");
             }
-            if line.contains(&died) && line.contains("has died") {
+            if deaths.died(&line, &package) {
                 say("the app died: started again");
                 let _ = device::launch(dev, &app, "");
                 (sent_at, ready) = (None, ready_at_start);

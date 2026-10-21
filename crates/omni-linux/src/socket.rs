@@ -131,6 +131,9 @@ pub enum Peer {
     Pair { channel: Arc<PairChannel>, side: usize },
     /// `logd`: packets are printed to this output.
     Logd(Output),
+    /// statsd's datagram socket in a host process statsd is not in ([`STATSD_SINK`]): what is sent
+    /// is taken and dropped.
+    Sink,
     /// init's property service: `setprop` requests, answered one `u32` each.
     PropertyService { pending: Vec<u8>, service: std::sync::Arc<crate::props::PropertyService> },
 }
@@ -317,6 +320,7 @@ pub fn send_with(socket: &mut Socket, bytes: &[u8], rights: Vec<Arc<OpenFile>>) 
             }
             Ok(bytes.len())
         }
+        Some(Peer::Sink) => Ok(bytes.len()),
         None => Err(ENOTCONN),
     }
 }
@@ -358,6 +362,35 @@ fn unix_path(p: &Process, at: u64, len: u64) -> Result<Vec<u8>, Errno> {
 /// Which instance a process is of, for the names sockets are bound to.
 fn instance_of(p: &Process) -> usize {
     Arc::as_ptr(p.vfs.binds()) as usize
+}
+
+/// Whether an app host process's connect to statsd's `/dev/socket/statsdw` succeeds, its datagrams
+/// dropped ([`Peer::Sink`]), rather than failing `ENOENT`: statsd is in the system's host process,
+/// and a path-named socket stays its own host process's (`crate::xsocket`). libstatssocket queues
+/// a uid-1000 process's atoms (`should_write_via_queue`: `getuid() == 1000`) and its writer thread
+/// retries a failed write every 5 ms, for ever (`BufferWriterQueue::processCommands`). MEASURED
+/// (warm device, M4, 2026-10-20): com.android.settings -- uid 1000, in a host process of its own for
+/// FallbackHome -- ran socket, setsockopt, connect, close and a 5 ms nanosleep ~147-165 times a
+/// second for the whole session; `statsd_sink=1` switched live, none in the next 10 s. On a pool
+/// device with Roblox at Home (five ABBA pairs, same day) its host took 0.7-0.8% of a core before,
+/// 0.2% with the sink. Every other app paid the four calls per atom and lost the atom; it is lost
+/// now too, for one send. On by default; the lever `statsd_sink=0` (`crate::lever`) or `OMNI_STATSD_SINK=0` refuses as before (a
+/// socket already connected keeps its sink).
+pub static STATSD_SINK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `OMNI_STATSD_SINK=0`: [`STATSD_SINK`] off from the start.
+pub fn statsd_sink_from_env() {
+    if std::env::var("OMNI_STATSD_SINK").as_deref() == Ok("0") {
+        STATSD_SINK.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_STATSD_SINK: statsd_sink=0");
+    }
+}
+
+/// Whether a connect to `path` by a socket of type `ty` takes [`STATSD_SINK`]'s sink: statsd's
+/// datagram socket, from an app's host process (`remote`) -- never the system's, where statsd binds
+/// it (a connect there before it has would otherwise keep a sink once statsd is up).
+fn sinks(path: &[u8], ty: u64, remote: bool) -> bool {
+    path == b"/dev/socket/statsdw" && ty == 2 && remote && STATSD_SINK.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn sys_connect(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -413,6 +446,10 @@ fn connect(p: &Process, t: &mut Task, a: [u64; 6], file: &Arc<OpenFile>) -> SysR
     if path == b"/dev/socket/dnsproxyd" && socket.ty == 1 {
         let hosts = p.vfs.sysroot().read(b"/system/etc/hosts").unwrap_or_default();
         socket.peer = Some(Peer::Dns(crate::dnsproxy::Proxy::new(&hosts)));
+        return Ok(0);
+    }
+    if sinks(&path, socket.ty, crate::remote::is_remote()) {
+        socket.peer = Some(Peer::Sink);
         return Ok(0);
     }
     // An abstract name another host process of the instance listens on (`crate::xsocket`).
@@ -924,10 +961,14 @@ const MSG_DONTWAIT: u64 = 0x40;
 
 fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     let file = p.fds.get(a[0] as i64 as i32)?;
-    let mut buf = crate::zbuf::ZeroBuf::new((a[2] as usize).min(1 << 20));
+    let len = (a[2] as usize).min(1 << 20);
     if let Some(host) = host_of(&file) {
-        let (n, from) = host.recv(&mut buf, a[3], nonblocking(&file), t)?;
-        p.mem.write(a[1], &buf[..n])?;
+        // Into this thread's receive buffer: only the `n` bytes received are used.
+        let (n, from) = crate::guest::with_recv_scratch(len, |buf| -> Result<_, Errno> {
+            let (n, from) = host.recv(buf, a[3], nonblocking(&file), t)?;
+            p.mem.write(a[1], &buf[..n])?;
+            Ok((n, from))
+        })?;
         if a[4] != 0 && a[5] != 0 {
             match from {
                 Some(addr) => write_name(p, a[4], a[5], &crate::hostnet::sockaddr(&addr))?,
@@ -936,6 +977,7 @@ fn sys_recvfrom(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         }
         return Ok(n as u64);
     }
+    let mut buf = crate::zbuf::ZeroBuf::new(len);
     let n = receive_waiting(&file, &mut buf, a[3] & MSG_DONTWAIT != 0, t)?;
     p.mem.write(a[1], &buf[..n])?;
     Ok(n as u64)
@@ -993,7 +1035,7 @@ pub fn key(socket: &Socket) -> Option<crate::poll::Key> {
 pub fn own_key(socket: &Socket) -> Option<crate::poll::Key> {
     let own = match &socket.peer {
         None => true,
-        Some(Peer::Logd(_) | Peer::PropertyService { .. } | Peer::Dgram(_)) => true,
+        Some(Peer::Logd(_) | Peer::PropertyService { .. } | Peer::Dgram(_) | Peer::Sink) => true,
         _ => false,
     };
     own.then_some(std::ptr::from_ref(socket) as crate::poll::Key)
@@ -1060,7 +1102,7 @@ pub fn readiness(socket: &Socket) -> u32 {
         Some(Peer::Host(host)) => host.readiness(),
         Some(Peer::Dns(proxy)) => (if proxy.available() > 0 { IN } else { 0 }) | OUT,
         Some(Peer::Bound(bound)) => if bound.ready() { IN } else { 0 },
-        Some(Peer::Dgram(_)) => OUT,
+        Some(Peer::Dgram(_) | Peer::Sink) => OUT,
         Some(Peer::Pair { channel, side }) => {
             let queued = !channel.queues.lock()[*side].is_empty();
             let other_open = channel.open[1 - *side].load(std::sync::atomic::Ordering::SeqCst);
@@ -1113,8 +1155,9 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
         total = total.saturating_add(span.1);
     }
     let host = host_of(&file);
-    // Into this thread's scratch buffer when small: only the `n` bytes received are used.
-    let (n, from) = crate::guest::with_scratch(total.min(1 << 20), |buf| -> Result<_, Errno> {
+    // Into this thread's scratch buffer when small, a host socket's into its receive buffer
+    // (`crate::guest::with_recv_scratch`): only the `n` bytes received are used.
+    let receive = |buf: &mut [u8]| -> Result<_, Errno> {
         let (n, from) = match &host {
             Some(host) => host.recv(buf, a[2], nonblocking(&file), t)?,
             None => (receive_waiting(&file, buf, a[2] & MSG_DONTWAIT != 0, t)?, None),
@@ -1129,7 +1172,12 @@ fn sys_recvmsg(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             at += k;
         }
         Ok((n, from))
-    })?;
+    };
+    let (n, from) = if host.is_some() {
+        crate::guest::with_recv_scratch(total.min(1 << 20), receive)
+    } else {
+        crate::guest::with_scratch(total.min(1 << 20), receive)
+    }?;
     if host.is_some() {
         // msg_name: where a datagram came from (a stream's is not reported: namelen 0).
         let name = hdr.name;
@@ -1238,6 +1286,29 @@ mod tests {
             Some(Peer::Pair { channel, side }) => channel.rights_taken(*side).len(),
             _ => 0,
         }
+    }
+
+    /// statsd's socket from an app's host process is a sink: always writable, never readable, what
+    /// is sent taken whole; nothing else is (another path, a stream socket, the system's host
+    /// process), nor anything with the lever off.
+    #[test]
+    fn statsds_socket_from_an_app_is_a_sink_and_nothing_else_is() {
+        use std::sync::atomic::Ordering;
+        let _held = crate::lever::held();
+        assert!(sinks(b"/dev/socket/statsdw", 2, true));
+        assert!(!sinks(b"/dev/socket/statsdw", 2, false), "the system's: statsd binds it there");
+        assert!(!sinks(b"/dev/socket/statsdw", 1, true), "a stream socket");
+        assert!(!sinks(b"/dev/socket/fwmarkd", 2, true));
+        let mut s = end(Peer::Sink);
+        s.ty = 2;
+        assert_eq!(send(&mut s, b"an atom"), Ok(7));
+        assert_eq!(readiness(&s), 0x4, "writable, nothing to read");
+        let mut buf = [0u8; 16];
+        assert_eq!(receive(&mut s, &mut buf), Err(crate::errno::EAGAIN));
+        assert!(own_key(&s).is_some(), "only its own sends change it");
+        let was = STATSD_SINK.swap(false, Ordering::Relaxed);
+        assert!(!sinks(b"/dev/socket/statsdw", 2, true), "statsd_sink=0: refused as before");
+        STATSD_SINK.store(was, Ordering::Relaxed);
     }
 
     #[test]

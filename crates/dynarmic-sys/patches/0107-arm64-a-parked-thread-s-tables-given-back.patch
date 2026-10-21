@@ -1,0 +1,281 @@
+diff -ru a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -530,7 +530,7 @@
+             for (const u32 index : indices) {
+                 consider(index);
+             }
+-            std::erase_if(indices, [&](u32 index) { return guest_ranges[index].dead; });
++            od_guest_page_indices -= std::erase_if(indices, [&](u32 index) { return guest_ranges[index].dead; });
+             return indices.empty();
+         };
+ 
+@@ -606,6 +606,7 @@
+     if (block_entries.empty()) {
+         ClearCache();
+     }
++    OdNoteTableBytes();  // patch 0107
+ }
+ 
+ void A64AddressSpace::ClearCache() {
+@@ -614,10 +615,42 @@
+     // is gone, so nothing registered before the clear can name a block that exists: a location
+     // translated again afterwards registers the range of its new translation, which is the range
+     // its code now depends on.
++    OdDropGuestRanges();
++    OdNoteTableBytes();  // patch 0107
++}
++
++void A64AddressSpace::OdDropGuestRanges() {
+     decltype(guest_ranges){}.swap(guest_ranges);
+     guest_range_pages = {};
+     std::vector<u32>{}.swap(wide_guest_ranges);
+     decltype(guest_range_chunks){}.swap(guest_range_chunks);  // patch 0015
++    od_guest_page_indices = 0;
++}
++
++// Omnidroid patch 0107: a parked thread's tables given back with its code (0104), so that a thread
++// waiting in a system call holds neither. Called by `Jit::Impl::OdDiscardParked` under the jit's
++// invalidation lock, with the clear asked for and the `CacheInvalidation` halt raised before it saw
++// the thread still parked in the `SVC` callback. Nothing reads a table again before that clear:
++// on waking, the thread runs only the rest of its `SVC` block (`SVC` ends its block) -- with cycle
++// counting the `GetTicksRemaining` call through the prelude, then the block's `CheckHalt` terminal:
++// no guest memory access, so no fastmem fault and no `FastmemCallback` -- and `CheckHalt` goes to
++// `return_to_dispatcher`, which tests the halt word before it calls the lookup. The run ends, and the
++// clear is made at its edge, under the same lock, before anything is looked up or emitted. Nothing
++// but the jit's own thread clears that halt bit, and only at a run's edge. Until then the tables are empty and consistent with each other;
++// the code they described is gone but for the pages the thread returns to. `OdTablesGivenBack` says
++// so until the clear (`lookups_after_give_back` counts any lookup made meanwhile: none).
++void A64AddressSpace::OdGiveBackTables() {
++    OdDropTables();
++    OdDropGuestRanges();
++    od_tables_given_back.store(true, std::memory_order_relaxed);
++    OdNoteTableBytes();
++}
++
++void A64AddressSpace::OdNoteTableBytes() {
++    const std::size_t bytes = OdBaseTableBytes() + OdVectorBytes(guest_ranges) + OdBucketBytes(guest_range_pages)
++                            + static_cast<std::size_t>(od_guest_page_indices) * sizeof(u32) + OdVectorBytes(wide_guest_ranges)
++                            + OdBucketBytes(guest_range_chunks);
++    od_table_bytes.store(bytes, std::memory_order_relaxed);
+ }
+ 
+ void A64AddressSpace::EmitPrelude() {
+@@ -946,6 +979,7 @@
+     const u64 first = descriptor.PC();
+     const u64 last = end_location.PC() - 1;
+     if (last < first) {
++        OdNoteTableBytes();  // patch 0107
+         return;
+     }
+     ASSERT(guest_ranges.size() < std::numeric_limits<u32>::max());
+@@ -956,15 +990,18 @@
+     const u64 last_page = last >> guest_page_bits;
+     if (last_page - first_page >= max_indexed_pages) {
+         wide_guest_ranges.push_back(index);
++        OdNoteTableBytes();  // patch 0107
+         return;
+     }
+     for (u64 page = first_page;; ++page) {
+         guest_range_pages[page].push_back(index);
++        od_guest_page_indices++;  // patch 0107
+         guest_range_chunks.insert(page >> (guest_chunk_bits - guest_page_bits));  // patch 0015
+         if (page == last_page) {
+             break;
+         }
+     }
++    OdNoteTableBytes();  // patch 0107
+ }
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff -ru a/src/dynarmic/backend/arm64/a64_address_space.h b/src/dynarmic/backend/arm64/a64_address_space.h
+--- a/src/dynarmic/backend/arm64/a64_address_space.h
++++ b/src/dynarmic/backend/arm64/a64_address_space.h
+@@ -28,6 +28,9 @@
+ 
+     void ClearCache() override;
+ 
++    // Omnidroid patch 0107: see the definition.
++    void OdGiveBackTables();
++
+ protected:
+     friend class A64Core;
+ 
+@@ -64,6 +67,12 @@
+     // one lookup per 4 KiB page, on every guest thread it is broadcast to.
+     static constexpr unsigned guest_chunk_bits = 21;
+     tsl::robin_set<u64> guest_range_chunks;
++
++    // Omnidroid patch 0107: the guest-range index given back (`ClearCache`, `OdGiveBackTables`); the
++    // indices in its page lists, counted for `OdNoteTableBytes`, which stores what every table holds.
++    void OdDropGuestRanges();
++    u64 od_guest_page_indices = 0;
++    void OdNoteTableBytes();
+ };
+ 
+ }  // namespace Dynarmic::Backend::Arm64
+diff -ru a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -169,7 +169,13 @@
+         if (resume == 0 || parked.load(std::memory_order_seq_cst) != resume) {
+             return 0;
+         }
+-        return current_address_space.OdDiscardExcept(resume);
++        const std::size_t given = current_address_space.OdDiscardExcept(resume);
++        current_address_space.OdGiveBackTables();  // patch 0107
++        return given;
++    }
++
++    std::size_t OdTableBytes() const {
++        return current_address_space.OdTableBytes();
+     }
+ 
+     // Omnidroid patch 0106: see the header. A parked thread's tables are read as 0104 gives back its
+@@ -376,6 +382,10 @@
+     return impl->OdDiscardParked(resume, parked);
+ }
+ 
++std::size_t Jit::OdTableBytes() const {
++    return impl->OdTableBytes();
++}
++
+ bool Jit::OdForEachBlock(OdBlockVisitor fn, void* ctx, std::uint64_t resume, const std::atomic<std::uint64_t>* parked) {
+     return impl->OdForEachBlock(fn, ctx, resume, parked);
+ }
+diff -ru a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -75,6 +75,11 @@
+ }
+ 
+ CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
++    // Omnidroid patch 0107: never, by the argument at `A64AddressSpace::OdGiveBackTables`; counted
++    // for `tests/parked_tables.rs`.
++    if (od_tables_given_back.load(std::memory_order_relaxed)) {
++        lookups_after_give_back.fetch_add(1, std::memory_order_relaxed);
++    }
+     if (CodePtr block_entry = Get(descriptor)) {
+         return block_entry;
+     }
+@@ -104,6 +109,17 @@
+ }
+ 
+ void AddressSpace::ClearCache() {
++    OdDropTables();
++    od_tables_given_back.store(false, std::memory_order_relaxed);  // patch 0107
++    // Omnidroid patch 0102: and so are the pages the blocks were in.
++    const std::size_t used = static_cast<std::size_t>(code.offset());
++    code.set_offset(prelude_info.end_of_prelude);
++    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
++    od_in_use.store(0, std::memory_order_relaxed);
++    cache_clears++;
++}
++
++void AddressSpace::OdDropTables() {
+     // Omnidroid patch 0010: given back rather than cleared (`clear()` keeps a robin_map's buckets
+     // and a vector's capacity), so a cleared cache holds no memory for the blocks it no longer has.
+     block_entries = {};
+@@ -111,12 +127,10 @@
+     decltype(fastmem_records){}.swap(fastmem_records);
+     decltype(link_records){}.swap(link_records);
+     link_heads = {};
+-    // Omnidroid patch 0102: and so are the pages the blocks were in.
+-    const std::size_t used = static_cast<std::size_t>(code.offset());
+-    code.set_offset(prelude_info.end_of_prelude);
+-    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
+-    od_in_use.store(0, std::memory_order_relaxed);
+-    cache_clears++;
++}
++
++std::size_t AddressSpace::OdBaseTableBytes() const {
++    return OdBucketBytes(block_entries) + OdBucketBytes(link_heads) + OdVectorBytes(block_records) + OdVectorBytes(fastmem_records) + OdVectorBytes(link_records);
+ }
+ 
+ // Omnidroid patch 0102: the whole pages of `[from, to)` (offsets into the cache) given back. Their
+@@ -548,6 +562,9 @@
+ }
+ 
+ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
++    if (od_tables_given_back.load(std::memory_order_relaxed)) {  // patch 0107: as in `GetOrEmit`
++        lookups_after_give_back.fetch_add(1, std::memory_order_relaxed);
++    }
+     {
+         const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
+ 
+diff -ru a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -57,6 +57,12 @@
+     std::size_t OdCodeBytesInUse() const { return od_in_use.load(std::memory_order_relaxed); }
+     u64 OdCodeBytesEmitted() const { return od_emitted.load(std::memory_order_relaxed); }
+ 
++    // Omnidroid patch 0107: the bytes the per-block tables hold (`A64AddressSpace::OdNoteTableBytes`),
++    // read from any thread; and whether a parked thread's tables have been given back and its clear
++    // is still to come (`A64AddressSpace::OdGiveBackTables`).
++    std::size_t OdTableBytes() const { return od_table_bytes.load(std::memory_order_relaxed); }
++    bool OdTablesGivenBack() const { return od_tables_given_back.load(std::memory_order_relaxed); }
++
+     void DumpDisassembly() const;
+ 
+ protected:
+@@ -97,6 +103,25 @@
+     void OdDiscard(std::size_t from, std::size_t to);
+     void OdReuseUpTo(std::size_t to);
+ 
++    // Omnidroid patch 0107: the per-block tables given back (what `ClearCache` does to them), their
++    // bytes as the derived space last counted them, and the parked-thread state (set from another
++    // thread, under the jit's invalidation lock, while this one is parked).
++    void OdDropTables();
++    std::size_t OdBaseTableBytes() const;
++    // A robin_map's or robin_set's bucket array (tsl keeps each value after a distance and a flag,
++    // aligned to the value), and a vector's capacity.
++    template<typename Map>
++    static std::size_t OdBucketBytes(const Map& map) {
++        using V = typename Map::value_type;
++        return map.bucket_count() * (sizeof(V) + alignof(V));
++    }
++    template<typename Vector>
++    static std::size_t OdVectorBytes(const Vector& vector) {
++        return vector.capacity() * sizeof(typename Vector::value_type);
++    }
++    std::atomic<std::size_t> od_table_bytes{0};
++    std::atomic<bool> od_tables_given_back{false};
++
+ public:
+     // Omnidroid patch 0104: every page of translated code given back but the prelude and the two
+     // pages from `keep` (host code a parked thread returns to); its owner is parked and holds no
+diff -ru a/src/dynarmic/backend/arm64/page_backed_allocator.h b/src/dynarmic/backend/arm64/page_backed_allocator.h
+--- a/src/dynarmic/backend/arm64/page_backed_allocator.h
++++ b/src/dynarmic/backend/arm64/page_backed_allocator.h
+@@ -38,6 +38,11 @@
+ /// the consequence: a fault through a tagged address reports it tagged (`od_set_fastmem_host_tbi`).
+ inline std::atomic<std::uint32_t> live_fastmem_host_tbi{0};
+ 
++/// Omnidroid patch 0107: dispatcher lookups and fastmem faults made by a jit whose tables were given
++/// back while its thread was parked, before its clear, over every jit in the process. Always 0 (see
++/// `A64AddressSpace::OdGiveBackTables`); a test hook (`od_lookups_after_give_back`).
++inline std::atomic<std::uint64_t> lookups_after_give_back{0};
++
+ /// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
+ /// the kernel and gives them straight back.
+ ///
+diff -ru a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -140,9 +140,14 @@
+     /// translated code but those holding the rest of that block. The thread finishes the block on
+     /// return, the halt sends it to the dispatcher, and the clear is made at the edge of its run
+     /// (after this returns: both hold the invalidation lock). The bytes given back; 0 if the
+-    /// thread was no longer parked there.
++    /// thread was no longer parked there. Patch 0107: the per-block tables are given back too.
+     std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
+ 
++    /// Omnidroid patch 0107 (arm64 backend only): the bytes this jit's per-block tables hold (the
++    /// block map, block, fastmem and link records, link heads, the guest-range index), as last
++    /// counted by its thread. Safe to call from any thread.
++    std::size_t OdTableBytes() const;
++
+     /// Omnidroid patch 0106 (arm64 backend only): a census of translated blocks, for measuring how
+     /// many threads translate the same code. `fn(ctx, location, host_bytes)` once per block; it
+     /// must not call into this jit or take a lock.

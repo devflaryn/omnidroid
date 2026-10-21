@@ -695,6 +695,12 @@ void FastmemEmitWriteMemory(oaknut::CodeGenerator& code, EmitContext& ctx, IR::I
 // own reservation (exclusive_state, address[pid], value[pid]) and the compare-and-swap of the
 // reserved value: value-compare, x64's semantics. Without it every exclusive access on arm64 took the
 // process-wide lock and every store-exclusive scanned every slot of the monitor under it.
+//
+// Omnidroid patch 0112: `monitor.address[pid]` and `monitor.value[pid]` are reached through the
+// state -- its pointers to this processor's two slots (A64JitState's `od_exclusive_address` and
+// `od_exclusive_value`) -- instead of being baked in, so a block is right for any processor of the
+// monitor. The lock and the scan of every slot are the monitor's, the same for each processor, and
+// stay immediates.
 
 namespace {
 
@@ -781,13 +787,13 @@ void FastmemEmitExclusiveReadMemory(oaknut::CodeGenerator& code, EmitContext& ct
     EmitMonitorLock(code, ctx);
     code.MOV(Wscratch0, 1);
     code.STRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
-    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_address_offset);
     code.STR(*Xaddr, Xscratch0);
 
     EmitExclusiveHostAddress<bitsize>(code, ctx, Xscratch1, *Xaddr, fallback);
     const CodePtr fastmem_location = EmitMemoryLdr<bitsize>(code, Rvalue->index(), Xscratch1, XZR, true);
 
-    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_value_offset);
     switch (bitsize) {
     case 8:
         code.STRB(oaknut::WReg{Rvalue->index()}, Xscratch0);
@@ -877,14 +883,14 @@ void FastmemEmitExclusiveWriteMemory(oaknut::CodeGenerator& code, EmitContext& c
     code.MOV(*Wstatus, 1);
     code.LDRB(Wscratch0, Xstate, ctx.conf.state_exclusive_state_offset);
     code.CBZ(Wscratch0, no_reservation);
-    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorAddressPointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_address_offset);
     code.LDR(Xscratch0, Xscratch0);
     code.CMP(Xscratch0, *Xaddr);
     code.B(NE, no_reservation);
 
     // Xscratch2 = host address (the lock pointer is no longer needed; unlock reloads it).
     EmitExclusiveHostAddress<bitsize>(code, ctx, Xscratch2, *Xaddr, fallback);
-    code.MOV(Xscratch0, mcl::bit_cast<u64>(GetExclusiveMonitorValuePointer(ctx.conf.global_monitor, ctx.conf.processor_id)));
+    code.LDR(Xscratch0, Xstate, ctx.conf.state_exclusive_value_offset);
 
     CodePtr fastmem_location;
     // Omnidroid patch 0014: the store-release faults too. A page the host lets the load-acquire read

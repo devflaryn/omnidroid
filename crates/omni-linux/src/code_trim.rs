@@ -38,6 +38,12 @@ pub const AGAIN_AFTER: Duration = Duration::from_secs(600);
 /// in the background uses ~0.
 pub const BUSY_CORES: f64 = if cfg!(target_arch = "aarch64") { 0.05 } else { 0.25 };
 
+/// A thread holding more than this of translations of its own -- quiet over a period
+/// ([`QUIET_BYTES`]) in a process that is not, or in a busy host process -- has them dropped
+/// ([`quiet_thread`]). arm64 only in effect: a cache per thread, up to 128 MiB in an app's host
+/// process; the system's host process gives each 8 MiB, under this.
+pub const THREAD_MIN_BYTES: u64 = 8 << 20;
+
 /// A thread parked in a system call this long has its translations given back
 /// (`OMNI_CODE_PARKED_S`, seconds; 0 off): binder loopers and daemons waiting for work.
 pub const PARKED: Duration = Duration::from_secs(120);
@@ -75,6 +81,8 @@ fn run() {
     let min_bytes = std::env::var("OMNI_CODE_TRIM_MIN_MB").ok().and_then(|v| v.parse::<u64>().ok()).map_or(MIN_BYTES, |mb| mb << 20);
     // pid -> (bytes emitted at the last look, when last trimmed).
     let mut seen: HashMap<i32, (u64, Option<Instant>)> = HashMap::new();
+    // A thread's cache (`quiet_thread`) -> the same; `OMNI_CODE_QUIET_THREADS=0` looks at none.
+    let mut threads: Option<HashMap<usize, (u64, Option<Instant>)>> = (std::env::var("OMNI_CODE_QUIET_THREADS").as_deref() != Ok("0")).then(HashMap::new);
     let started = Instant::now();
     // `first_trim` (`crate::settle`): the first look when the host process has settled after its
     // start -- quiet, in all its processes, for seconds in a row -- rather than a period after it.
@@ -85,7 +93,7 @@ fn run() {
     while started.elapsed() < PERIOD {
         std::thread::sleep(Duration::from_secs(1));
         if crate::settle::FIRST_TRIM.load(std::sync::atomic::Ordering::Relaxed) && crate::settle::settled() {
-            look(&mut seen, false, true, min_bytes);
+            look(&mut seen, threads.as_mut(), false, true, min_bytes);
             (cpu, since, early) = (omni_platform::process::cpu_time().ok(), Instant::now(), true);
             break;
         }
@@ -105,14 +113,18 @@ fn run() {
         };
         (cpu, since) = (now_cpu, Instant::now());
         let busy = cores > BUSY_CORES && crate::remote::is_remote();
-        look(&mut seen, busy, false, min_bytes);
+        look(&mut seen, threads.as_mut(), busy, false, min_bytes);
     }
 }
 
 /// One look over the live processes: each quiet one (or every one, `all_quiet`) holding more than
 /// `min_bytes` of translations, not trimmed in [`AGAIN_AFTER`], has them dropped -- unless `busy`.
-fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, busy: bool, all_quiet: bool, min_bytes: u64) {
+/// One that is busy, or not quiet, has its largest quiet thread's dropped instead (`threads`).
+fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, mut threads: Option<&mut HashMap<usize, (u64, Option<Instant>)>>, busy: bool, all_quiet: bool, min_bytes: u64) {
     let live = crate::process::all_live();
+    census(&live);
+    // A vfork child still on its parent's backend: the parent's threads, looked at once.
+    let mut backends = std::collections::HashSet::new();
     for p in &live {
         let pid = p.sys.pid;
         let emitted = p.code_emitted();
@@ -122,7 +134,25 @@ fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, busy: bool, all_quiet: 
         let committed = p.code_cache_committed();
         let quiet = all_quiet || emitted.saturating_sub(last) < QUIET_BYTES;
         let due = trimmed.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
-        if busy || !quiet || !due || committed < min_bytes || name == "surfaceflinger" {
+        if name == "surfaceflinger" {
+            continue;
+        }
+        if busy || !quiet {
+            if !backends.insert(p.backend_key()) {
+                continue;
+            }
+            match threads.as_deref_mut().and_then(|t| quiet_thread(p, t)) {
+                Some(ThreadTrim::GivenBack(given)) => {
+                    eprintln!("[code] {name} (pid {pid}) {}: a parked thread's {} MiB of translations given back", if busy { "busy" } else { "not quiet" }, given >> 20);
+                }
+                Some(ThreadTrim::Cleared(held)) => {
+                    eprintln!("[code] {name} (pid {pid}) {}: a quiet thread's {} MiB of translations dropped", if busy { "busy" } else { "not quiet" }, held >> 20);
+                }
+                None => {}
+            }
+            continue;
+        }
+        if !due || committed < min_bytes {
             continue;
         }
         crate::jit_snapshot::save_before_trim(p);
@@ -131,6 +161,90 @@ fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, busy: bool, all_quiet: 
         eprintln!("[code] {name} (pid {pid}) quiet{}: {} MiB of translations dropped", if all_quiet { " (settled after its start)" } else { "" }, committed >> 20);
     }
     seen.retain(|pid, _| live.iter().any(|p| p.sys.pid == *pid));
+    if let Some(t) = threads {
+        let keys: std::collections::HashSet<usize> = live.iter().flat_map(|p| p.thread_caches()).map(|(k, _, _)| k).collect();
+        t.retain(|k, _| keys.contains(k));
+    }
+}
+
+/// **The largest quiet thread of a process that is not quiet, or of a busy host process** (the
+/// game's), has its translations dropped: one thread a look, each at most once every
+/// [`AGAIN_AFTER`]. A thread holding more than [`THREAD_MIN_BYTES`] of its own (arm64) that has
+/// translated under [`QUIET_BYTES`] since the last look has run what it holds for a period: what it
+/// runs from now on is translated again, and the rest -- its share of the start -- goes. In an app's
+/// host process the whole-process trim never comes while it is busy (TalkingTomCamp on screen, M4
+/// 2026-10-20: 50 threads, four of them holding 11-51 MiB each, none translating). What was done,
+/// if anything.
+fn quiet_thread(p: &crate::process::Process, threads: &mut HashMap<usize, (u64, Option<Instant>)>) -> Option<ThreadTrim> {
+    let mut largest: Option<(usize, u64)> = None;
+    for (key, in_use, emitted) in p.thread_caches() {
+        let (last, cleared) = threads.get(&key).copied().unwrap_or((u64::MAX, None));
+        threads.insert(key, (emitted, cleared));
+        // Not seen at the last look (or a new jit at an old one's address): not known to be quiet.
+        let quiet = emitted >= last && emitted - last < QUIET_BYTES;
+        let due = cleared.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
+        if quiet && due && in_use > THREAD_MIN_BYTES && largest.is_none_or(|(_, b)| in_use > b) {
+            largest = Some((key, in_use));
+        }
+    }
+    let (key, bytes) = largest?;
+    let given = p.trim_thread_code(key)?;
+    if let Some(t) = threads.get_mut(&key) {
+        t.1 = Some(Instant::now());
+    }
+    Some(if given > 0 { ThreadTrim::GivenBack(given) } else { ThreadTrim::Cleared(bytes) })
+}
+
+/// What [`quiet_thread`] did to the thread it chose.
+enum ThreadTrim {
+    /// Parked in a system call: these bytes of code given back now, its tables with them, and
+    /// nothing more of it found by [`parked_pass`] while it stays parked (patch 0108). A clear
+    /// asked instead would wait for it to wake, and the parked pass would give back -- and count
+    /// again -- the same pages meanwhile.
+    GivenBack(u64),
+    /// Running: its cache, holding these bytes, cleared at the edge of its run.
+    Cleared(u64),
+}
+
+/// How long a census look waits for running threads to send their live blocks (each does at the
+/// end of its run slice, a millisecond or so; parked ones are read at once).
+const CENSUS_GATHER: Duration = Duration::from_millis(250);
+
+/// **The duplication census** at a look, before any trim (`OMNI_JIT_CENSUS=1`; arm64): one
+/// `[jit-census]` line per process -- threads T, live blocks summed S and distinct U (`D_mem` =
+/// S/U), their host code; host code emitted since the process's start, summed and distinct
+/// (`D_emit`), and the distinct bytes' growth since the last look. All processes are asked together;
+/// a vfork child still on its parent's backend is the parent's line.
+fn census(live: &[std::sync::Arc<crate::process::Process>]) {
+    let mut backends = std::collections::HashSet::new();
+    let asked: Vec<_> = live.iter().filter(|p| backends.insert(p.backend_key()) && p.census_begin()).collect();
+    if asked.is_empty() {
+        return;
+    }
+    std::thread::sleep(CENSUS_GATHER);
+    let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+    for p in asked {
+        let Some(c) = p.census_end() else { continue };
+        eprintln!(
+            "[jit-census] host {} {} (pid {}): {} threads, blocks {} / {} distinct (D_mem {:.2}), {:.2} / {:.2} MiB; emitted {:.2} / {:.2} MiB distinct, blocks {} / {} (D_emit {:.2}); distinct +{:.2} MiB/min; census maps {:.2} MiB",
+            std::process::id(),
+            String::from_utf8_lossy(&p.comm.lock()),
+            p.sys.pid,
+            c.threads,
+            c.blocks,
+            c.distinct_blocks,
+            c.d_mem(),
+            mib(c.bytes),
+            mib(c.distinct_bytes),
+            mib(c.emitted_bytes),
+            mib(c.emitted_distinct_bytes),
+            c.emitted_blocks,
+            c.emitted_distinct_blocks,
+            c.d_emit(),
+            mib(c.distinct_growth_per_min),
+            mib(c.own_bytes)
+        );
+    }
 }
 
 /// **The age pass: the oldest translations of the system's busy processes, given back on a long

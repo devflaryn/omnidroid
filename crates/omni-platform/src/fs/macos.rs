@@ -28,6 +28,25 @@ use super::VolumeStats;
 // macOS shortens a mapped file as Linux does, so the end of file is the host's own; see `unix.rs`.
 pub(super) use super::unix::{logical_len, logical_len_at, open, settle, truncate, write};
 
+/// `fsync(2)` for [`Os`](super::SyncLevel::Os): the data handed to the drive, which may hold it in
+/// its cache. [`Full`](super::SyncLevel::Full) is `std`'s `sync_data`, `fcntl(F_FULLFSYNC)` (with
+/// `fsync` where the volume refuses it): the drive's cache flushed too, for the whole device.
+pub(super) fn sync_data(file: &File, level: super::SyncLevel) -> std::io::Result<()> {
+    if level == super::SyncLevel::Full {
+        return file.sync_data();
+    }
+    loop {
+        // SAFETY: a descriptor `file` owns, open for this call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
 /// `pread(2)`: one call, short reads reported, the descriptor's offset untouched.
 pub(super) fn pread(file: &File, buf: &mut [u8], offset: u64) -> FsResult<usize> {
     file.read_at(buf, offset).map_err(|error| FsError::io("pread", "a descriptor", &error))

@@ -24,6 +24,7 @@ pub mod ws_trim;
 pub mod threadsys;
 pub mod proccpu;
 pub mod bpf;
+pub mod card;
 pub mod device;
 pub mod display_window;
 pub mod displays;

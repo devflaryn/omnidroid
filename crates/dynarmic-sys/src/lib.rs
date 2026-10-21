@@ -232,8 +232,10 @@ pub struct OdConfig {
     /// Opaque host pointer handed to every callback. See the crate docs on
     /// re-entrancy before deciding what this points at.
     pub ctx: *mut c_void,
-    /// D13: where `TPIDR_EL0` lives. dynarmic inlines this pointer into
-    /// generated code, so the pointee must be pinned for the jit's life.
+    /// D13: where `TPIDR_EL0` lives. Generated code reads and writes through
+    /// this pointer -- kept in the jit's state (arm64, vendored patch 0112;
+    /// x64's shared cache, 0022) or inlined (an x64 cache of its own) -- so
+    /// the pointee must be pinned for the jit's life.
     pub tpidr_el0: *mut u64,
     /// Where `TPIDRRO_EL0` lives; same pinning requirement.
     pub tpidrro_el0: *const u64,
@@ -437,9 +439,9 @@ pub struct OdEffectiveConfig {
     /// every write is bracketed by `pthread_jit_write_protect_np`, so each thread sees it either
     /// writable or executable, never both. That one is measured by `tests/wx.rs`, not echoed.
     pub code_cache_w_xor_x: i32,
-    /// Address of the `TPIDR_EL0` slot baked into generated code; 0 means the
-    /// guest cannot read it, which D13 says breaks every stack-protected
-    /// function in `libroblox.so`.
+    /// Address of the `TPIDR_EL0` slot generated code reads and writes (on arm64 as the jit's
+    /// state holds it, vendored patch 0112); 0 means the guest cannot read it, which D13 says
+    /// breaks every stack-protected function in `libroblox.so`.
     pub tpidr_el0_ptr: u64,
     /// Address of the `TPIDRRO_EL0` slot.
     pub tpidrro_el0_ptr: u64,
@@ -1008,6 +1010,16 @@ extern "C" {
     /// `jit` must be live.
     pub fn od_jit_clear_exclusive(jit: *mut c_void);
 
+    /// Back to the state a new jit starts in (every register, SP, PC, PSTATE, FPCR, FPSR and the
+    /// exclusive state zero), keeping what is the thread's own -- its callbacks, its thread
+    /// pointers' slots, its reservation slots in the monitor -- which the arm64 backend's
+    /// generated code reads from that state (vendored patch 0112). 1; 0, changing nothing, from
+    /// inside one of the jit's callbacks.
+    ///
+    /// # Safety
+    /// `jit` must be live, on its own thread.
+    pub fn od_jit_reset(jit: *mut c_void) -> u32;
+
     /// Read back what dynarmic is configured with.
     ///
     /// # Safety
@@ -1029,11 +1041,69 @@ extern "C" {
 
     /// arm64 (vendored patch 0104): from any thread, if the jit's thread has been inside an `SVC`
     /// callback for at least `parked_at_least_ns`, give back its cache's translated code (cleared
-    /// when it next runs). The bytes given back.
+    /// when it next runs). The bytes given back. Patch 0107: its per-block tables too.
     ///
     /// # Safety
     /// `jit` must be live.
     pub fn od_jit_discard_parked(jit: *mut c_void, parked_at_least_ns: u64) -> u64;
+
+    /// arm64 (vendored patch 0107): the bytes the jit's per-block tables hold (block map, records,
+    /// link heads, guest-range index), from any thread. 0 elsewhere.
+    ///
+    /// # Safety
+    /// `jit` must be live.
+    pub fn od_jit_table_bytes(jit: *mut c_void) -> u64;
+
+    /// arm64 (vendored patch 0112): what the jit's generated code reads per thread from its state
+    /// instead of immediates, in this order: the callbacks object, the config the non-inline
+    /// exclusives are given, `TPIDR_EL0`'s slot, `TPIDRRO_EL0`'s slot, and this processor's
+    /// reservation-address and reserved-value slots in the monitor (0 without one). Up to `n` of
+    /// the [`OD_THREAD_VALUES`] into `out`; returns how many. 0 elsewhere.
+    ///
+    /// # Safety
+    /// `jit` must be live and not being reset; `out` must hold `n` writable `u64`s.
+    pub fn od_jit_thread_values(jit: *mut c_void, out: *mut u64, n: u32) -> u32;
+
+    /// arm64 (vendored patch 0107): dispatcher lookups and fastmem faults made by jits whose tables
+    /// were given back while parked, before their clear, in this process. Always 0; a test hook.
+    pub fn od_lookups_after_give_back() -> u64;
+
+    /// arm64 (vendored patch 0106): where the census of translated blocks goes, process-wide (null,
+    /// the default: nowhere). See [`OdCensusSink`]. A no-op elsewhere.
+    ///
+    /// # Safety
+    /// `sink` must be safe to call from any thread that runs or emits for a joined jit, and from
+    /// any thread that calls [`od_jit_block_census`], until it is replaced.
+    pub fn od_set_census_sink(sink: Option<OdCensusSink>);
+
+    /// arm64 (vendored patch 0106): `jit`'s blocks go to `group` from now on -- each block it
+    /// emits, and its live blocks when asked ([`od_jit_block_census`]). Null: nowhere. A no-op
+    /// elsewhere.
+    ///
+    /// # Safety
+    /// `jit` must be live and not yet run, nor reachable by a thread that may call
+    /// [`od_jit_block_census`] on it (the group is a plain field); `group` must stay valid for the
+    /// sink until the jit is freed.
+    pub fn od_jit_census_join(jit: *mut c_void, group: *mut c_void);
+
+    /// arm64 (vendored patch 0106): ask for `jit`'s live blocks, from any thread. Read at once if
+    /// its thread is parked in an `SVC` callback (returns 1, the sink called before this returns),
+    /// else by its own thread at the end of its next run (0); a running thread is not stopped for
+    /// it. 0 and a no-op elsewhere, or for a jit in no group.
+    ///
+    /// # Safety
+    /// `jit` must be live.
+    pub fn od_jit_block_census(jit: *mut c_void) -> u32;
+
+    /// arm64 (vendored patch 0114), a test hook: the block `jit`'s cache holds for `location`
+    /// (dynarmic's `LocationDescriptor`: the guest PC while FPCR is 0) into `out`, and up to
+    /// `capacity` of its link sites -- each its offset from the entry point into `offsets` and its
+    /// kind ([`OD_LINK_BRANCH`] or [`OD_LINK_RSB_SLOT`]) into `kinds`. All zero elsewhere.
+    ///
+    /// # Safety
+    /// `jit` must be live and not executing, called on its own thread; `out` writable; `offsets`
+    /// and `kinds` writable for `capacity` elements each.
+    pub fn od_jit_block_links(jit: *mut c_void, location: u64, out: *mut OdBlockLinks, offsets: *mut u32, kinds: *mut u32, capacity: u32);
 
     /// Zero the callback-entry counters, so a specific loop can be measured.
     ///
@@ -1072,12 +1142,12 @@ extern "C" {
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
     pub fn od_set_live_fp_optimizations(mask: u32) -> u32;
 
-    /// Patch 0037 (x64 only): non-zero runs `GetSetElimination`, in a form precise at every guest
-    /// data access, on every block translated from now on by a jit whose config sets
+    /// Patch 0037 (both backends since 0120): non-zero runs `GetSetElimination`, in a form precise
+    /// at every guest data access, on every block translated from now on by a jit whose config sets
     /// `check_halt_on_memory_access` -- which otherwise skips the pass, so that every guest
     /// register read is a load from `JitState` and every write a store. Blocks already translated
     /// keep what they were translated with -- clear the cache to have them again. Returns the value
-    /// in force (1 or 0); 0 and a no-op on arm64.
+    /// in force (1 or 0).
     ///
     /// # Safety
     /// None beyond an ordinary FFI call: it stores one process-wide atomic.
@@ -1089,7 +1159,7 @@ extern "C" {
     /// Returns the switch (1 or 0); 0 on arm64.
     pub fn od_set_batch_ic_ivau(on: u32) -> u32;
 
-    /// Patch 0037: the switch [`od_set_precise_get_set`] sets (1 or 0; 0 on arm64).
+    /// Patch 0037: the switch [`od_set_precise_get_set`] sets (1 or 0).
     ///
     /// # Safety
     /// None beyond an ordinary FFI call: it loads one process-wide atomic.
@@ -1204,6 +1274,44 @@ pub const OD_SNAPSHOT_LOAD_LAZY: u32 = 1;
 /// Patch 0070: [`od_code_cache_save_snapshot`]'s flag leaving out the blocks restored and never
 /// entered since.
 pub const OD_SNAPSHOT_ENTERED_ONLY: u32 = 1;
+
+/// Patch 0106: the census's sink -- `count` blocks of `group`'s, each its location (dynarmic's
+/// `LocationDescriptor`: guest PC and mode) and host code bytes. `kind` is [`OD_CENSUS_LIVE`] (every
+/// block one jit holds, in one call) or [`OD_CENSUS_EMITTED`] (one block just emitted, on the
+/// emitting thread).
+pub type OdCensusSink = unsafe extern "C" fn(group: *mut c_void, kind: u32, locations: *const u64, host_bytes: *const u32, count: u64);
+/// Patch 0106: [`OdCensusSink`]'s kind for one jit's live blocks.
+pub const OD_CENSUS_LIVE: u32 = 0;
+/// Patch 0106: [`OdCensusSink`]'s kind for a block just emitted.
+pub const OD_CENSUS_EMITTED: u32 = 1;
+
+/// Patch 0112: how many values [`od_jit_thread_values`] reports.
+pub const OD_THREAD_VALUES: u32 = 6;
+
+/// Patch 0114: [`od_jit_block_links`]'s kind for a branch word -- one instruction, `B` to the
+/// target linked, `NOP` not.
+pub const OD_LINK_BRANCH: u32 = 0;
+/// Patch 0114: [`od_jit_block_links`]'s kind for a return-stack slot -- 8 aligned bytes of data a
+/// `PushRSB` loads: the predicted block's entry point linked, [`OdBlockLinks::unlinked_slot`] not.
+pub const OD_LINK_RSB_SLOT: u32 = 1;
+
+/// Patch 0114: what [`od_jit_block_links`] reports of one block (`od_block_links`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OdBlockLinks {
+    /// Host entry point; 0 when the cache holds no block for the location.
+    pub entry_point: u64,
+    /// The block's host bytes, its slots included.
+    pub host_bytes: u64,
+    /// What an unlinked return-stack slot holds: the dispatcher's entry.
+    pub unlinked_slot: u64,
+    /// Bytes of code the cache's relinks have handed to instruction-cache maintenance so far.
+    pub relink_maintained: u64,
+    /// The block's link sites, those past `capacity` too.
+    pub count: u32,
+    /// Zero.
+    pub reserved: u32,
+}
 
 /// Patch 0062: see [`od_set_emit_observer`].
 pub type OdEmitObserver = unsafe extern "C" fn(ctx: *mut c_void, guest_pc: u64, host: *const c_void, code_bytes: usize, total_bytes: usize);

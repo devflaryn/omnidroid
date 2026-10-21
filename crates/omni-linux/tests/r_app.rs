@@ -16,7 +16,7 @@
 //! Minutes long: `cargo test -p omni-linux --release --test r_app -- --ignored --nocapture`.
 mod common;
 
-use omni_linux::app_session::{says, AppSession};
+use omni_linux::app_session::{says, AppDeaths, AppSession};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -209,6 +209,10 @@ fn settings_script() -> String {
 /// installer kept enabled).
 const DEVICE_SETUP: u32 = 2;
 
+/// How saved warm devices are set up (`warm_device`): one saved by an older setup is not booted
+/// (3: the idle apps' disabling written before the device is saved).
+const WARM_SETUP: u32 = 3;
+
 /// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
 /// file or another setup is another device.
 fn golden_dir(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool, locale: &str) -> PathBuf {
@@ -294,7 +298,7 @@ fn signed_in_wait(session: &AppSession, limit: u32) -> String {
 #[test]
 #[ignore = "boots the whole system, installs and starts an app: many minutes"]
 fn the_apk_is_installed_started_and_draws() {
-    let Some(sysroot) = common::sysroot() else { return };
+    let Some(sysroot) = common::device_sysroot() else { return };
     if std::env::var("OMNI_R_WARM").as_deref() == Ok("1") {
         return warm_device(&sysroot);
     }
@@ -508,6 +512,7 @@ fn the_apk_is_installed_started_and_draws() {
     let mut joined = false;
     let mut signed_in = false;
     let mut app_died = false;
+    let mut deaths = AppDeaths::default();
     let mut loaded_id: Option<String> = None;
     let quiet = std::cell::Cell::new(false);
     let stopped = std::cell::Cell::new(false);
@@ -565,9 +570,9 @@ fn the_apk_is_installed_started_and_draws() {
                 let _ = std::fs::write(in_tmp("signed-in"), "1");
             }
         }
-        // The app's process died (a crash, a kill): the join script starts it again.
-        // A standby device that had opened its link opens it again.
-        if package.as_deref().is_some_and(|p| line.contains(&format!("Process {p} (pid "))) && line.contains("has died") {
+        // The app's process died (a crash, a kill; however the log tells it, `AppDeaths`): the join
+        // script starts it again. A standby device that had opened its link opens it again.
+        if package.as_deref().is_some_and(|p| deaths.died(line, p)) {
             let _ = std::fs::write(in_tmp("app-died"), "1");
             app_died = true;
             let _ = std::fs::remove_file(in_tmp("game-loaded"));
@@ -673,7 +678,7 @@ fn multi_display_key() -> &'static str {
 /// apps a host program (the MCP server) installs, starts and stops through the device's control
 /// channel (`<instance>.ctl`, `omni-linux-run --control`) one after another. The device is the
 /// kiosk device the app sessions boot, less their APK: set up once (`settings_script`), saved
-/// under `OMNI_R_GOLDEN` as `base-<kiosk|ui>-<locale>-v<DEVICE_SETUP>` and booted from a copy
+/// under `OMNI_R_GOLDEN` as `base-<kiosk|ui>-<locale>-v<WARM_SETUP>` and booted from a copy
 /// afterwards. The host writes `/data/local/tmp/warm-ready` once it can take an app, and the
 /// session runs `OMNI_R_MINUTES` (default 720) or until `/data/local/tmp/stop`.
 fn warm_device(sysroot: &Path) {
@@ -703,7 +708,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{DEVICE_SETUP}{rooted_key}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key())));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key())));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");
@@ -717,7 +722,11 @@ fn warm_device(sysroot: &Path) {
         if let Some(request) = &root_req {
             stage_root(&instance, request);
         }
-        let rest = if golden.is_some() { "sync; sleep 2; echo \"[r] device quiet\"; ".to_string() } else { "echo \"[r] warm ready\"; ".to_string() };
+        // A device to be saved waits out PackageManager's write of the idle apps' disabling: it
+        // writes package-restrictions 10 s after a change (WRITE_SETTINGS_DELAY), and a device saved
+        // 4 s after its setup booted with all 18 enabled again (but the first) -- each started at
+        // boot, and again for every new user (2026-10-19). The shell user cannot see the file.
+        let rest = if golden.is_some() { "sleep 12; sync; sleep 2; echo \"[r] device quiet\"; ".to_string() } else { "echo \"[r] warm ready\"; ".to_string() };
         format!("{BOOTED}{}{rest}", settings_script())
     };
     // A rooted warm device says which root profile it has (`omni_warm::ROOT_HASH_FILE`): a request

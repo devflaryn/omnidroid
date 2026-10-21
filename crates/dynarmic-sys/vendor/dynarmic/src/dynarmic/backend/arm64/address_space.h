@@ -57,6 +57,12 @@ public:
     std::size_t OdCodeBytesInUse() const { return od_in_use.load(std::memory_order_relaxed); }
     u64 OdCodeBytesEmitted() const { return od_emitted.load(std::memory_order_relaxed); }
 
+    // Omnidroid patch 0107: the bytes the per-block tables hold (`A64AddressSpace::OdNoteTableBytes`),
+    // read from any thread; and whether a parked thread's tables have been given back and its clear
+    // is still to come (`A64AddressSpace::OdGiveBackTables`).
+    std::size_t OdTableBytes() const { return od_table_bytes.load(std::memory_order_relaxed); }
+    bool OdTablesGivenBack() const { return od_tables_given_back.load(std::memory_order_relaxed); }
+
     void DumpDisassembly() const;
 
 protected:
@@ -97,13 +103,66 @@ protected:
     void OdDiscard(std::size_t from, std::size_t to);
     void OdReuseUpTo(std::size_t to);
 
+    // Omnidroid patch 0107: the per-block tables given back (what `ClearCache` does to them), their
+    // bytes as the derived space last counted them, and the parked-thread state (set from another
+    // thread, under the jit's invalidation lock, while this one is parked).
+    void OdDropTables();
+    std::size_t OdBaseTableBytes() const;
+    // A robin_map's or robin_set's bucket array (tsl keeps each value after a distance and a flag,
+    // aligned to the value), and a vector's capacity.
+    template<typename Map>
+    static std::size_t OdBucketBytes(const Map& map) {
+        using V = typename Map::value_type;
+        return map.bucket_count() * (sizeof(V) + alignof(V));
+    }
+    template<typename Vector>
+    static std::size_t OdVectorBytes(const Vector& vector) {
+        return vector.capacity() * sizeof(typename Vector::value_type);
+    }
+
+    // Omnidroid patch 0109: the block map and the link heads at load factor 0.75, not tsl's 0.5:
+    // their bucket arrays are half the size whenever the entries are between a half and three
+    // quarters of a power of two, for a little longer robin-hood probes. Set on an empty map. tsl
+    // computes each size limit as `size_t(float(bucket_count) * load_factor)` on the emitting
+    // thread -- inside a run, under the guest's FPCR -- so the factor must give exact products:
+    // 0.75 x 2^k is an integer from 4 buckets up, the same in every rounding mode and raising no
+    // flag; tsl's first growth from none would be to 2 (1.5), so the map starts at 4.
+    template<typename Map>
+    static void OdUseLoadFactor(Map& map) {
+        map.max_load_factor(0.75f);
+        map.rehash(4);
+    }
+    std::atomic<std::size_t> od_table_bytes{0};
+    std::atomic<bool> od_tables_given_back{false};
+
 public:
     // Omnidroid patch 0104: every page of translated code given back but the prelude and the two
     // pages from `keep` (host code a parked thread returns to); its owner is parked and holds no
     // pointer into the rest. The bytes given back.
     std::size_t OdDiscardExcept(std::uint64_t keep);
 
+    // Omnidroid patch 0106: the census (`Jit::OdForEachBlock`, `Jit::OdSetEmitHook`).
+    using OdBlockVisitor = void (*)(void* ctx, u64 location, u32 host_bytes);
+    void OdForEachBlock(OdBlockVisitor fn, void* ctx) const;
+    void OdSetEmitHook(OdBlockVisitor fn, void* ctx) {
+        od_emit_hook_ctx = ctx;
+        od_emit_hook = fn;
+    }
+
+    // Omnidroid patch 0114, a test hook (`Jit::OdBlockLinks`): the block held for `location` (null
+    // if none) and its size, and each of its link sites, `fn(ctx, offset, kind)` -- kind 0 a branch
+    // word, 1 a return-stack slot; what an unlinked slot holds; and the bytes of code relinks have
+    // handed to instruction-cache maintenance. On the owning thread, outside a run.
+    using OdLinkVisitor = void (*)(void* ctx, std::uint32_t offset, std::uint32_t kind);
+    CodePtr OdBlockLinks(IR::LocationDescriptor location, u32& host_bytes, OdLinkVisitor fn, void* ctx) const;
+    void* OdUnlinkedSlot() const { return prelude_info.return_to_dispatcher; }
+    u64 OdRelinkMaintained() const { return od_relink_maintained; }
+
 protected:
+    OdBlockVisitor od_emit_hook = nullptr;
+    void* od_emit_hook_ctx = nullptr;
+    u64 od_relink_maintained = 0;  // patch 0114
+
     oaknut::CodeBlock mem;
     oaknut::CodeGenerator code;
 

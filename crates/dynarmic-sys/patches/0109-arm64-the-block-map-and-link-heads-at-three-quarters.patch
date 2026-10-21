@@ -1,0 +1,44 @@
+diff -ru a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -33,6 +33,8 @@
+         , code(mem.ptr(), mem.ptr())
+         , fastmem_manager(exception_handler) {
+     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
++    OdUseLoadFactor(block_entries);  // patch 0109
++    OdUseLoadFactor(link_heads);
+ 
+     exception_handler.Register(mem, code_cache_size);
+     exception_handler.SetFastmemCallback([this](u64 host_pc) {
+@@ -127,6 +129,8 @@
+     decltype(fastmem_records){}.swap(fastmem_records);
+     decltype(link_records){}.swap(link_records);
+     link_heads = {};
++    OdUseLoadFactor(block_entries);  // patch 0109
++    OdUseLoadFactor(link_heads);
+ }
+ 
+ std::size_t AddressSpace::OdBaseTableBytes() const {
+diff -ru a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -119,6 +119,19 @@
+     static std::size_t OdVectorBytes(const Vector& vector) {
+         return vector.capacity() * sizeof(typename Vector::value_type);
+     }
++
++    // Omnidroid patch 0109: the block map and the link heads at load factor 0.75, not tsl's 0.5:
++    // their bucket arrays are half the size whenever the entries are between a half and three
++    // quarters of a power of two, for a little longer robin-hood probes. Set on an empty map. tsl
++    // computes each size limit as `size_t(float(bucket_count) * load_factor)` on the emitting
++    // thread -- inside a run, under the guest's FPCR -- so the factor must give exact products:
++    // 0.75 x 2^k is an integer from 4 buckets up, the same in every rounding mode and raising no
++    // flag; tsl's first growth from none would be to 2 (1.5), so the map starts at 4.
++    template<typename Map>
++    static void OdUseLoadFactor(Map& map) {
++        map.max_load_factor(0.75f);
++        map.rehash(4);
++    }
+     std::atomic<std::size_t> od_table_bytes{0};
+     std::atomic<bool> od_tables_given_back{false};
+ 

@@ -1,0 +1,27 @@
+diff -ru a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -169,6 +169,12 @@
+         if (resume == 0 || parked.load(std::memory_order_seq_cst) != resume) {
+             return 0;
+         }
++        // Omnidroid patch 0108: given back already, and not run since (its clear is still to come):
++        // nothing more to give. The same pages were counted again at every pass while the thread
++        // stayed parked, which overstated what the trim gave back.
++        if (current_address_space.OdTablesGivenBack()) {
++            return 0;
++        }
+         const std::size_t given = current_address_space.OdDiscardExcept(resume);
+         current_address_space.OdGiveBackTables();  // patch 0107
+         return given;
+diff -ru a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -141,6 +141,7 @@
+     /// return, the halt sends it to the dispatcher, and the clear is made at the edge of its run
+     /// (after this returns: both hold the invalidation lock). The bytes given back; 0 if the
+     /// thread was no longer parked there. Patch 0107: the per-block tables are given back too.
++    /// Patch 0108: 0 when they were given back already and the thread has not run since.
+     std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
+ 
+     /// Omnidroid patch 0107 (arm64 backend only): the bytes this jit's per-block tables hold (the

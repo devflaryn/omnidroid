@@ -21,16 +21,25 @@
 //!
 //! **Only the app is presented** (the default; `OMNI_APP_ONLY=0` or
 //! [`Composer::set_show_chrome`] shows the whole display): the system's chrome -- SystemUI's status
-//! and navigation bars and screen decorations, the launcher's taskbar -- are layers like any other
-//! here, and the composer leaves them out of what it presents. It knows them by the window their
-//! buffers are for: a window's BufferQueue names its buffers after it when it asks the allocator
-//! for them (`VRI[StatusBar]#0(BLAST Consumer)0`; `hal::gralloc` keeps the name, [`is_chrome`]).
-//! A chrome layer stays `DEVICE`, which is the composer's to draw -- and it draws nothing. When the
-//! frame's other layers are the composer's too, they are composed as they are; when one is not,
-//! they go to SurfaceFlinger (`CLIENT`), whose client target then holds everything but the chrome,
-//! with the app's own pixels where the chrome would have been on top of them. The app's layer is
-//! not moved or scaled: an app that draws edge to edge (a game; any app on a device without
-//! SystemUI) fills the display, and one that keeps clear of the bars shows its own background there.
+//! and navigation bars and screen decorations, the launcher's taskbar -- and Settings'
+//! `FallbackHome` (the home Android starts when there is no launcher: "Phone is starting...", on a
+//! kiosk device's every display before its app draws and after the app is gone) are layers like
+//! any other here, and the composer leaves them out of what it presents. It knows them by the
+//! window their buffers are for: a window's BufferQueue names its buffers after it when it asks the
+//! allocator for them (`VRI[StatusBar]#0(BLAST Consumer)0`; `hal::gralloc` keeps the name,
+//! [`is_chrome`]). A hidden layer stays `DEVICE`, which is the composer's to draw -- and it draws
+//! nothing. When the frame's other layers are the composer's too, they are composed as they are;
+//! when one is not, they go to SurfaceFlinger (`CLIENT`), whose client target then holds everything
+//! but the hidden layers, with the app's own pixels where the chrome would have been on top of
+//! them; with no other layer, the frame is the composer's, and black. The app's layer is not moved
+//! or scaled: an app that draws edge to edge (a game; any app on a device without SystemUI) fills
+//! the display, and one that keeps clear of the bars shows its own background there.
+//!
+//! **A card instead of the display's frames** ([`Composer::set_card`], `crate::card`): what
+//! happened to the app a display's instance ran -- it crashed, it stopped -- drawn on the host at
+//! the display's size and presented into its framebuffer, and so into its window, while the
+//! display's own frames are presented nowhere until the card is taken away. Android goes on
+//! composing the display meanwhile; only the composer's present leaves it out.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Weak};
@@ -347,13 +356,23 @@ pub fn edid(port: u8, name: &str) -> Vec<u8> {
     e
 }
 
-/// The windows that are the system's chrome, by the start of their title: SystemUI's bars and
-/// screen decorations (rounded corners, cutout), and the launcher's taskbar.
-const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer"];
+/// The windows left out of what is presented (this module's "Only the app"), by the start of their
+/// buffers' window name: SystemUI's bars and screen decorations (rounded corners, cutout), the
+/// launcher's taskbar, and Settings' `FallbackHome` (the home of a device without a launcher).
+///
+/// Not the crash dialog (`AppErrorDialog`, titled `Application Error: <process>`), though it is no
+/// more the app's: a view root names its buffers after the last dot-separated part of its window's
+/// title (`ViewRootImpl.setTag`, AOSP 15's framework.jar, read 2026-10-19), so the dialog for
+/// `com.roblox.client` is `VRI[client]` -- which is also the ANR dialog's (`Application Not
+/// Responding: com.roblox.client`), shown because waiting or closing is the person's choice, and
+/// that of any window of the app whose title ends in `.client`. A crashed app's display gets a
+/// card instead ([`Composer::set_card`]), which covers the dialog with the rest.
+const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer", "FallbackHome"];
 
-/// Whether a buffer of this name (`hal::gralloc`'s metadata page) is one of the system's chrome:
-/// a view root's BufferQueue is named `VRI[<window title>]#<n>(BLAST Consumer)<n>`, and the title
-/// is one of [`CHROME`]'s.
+/// Whether a buffer of this name (`hal::gralloc`'s metadata page) is one of the windows left out
+/// ([`CHROME`]): a view root's BufferQueue is named `VRI[<name>]#<n>(BLAST Consumer)<n>`, the name
+/// being its window title's last dot-separated part (`com.android.settings/...FallbackHome` is
+/// `FallbackHome`), and the name is one of [`CHROME`]'s.
 #[must_use]
 pub fn is_chrome(buffer_name: &str) -> bool {
     let Some(title) = buffer_name.strip_prefix("VRI[").and_then(|rest| rest.split(']').next()) else { return false };
@@ -370,11 +389,29 @@ struct Screen {
     framebuffer: Arc<Framebuffer>,
     mode: Mutex<Mode>,
     state: Mutex<State>,
+    /// The card shown instead of the display's frames ([`Composer::set_card`]), if any. Its lock is
+    /// held for the whole of a present, taken before the state's: two paths write the framebuffer
+    /// after letting the state go (the CPU composition's copy, the client target's), so the state's
+    /// lock alone would let a card be drawn between a frame's composition and its write, and the
+    /// frame land over it.
+    card: Mutex<Option<crate::card::Card>>,
 }
 
 impl Screen {
+    fn new(framebuffer: Arc<Framebuffer>, width: u32, height: u32) -> Self {
+        Self { framebuffer, mode: Mutex::new(Mode { config: 0, width, height }), state: Mutex::default(), card: Mutex::new(None) }
+    }
+
     fn mode(&self) -> Mode {
         *self.mode.lock()
+    }
+
+    /// `card` drawn at the display's size now, presented into its framebuffer (and so its window,
+    /// by the window's own present: a frame with pixels, which it shows over whatever the composer
+    /// wrote into the window itself).
+    fn present_card(&self, card: &crate::card::Card) {
+        let Mode { width, height, .. } = self.mode();
+        self.framebuffer.present_frame(&crate::card::render(card, width, height), width, height, width);
     }
 }
 
@@ -394,8 +431,8 @@ impl Composer {
     pub fn new(broker: Arc<Broker>, framebuffer: Arc<Framebuffer>) -> Arc<Self> {
         let (width, height) = framebuffer.size();
         let show_chrome = std::env::var("OMNI_APP_ONLY").as_deref() == Ok("0");
-        eprintln!("[composer] {}", if show_chrome { "the whole display is presented (OMNI_APP_ONLY=0)" } else { "only the app is presented: the system's bars and taskbar are left out" });
-        let screen = Arc::new(Screen { framebuffer, mode: Mutex::new(Mode { config: 0, width, height }), state: Mutex::default() });
+        eprintln!("[composer] {}", if show_chrome { "the whole display is presented (OMNI_APP_ONLY=0)" } else { "only the app is presented: the system's bars, taskbar and FallbackHome are left out" });
+        let screen = Arc::new(Screen::new(framebuffer, width, height));
         let screens: Screens = Arc::new(Mutex::new([(DISPLAY, screen)].into_iter().collect()));
         Arc::new(Self { broker, screens, client: Mutex::new(None), show_chrome: Arc::new(AtomicBool::new(show_chrome)) })
     }
@@ -421,10 +458,60 @@ impl Composer {
             return;
         }
         eprintln!("[composer] {}", if show { "the whole display is presented" } else { "only the app is presented" });
+        self.refresh(DISPLAY);
+    }
+
+    /// Ask SurfaceFlinger for a frame of the display `id` now (`onRefresh`): the composer changed
+    /// how it presents, and a still screen would otherwise show the change only when it next moves.
+    fn refresh(&self, id: i64) {
         let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
         if let Some(callback) = callback {
-            let _ = IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_refresh(DISPLAY);
+            let _ = IComposerCallbackProxy::new(Arc::clone(&self.broker), callback).on_refresh(id);
         }
+    }
+
+    /// **Show `card` on the display `id` instead of its frames** (see this module's "A card"), or,
+    /// with `None`, its frames again.
+    ///
+    /// The card is drawn at the display's size and presented into its framebuffer at once -- so a
+    /// window that opens on the display's first frame opens on it -- and from then on no frame of
+    /// the display reaches the framebuffer or the window by any path ([`Client::present`] looks
+    /// first, under the card's lock); a resize draws it again at the new size. Taken away, the
+    /// display's next frame is composed even if nothing in it changed (the unchanged frame's
+    /// signature is the frame before the card's), and SurfaceFlinger is asked for one at once, so
+    /// a still screen comes back too.
+    ///
+    /// # Errors
+    /// A display there is not.
+    pub fn set_card(&self, id: i64, card: Option<crate::card::Card>) -> Result<(), String> {
+        let screen = self.screen(id).ok_or_else(|| format!("no display {id}"))?;
+        let mut held = screen.card.lock();
+        if let Some(card) = card {
+            screen.present_card(&card);
+            eprintln!("[composer] display {id}: a card instead of its frames ({:?})", card.title);
+            *held = Some(card);
+            return Ok(());
+        }
+        if held.take().is_none() {
+            return Ok(());
+        }
+        screen.state.lock().composed.clear();
+        drop(held);
+        eprintln!("[composer] display {id}: its frames again");
+        self.refresh(id);
+        Ok(())
+    }
+
+    /// Whether the pixel `(x, y)` of the display `id` is in the restart block of the card it shows
+    /// now ([`crate::card::restart_rect`] at the display's size, as the card was drawn): what the
+    /// window asks of a click over a card. False with no card, or a card with no block.
+    #[must_use]
+    pub fn card_restart_at(&self, id: i64, x: u32, y: u32) -> bool {
+        let Some(screen) = self.screen(id) else { return false };
+        // The card's lock first, then the mode's, as a present takes them.
+        let card = screen.card.lock();
+        let Mode { width, height, .. } = screen.mode();
+        card.as_ref().and_then(|c| crate::card::restart_rect(c, width, height)).is_some_and(|(rx, ry, rw, rh)| (rx..rx.saturating_add(rw)).contains(&x) && (ry..ry.saturating_add(rh)).contains(&y))
     }
 
     /// Display 0's size now.
@@ -438,6 +525,23 @@ impl Composer {
     pub fn display_size_of(&self, id: i64) -> (u32, u32) {
         let m = self.screen(id).map_or(Mode { config: 0, width: WIDTH, height: HEIGHT }, |s| s.mode());
         (m.width, m.height)
+    }
+
+    /// **Who draws on the display `id`**: the requestors of the buffers its layers hold now (any
+    /// slot), `(pid, uid)` as the allocator wrote them ([`super::gralloc::owner`]), each once.
+    /// SurfaceFlinger keeps a composer layer only while its layer is on the display's visible set
+    /// (CompositionEngine's output layers): an app whose window left the display -- its activity
+    /// finished while its process stays cached, or another covers it -- is none of them. A layer
+    /// whose buffers the allocator did not make names nobody. `None`: a display there is not.
+    #[must_use]
+    pub fn owners(&self, id: i64) -> Option<Vec<(i32, u32)>> {
+        let screen = self.screen(id)?;
+        let st = screen.state.lock();
+        let mut out: Vec<(i32, u32)> = st.layers.keys().filter_map(|l| st.device.get(l)).flat_map(|d| d.buffers.values()).filter_map(|b| super::gralloc::owner(&b.shm)).collect();
+        drop(st);
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
     }
 
     /// The ids of the displays there are, display 0 first.
@@ -472,6 +576,11 @@ impl Composer {
             *m = Mode { config: m.config + 1, width, height };
             m.config
         };
+        // A card shown is drawn again at the new size now: the display's frames, which would
+        // follow the resize, are not presented.
+        if let Some(card) = screen.card.lock().as_ref() {
+            screen.present_card(card);
+        }
         let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
         eprintln!("[composer] display {id} {width}x{height} (config {config}): {}", if callback.is_some() { "hotplug" } else { "before SurfaceFlinger" });
         if let Some(callback) = callback {
@@ -518,7 +627,7 @@ impl Composer {
         let id = {
             let mut screens = self.screens.lock();
             let id = screens.keys().copied().max().unwrap_or(DISPLAY) + 1;
-            screens.insert(id, Arc::new(Screen { framebuffer: Arc::clone(&framebuffer), mode: Mutex::new(Mode { config: 0, width, height }), state: Mutex::default() }));
+            screens.insert(id, Arc::new(Screen::new(Arc::clone(&framebuffer), width, height)));
             id
         };
         let callback = self.client.lock().as_ref().and_then(|c| *c.callback.lock());
@@ -651,7 +760,7 @@ struct State {
     device: HashMap<i64, LayerState>,
     /// Whether the frame being presented is the composer's own (`DEVICE`), decided at validation.
     device_frame: bool,
-    /// The chrome layers left out of the frame being presented, decided at validation.
+    /// The layers left out of the frame being presented ([`is_chrome`]), decided at validation.
     hidden: std::collections::HashSet<i64>,
     /// Frames presented by each path, for the `[composer]` line.
     frames_device: u64,
@@ -776,8 +885,14 @@ impl Client {
         }
     }
 
-    /// Present the frame: the composer's own composition of its layers, or the client target.
+    /// Present the frame: the composer's own composition of its layers, or the client target --
+    /// or nothing while the display shows a card ([`Composer::set_card`]), whose lock is held to
+    /// the end, so a card set meanwhile is drawn after this frame and never under it.
     fn present(&self, screen: &Screen) {
+        let card = screen.card.lock();
+        if card.is_some() {
+            return;
+        }
         let mut st = screen.state.lock();
         if st.device_frame {
             // **An unchanged frame is not composed again.** SurfaceFlinger presents every display
@@ -942,7 +1057,7 @@ impl Client {
 }
 
 /// Layer `l` of the frame as `super::compose` takes it, its buffer's pixels `data`: `None` for a
-/// layer not drawn (hidden chrome, no frame, a buffer layer without its pixels or crop).
+/// layer not drawn (hidden, no frame, a buffer layer without its pixels or crop).
 fn layer_of<'a>(st: &State, l: i64, data: Option<&'a [u8]>) -> Option<super::compose::Layer<'a>> {
     use super::compose::{Blend, Layer, Source};
     let d = st.device.get(&l)?;
@@ -1624,7 +1739,8 @@ impl IComposerClientServer for Client {
                 let hide = !self.show_chrome.load(Ordering::Relaxed);
                 let device = {
                     let mut st = screen.state.lock();
-                    // The chrome left out: layers the composer was asked to draw itself.
+                    // The chrome and FallbackHome left out: layers the composer was asked to draw
+                    // itself.
                     let hidden: std::collections::HashSet<i64> = if hide {
                         st.layers
                             .iter()
@@ -1634,7 +1750,11 @@ impl IComposerClientServer for Client {
                     } else {
                         std::collections::HashSet::new()
                     };
-                    let all = !off && !st.layers.is_empty() && st.layers.iter().filter(|(l, _)| !hidden.contains(l)).all(|(l, c)| st.device.get(l).is_some_and(|d| d.composable(*c)));
+                    // A frame of nothing but hidden layers is the composer's even under
+                    // `OMNI_COMPOSER_DEVICE=0`, and black: SurfaceFlinger would compose nothing and
+                    // send no client target, and the one held is the frame before's (the app's
+                    // last, after it crashed and left FallbackHome).
+                    let all = !st.layers.is_empty() && st.layers.iter().filter(|(l, _)| !hidden.contains(l)).all(|(l, c)| !off && st.device.get(l).is_some_and(|d| d.composable(*c)));
                     if !all && !off {
                         log_client_reason(&st, &hidden);
                     }
@@ -1658,8 +1778,8 @@ impl IComposerClientServer for Client {
                     }
                     continue;
                 }
-                // Every layer is composed by the client -- but the chrome left out, which stays the
-                // composer's (and is not drawn).
+                // Every layer is composed by the client -- but the hidden ones (chrome,
+                // FallbackHome), which stay the composer's (and are not drawn).
                 let changed: Vec<ChangedCompositionLayer> = {
                     let mut st = screen.state.lock();
                     let State { layers, hidden, .. } = &mut *st;
@@ -2135,21 +2255,190 @@ mod tests {
         assert!(paced > 59.5 && paced < 60.5, "deadlines ran at {paced:.3} Hz");
     }
 
-    /// Names as the image's own windows give them (run 2026-09-28: SystemUI, the launcher, Roblox).
+    /// Names as the image's own windows give them (run 2026-09-28: SystemUI, the launcher, Roblox,
+    /// Settings' FallbackHome). The crash and ANR dialogs of `com.roblox.client` are both
+    /// `VRI[client]` (`ViewRootImpl.setTag`): shown, as an app's window of that name would be.
     #[test]
-    fn the_bars_and_the_taskbar_are_chrome_and_an_app_is_not() {
-        for chrome in ["VRI[StatusBar]#0(BLAST Consumer)0", "VRI[Taskbar]#0(BLAST Consumer)0", "VRI[NavigationBar0]#3(BLAST Consumer)3", "VRI[ScreenDecorOverlayBottom]#5(BLAST Consumer)5"] {
+    fn the_bars_the_taskbar_and_fallback_home_are_hidden_and_an_app_is_not() {
+        for chrome in [
+            "VRI[StatusBar]#0(BLAST Consumer)0",
+            "VRI[Taskbar]#0(BLAST Consumer)0",
+            "VRI[NavigationBar0]#3(BLAST Consumer)3",
+            "VRI[ScreenDecorOverlayBottom]#5(BLAST Consumer)5",
+            "VRI[FallbackHome]#0(BLAST Consumer)0",
+        ] {
             assert!(is_chrome(chrome), "{chrome}");
         }
         for app in [
             "SurfaceView[com.roblox.client/com.roblox.client.ActivityNativeMain]#2(BLAST Consumer)2",
             "VRI[ActivityNativeMain]#1(BLAST Consumer)1",
-            "VRI[FallbackHome]#0(BLAST Consumer)0",
+            "VRI[client]#4(BLAST Consumer)4",
             "bbq-adapter#0(BLAST Consumer)0",
             "",
             "StatusBar",
+            "FallbackHome",
         ] {
             assert!(!is_chrome(app), "{app}");
         }
+    }
+
+    /// A display with nothing on it but a hidden window -- FallbackHome, once the app's layers are
+    /// gone -- presents black: not the app's last frame, not FallbackHome.
+    #[test]
+    fn a_frame_of_only_hidden_layers_is_black() {
+        use super::super::aidl::android_hardware_graphics_composer3::{Color, LayerCommand, ParcelableComposition};
+        use super::*;
+        let (w, h) = (64u32, 32u32);
+        let fb = Arc::new(Framebuffer::new(w, h));
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::clone(&fb));
+        let client = Client::new(Arc::clone(&composer.broker), Arc::clone(&composer.screens), Arc::new(AtomicBool::new(false)));
+        let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
+        let ctx = Ctx { call: &call };
+        let full = common::Rect { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+        let app = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        let frame = |layers: Vec<LayerCommand>| DisplayCommand { display: DISPLAY, layers, validate_display: true, present_display: true, ..Default::default() };
+        let red = LayerCommand {
+            layer: app,
+            composition: Some(ParcelableComposition { composition: Composition::SOLID_COLOR }),
+            display_frame: Some(full.clone()),
+            color: Some(Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+            ..Default::default()
+        };
+        client.execute_commands(&ctx, vec![frame(vec![red])]).unwrap();
+        assert_eq!(&fb.pixels()[..4], &[255, 0, 0, 255], "the app");
+        let before = fb.frames();
+        // The app is gone; FallbackHome's window is all there is, its buffer as gralloc names it.
+        client.destroy_layer(&ctx, DISPLAY, app).unwrap();
+        let home = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        {
+            let screen = composer.screen(DISPLAY).unwrap();
+            let mut st = screen.state.lock();
+            st.layers.insert(home, Composition::DEVICE);
+            let shm = crate::shm::Shm::create("fallback-home-test").unwrap();
+            let name = "VRI[FallbackHome]#0(BLAST Consumer)0".to_string();
+            let buffer = LayerBuffer { shm, format: RGBA_8888, stride: w, width: w, height: h, pixels_at: 0, name };
+            let crop = common::FRect { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+            st.device.insert(home, LayerState { buffers: [(0, buffer)].into_iter().collect(), slot: Some(0), frame: Some(full), crop: Some(crop), ..LayerState::default() });
+        }
+        client.execute_commands(&ctx, vec![frame(Vec::new())]).unwrap();
+        assert_eq!(fb.frames(), before + 1, "presented");
+        assert!(fb.pixels().as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]), "black");
+    }
+
+    /// Who draws on a display: the requestors the allocator wrote into its layers' buffers, any
+    /// slot's, each once -- not another display's, not a buffer it did not make; a destroyed
+    /// layer's go with it. `#host display owners` answers the same.
+    #[test]
+    fn a_display_s_owners_are_the_requestors_of_its_layers_buffers() {
+        use super::*;
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::new(Framebuffer::new(64, 32)));
+        let client = Client::new(Arc::clone(&composer.broker), Arc::clone(&composer.screens), Arc::new(AtomicBool::new(false)));
+        let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
+        let ctx = Ctx { call: &call };
+        let (id, _) = composer.add_display(64, 32).unwrap();
+        let buffer = |owner: Option<(i32, u32)>| {
+            let shm = Shm::create("owners-test").unwrap();
+            shm.set_len(PIXELS_AT).unwrap();
+            if let Some(o) = owner {
+                super::super::gralloc::set_owner(&shm, o).unwrap();
+            }
+            LayerBuffer { shm, format: RGBA_8888, stride: 64, width: 64, height: 32, pixels_at: PIXELS_AT, name: String::new() }
+        };
+        let (app, surface, home) = (client.create_layer(&ctx, id, 3).unwrap(), client.create_layer(&ctx, id, 3).unwrap(), client.create_layer(&ctx, DISPLAY, 3).unwrap());
+        {
+            let screen = composer.screen(id).unwrap();
+            let mut st = screen.state.lock();
+            let slots = [(0, buffer(Some((310_000, 1_010_116)))), (1, buffer(Some((310_000, 1_010_116))))];
+            st.device.insert(app, LayerState { buffers: slots.into_iter().collect(), slot: Some(1), ..LayerState::default() });
+            st.device.insert(surface, LayerState { buffers: [(0, buffer(Some((311_000, 1_010_116)))), (2, buffer(None))].into_iter().collect(), ..LayerState::default() });
+            composer.screen(DISPLAY).unwrap().state.lock().device.insert(home, LayerState { buffers: [(0, buffer(Some((1210, 1000))))].into_iter().collect(), ..LayerState::default() });
+        }
+        assert_eq!(composer.owners(id), Some(vec![(310_000, 1_010_116), (311_000, 1_010_116)]));
+        assert_eq!(composer.owners(DISPLAY), Some(vec![(1210, 1000)]));
+        let displays = crate::displays::Displays::new(Arc::clone(&composer), false, None, None, Duration::from_secs(5), None);
+        assert_eq!(displays.handle(&format!("display owners {id}")), (0, "310000 1010116\n311000 1010116\n".to_string()));
+        client.destroy_layer(&ctx, id, app).unwrap();
+        assert_eq!(composer.owners(id), Some(vec![(311_000, 1_010_116)]));
+        client.destroy_layer(&ctx, id, surface).unwrap();
+        assert_eq!(composer.owners(id), Some(Vec::new()), "its windows left the display");
+        assert_eq!(composer.owners(id + 1), None);
+    }
+
+    /// A card is the framebuffer's at once and stays so through the display's frames; a resize
+    /// draws it again at the new size; taken away, the display's frames come back -- the same frame
+    /// as before the card too, which the unchanged-frame check would otherwise skip.
+    #[test]
+    fn a_card_is_shown_instead_of_the_frames_until_taken_away() {
+        use super::super::aidl::android_hardware_graphics_composer3::{Color, LayerCommand, ParcelableComposition};
+        use super::*;
+        use crate::card::{render, Card};
+        let fb = Arc::new(Framebuffer::new(64, 32));
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::clone(&fb));
+        let client = Client::new(Arc::clone(&composer.broker), Arc::clone(&composer.screens), Arc::new(AtomicBool::new(false)));
+        let call = crate::binder::HostCall { code: 0, data: Vec::new(), offsets: Vec::new(), fds: Vec::new(), handles: Vec::new(), sender_pid: 1, sender_euid: 1000 };
+        let ctx = Ctx { call: &call };
+        let layer = client.create_layer(&ctx, DISPLAY, 3).unwrap();
+        let frame = |layers: Vec<LayerCommand>| DisplayCommand { display: DISPLAY, layers, validate_display: true, present_display: true, ..Default::default() };
+        let red = LayerCommand {
+            layer,
+            composition: Some(ParcelableComposition { composition: Composition::SOLID_COLOR }),
+            display_frame: Some(common::Rect { left: 0, top: 0, right: 64, bottom: 32 }),
+            color: Some(Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+            ..Default::default()
+        };
+        client.execute_commands(&ctx, vec![frame(vec![red.clone()])]).unwrap();
+        assert_eq!(&fb.pixels()[..4], &[255, 0, 0, 255]);
+        let card = Card::parse("Talking Tom stopped\nNative crash: SIGSEGV at 0x0 in libgame.so");
+
+        composer.set_card(DISPLAY, Some(card.clone())).unwrap();
+        let shown = fb.frames();
+        assert_eq!(fb.pixels(), render(&card, 64, 32), "the card, at once");
+        let blue = LayerCommand { color: Some(Color { r: 0.0, g: 0.0, b: 1.0, a: 1.0 }), ..red.clone() };
+        client.execute_commands(&ctx, vec![frame(vec![blue])]).unwrap();
+        client.execute_commands(&ctx, vec![frame(vec![red.clone()])]).unwrap();
+        assert_eq!(fb.frames(), shown, "no frame presented over it");
+        assert_eq!(fb.pixels(), render(&card, 64, 32));
+
+        composer.set_card(DISPLAY, None).unwrap();
+        // SurfaceFlinger's refresh: the frame as it was before the card, nothing in it changed.
+        client.execute_commands(&ctx, vec![frame(Vec::new())]).unwrap();
+        assert_eq!(fb.frames(), shown + 1, "composed again");
+        assert_eq!(&fb.pixels()[..4], &[255, 0, 0, 255]);
+        assert_eq!(composer.set_card(7, None), Err("no display 7".to_string()));
+
+        composer.set_card(DISPLAY, Some(card.clone())).unwrap();
+        composer.set_display_size_of(DISPLAY, 400, 330).unwrap();
+        assert_eq!(fb.size(), (400, 330), "drawn again at the new size");
+        assert_eq!(fb.pixels(), render(&card, 400, 330));
+        let shown = fb.frames();
+        client.execute_commands(&ctx, vec![frame(Vec::new())]).unwrap();
+        assert_eq!(fb.frames(), shown);
+        composer.set_card(DISPLAY, None).unwrap();
+        client.execute_commands(&ctx, vec![frame(Vec::new())]).unwrap();
+        assert_eq!((fb.frames(), fb.size()), (shown + 1, (400, 330)), "the display's frame, at its size");
+        assert_eq!(&fb.pixels()[..4], &[255, 0, 0, 255]);
+        assert_eq!(&fb.pixels()[400 * 4 * 100..400 * 4 * 100 + 4], &[0, 0, 0, 255], "below the 64x32 layer: black");
+    }
+
+    /// A display pixel is in the restart block where the card's own layout puts it at the display's
+    /// size now -- after a resize too; nowhere without a card, or with a card that offers none.
+    #[test]
+    fn a_click_lands_on_the_restart_block_of_the_card_shown() {
+        use super::*;
+        use crate::card::{restart_rect, Card};
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::new(Framebuffer::new(1280, 720)));
+        let card = Card::parse("com.a crashed\nNative crash: SIGSEGV\n\u{1}restart\tRestarting in 5 seconds\tClick here to restart now\n\nClose this window when you are done.");
+        let (x, y, w, h) = restart_rect(&card, 1280, 720).unwrap();
+        assert!(!composer.card_restart_at(DISPLAY, x + w / 2, y + h / 2), "no card yet");
+        composer.set_card(DISPLAY, Some(card.clone())).unwrap();
+        assert!(composer.card_restart_at(DISPLAY, x + w / 2, y + h / 2));
+        assert!(composer.card_restart_at(DISPLAY, x, y) && composer.card_restart_at(DISPLAY, x + w - 1, y + h - 1), "its corners");
+        assert!(!composer.card_restart_at(DISPLAY, x + w, y + h / 2) && !composer.card_restart_at(DISPLAY, x + w / 2, y - 1), "just outside");
+        assert!(!composer.card_restart_at(7, x + w / 2, y + h / 2), "no display 7");
+        composer.set_display_size_of(DISPLAY, 400, 700).unwrap();
+        let (x, y, w, h) = restart_rect(&card, 400, 700).unwrap();
+        assert!(composer.card_restart_at(DISPLAY, x + w / 2, y + h / 2), "at the display's new size");
+        composer.set_card(DISPLAY, Some(Card::parse("com.a crashed\nNative crash: SIGSEGV"))).unwrap();
+        assert!(!composer.card_restart_at(DISPLAY, x + w / 2, y + h / 2), "a card without a block");
     }
 }

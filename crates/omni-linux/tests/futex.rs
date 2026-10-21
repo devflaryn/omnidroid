@@ -113,6 +113,39 @@ fn cmp_requeue_moves_waiters_and_checks_the_value() {
     }
 }
 
+/// A wait that times out takes itself out of its own queue and leaves the others -- and, moved by a
+/// requeue, out of the queue it was moved to.
+#[test]
+fn a_timed_out_wait_leaves_its_own_queue_even_when_requeued() {
+    let (p, s) = process();
+    let (a, b, c) = (s, s + 8, s + 16);
+    for word in [a, b, c] {
+        p.mem.write_u32(word, 0).unwrap();
+    }
+    // 400 ms, relative.
+    p.mem.write_u64(s + 64, 0).unwrap();
+    p.mem.write_u64(s + 72, 400_000_000).unwrap();
+    let timed = waiter(&p, 2050, [a, WAIT | PRIVATE, 0, s + 64, 0, 0]);
+    until("the timed waiter", || p.futexes.waiters(a) == 1);
+    let on_a = waiter(&p, 2051, [a, WAIT | PRIVATE, 0, 0, 0, 0]);
+    let on_c = waiter(&p, 2052, [c, WAIT | PRIVATE, 0, 0, 0, 0]);
+    until("the others", || p.futexes.waiters(a) == 2 && p.futexes.waiters(c) == 1);
+    // The oldest on a, the timed one, moved to b.
+    assert_eq!(futex(&p, 1, [a, CMP_REQUEUE | PRIVATE, 0, 1, b, 0]), 1);
+    assert_eq!((p.futexes.waiters(a), p.futexes.waiters(b)), (1, 1));
+    assert_eq!(timed.join().unwrap(), ETIMEDOUT);
+    assert_eq!((p.futexes.waiters(a), p.futexes.waiters(b), p.futexes.waiters(c)), (1, 0, 1));
+    // One that times out where it began.
+    let timed = waiter(&p, 2053, [a, WAIT | PRIVATE, 0, s + 64, 0, 0]);
+    until("a second timed waiter", || p.futexes.waiters(a) == 2);
+    assert_eq!(timed.join().unwrap(), ETIMEDOUT);
+    assert_eq!((p.futexes.waiters(a), p.futexes.waiters(c)), (1, 1));
+    assert_eq!(futex(&p, 1, [a, WAKE | PRIVATE, 10, 0, 0, 0]), 1);
+    assert_eq!(futex(&p, 1, [c, WAKE | PRIVATE, 10, 0, 0, 0]), 1);
+    assert_eq!(on_a.join().unwrap(), 0);
+    assert_eq!(on_c.join().unwrap(), 0);
+}
+
 #[test]
 fn wake_op_changes_the_second_word_and_wakes_by_the_comparison() {
     let (p, s) = process();

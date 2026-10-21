@@ -2,7 +2,7 @@
 //! replies as the NDK client reads them. The live path (libui in a guest) is `d2_gralloc.rs`.
 use omni_linux::binder::{HostCall, HostReply};
 use omni_linux::fd::FileKind;
-use omni_linux::hal::gralloc::{Allocator, PIXELS_AT};
+use omni_linux::hal::gralloc::{owner, Allocator, PIXELS_AT};
 use omni_linux::hal::parcel::{Reader, Writer};
 
 const DESCRIPTOR: &str = "android.hardware.graphics.allocator.IAllocator";
@@ -142,6 +142,8 @@ fn allocate2_answers_one_handle_whose_fd_is_a_shm_region() {
     let mut name = [0u8; 8];
     shm.read_at(&mut name, 64).unwrap();
     assert_eq!(&name, b"d2-test\0");
+    // And the requestor itself, the sender's pid and uid (which app draws a display's layers).
+    assert_eq!(owner(&shm), Some((42, 1000)));
 }
 
 #[test]

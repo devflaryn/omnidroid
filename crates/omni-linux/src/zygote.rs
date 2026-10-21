@@ -9,7 +9,9 @@
 //! system's (`crate::remote`), under the uid and pid the reply gives, and the reply says a wrapper
 //! is used (ActivityManager then waits for the app as long as for a wrapped one). WrapperInit
 //! preloads as the zygote does; everything the app then does (`attachApplication`,
-//! `bindApplication`, its Activity) is the framework's own.
+//! `bindApplication`, its Activity) is the framework's own. app_process's class is
+//! `com.omnidroid.spare.App`, which runs WrapperInit and reports a crash of the app's main thread
+//! while binder is open (`app_command`; not for a process hidden from root, `guarded`).
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -173,7 +175,7 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
     let installed = uid >= 10_000 && installed_app(&launcher.instance, &package);
     let pid = launch(launcher, uid, nice.as_deref(), sdk.unwrap_or(0), &rest, installed).unwrap_or(-1);
     let mut reply = int(pid);
-    reply.push(1); // usingWrapper: the process is WrapperInit's
+    reply.push(1); // usingWrapper: the process runs WrapperInit
     Some(reply)
 }
 
@@ -257,12 +259,51 @@ fn launch_host(launcher: &Launcher, uid: u32, nice: Option<&str>, sdk: u32, clas
         return Some(pid);
     }
     let pid = crate::process::reserve_pid();
-    let mut cmd = host_command(launcher, pid, uid, nice, &[]);
-    // WrapperInit <pipe fd> <target sdk>: no pipe (the pid is the one this reply gives).
-    cmd.args(["com.android.internal.os.WrapperInit", "0", &sdk.to_string()]);
-    cmd.args(class_and_args);
+    let cmd = app_command(launcher, pid, uid, nice, sdk, class_and_args, guarded(launcher, uid, nice));
     eprintln!("[zygote] launching {} as pid {pid} uid {uid}: {}", nice.unwrap_or("?"), class_and_args.join(" "));
     spawn(cmd, pid, uid)
+}
+
+/// **The command an app process is launched with**: app_process runs `com.omnidroid.spare.App`
+/// (`/vendor/framework/omni-spare.jar`, `device/src/spare/`), which runs `WrapperInit <pipe fd>
+/// <target sdk> <class> [args...]` -- no pipe: the pid is the one the reply gives -- and hands an
+/// exception escaping the app's main thread to the thread's handlers itself. app_process runs its
+/// class under `AppRuntime::onStarted`, which closes binder (`IPCThreadState::stopProcess`) as soon
+/// as the class's main returns, before ART dispatches that exception: run as WrapperInit itself
+/// (`guarded` false), every main-thread crash's report to ActivityManager failed ("Error reporting
+/// crash", `RuntimeException: Bad file descriptor`, 2026-10-19) -- no `am_crash`, its activity kept.
+/// Guarded, `am crash` on a pool instance was ActivityManager's: exit reason 4 (APP CRASH), a
+/// DropBox `data_app_crash`, no dialog for a background user (2026-10-20).
+fn app_command(launcher: &Launcher, pid: i32, uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String], guarded: bool) -> std::process::Command {
+    let (env, class): (&[&str], &str) =
+        if guarded { (&["CLASSPATH=/vendor/framework/omni-spare.jar"], "com.omnidroid.spare.App") } else { (&[], "com.android.internal.os.WrapperInit") };
+    let mut cmd = host_command(launcher, pid, uid, nice, env);
+    cmd.args([class, "0", &sdk.to_string()]);
+    cmd.args(class_and_args);
+    cmd
+}
+
+/// Whether app processes start under `com.omnidroid.spare.App` (`app_command`):
+/// `OMNI_APP_CRASH_ENTRY=0` in the environment or the per-app switches starts them as WrapperInit
+/// itself, as before (an A/B). A spare is guarded alike, whatever this says.
+fn crash_entry() -> bool {
+    std::env::var("OMNI_APP_CRASH_ENTRY").as_deref() != Ok("0") && !app_switch("OMNI_APP_CRASH_ENTRY=0")
+}
+
+/// Whether the app process `nice` of `uid` starts guarded: [`crash_entry`], unless the root profile
+/// hides root from it (and may spoof the emulator for it, `root::ProcessView`, decided as its host
+/// process decides it). The guard names omnidroid where such an app's anti-tamper looks -- the
+/// jar in its class path, its `CLASSPATH` and its maps (ART extracts the deflated dex into memory
+/// named after the jar), `com.omnidroid.spare.App` under every main-thread stack -- none of which a
+/// phone has; hiding devices start no spare for the same reason (`hiding_device`). Its main-thread
+/// crashes go unreported, as before ("Error reporting crash").
+fn guarded(launcher: &Launcher, uid: u32, nice: Option<&str>) -> bool {
+    crash_entry() && !crate::root::ProcessView::for_process(crate::root::Profile::of(&launcher.instance).as_deref(), nice, uid).hidden
+}
+
+/// Whether the per-app switches (`OMNI_APP_ENV_FILE`) hold the line `switch`.
+fn app_switch(switch: &str) -> bool {
+    std::env::var_os("OMNI_APP_ENV_FILE").and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|t| t.lines().any(|l| l.trim() == switch))
 }
 
 /// An app host process's command, up to the class app_process runs: the runner, the instance,
@@ -380,6 +421,7 @@ fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
             }
             // Reaped by a thread of its own; the app's end reaches the system through binder. Kept
             // by pid meanwhile, for a signal the system sends it (`signal`).
+            let host = child.id();
             let child = Arc::new(parking_lot::Mutex::new(child));
             CHILDREN.lock().insert(pid, Arc::clone(&child));
             std::thread::spawn(move || {
@@ -393,6 +435,12 @@ fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
                 };
                 CHILDREN.lock().remove(&pid);
                 crate::remote::revoke_credential(pid);
+                // Its direct-access gate, left on the disk by a process that ends without a word,
+                // would outlive the session; its regions stay for the session, a crossed one opened
+                // by path again (`crate::shm::remove_gate_of`).
+                if crate::shm::SWEEP.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::shm::remove_gate_of(&crate::shm::host_dir(), host);
+                }
                 eprintln!("[zygote] pid {pid} ended: {status:?}");
             });
             Some(pid)
@@ -409,9 +457,10 @@ fn spawn(mut cmd: std::process::Command, pid: i32, uid: u32) -> Option<i32> {
 /// -- waiting in `com.omnidroid.spare.Spare` (`/vendor/framework/omni-spare.jar`) for a file that
 /// names the app: `<uid> <target sdk> <class> [args...]`. The pid it was started under is the one
 /// the zygote's reply gives ActivityManager, its uid is rebound (`remote::rebind_uid`) before it
-/// runs WrapperInit (its preload done while it waited), and a new spare is started some seconds
-/// after (`OMNI_APP_SPARE_DELAY_S`, default 5: the app's start runs on one thread, the spare's on
-/// others). The warm device keeps one (`tests/r_app.rs`); an app session does not.
+/// runs WrapperInit (its preload done while it waited; guarded as `app_command`'s is), and a new
+/// spare is started some seconds after (`OMNI_APP_SPARE_DELAY_S`, default 5: the app's start runs
+/// on one thread, the spare's on others). The warm device keeps one (`tests/r_app.rs`); an app
+/// session does not.
 struct Spare {
     pid: i32,
     /// The host path of the file it waits for.
@@ -474,8 +523,7 @@ fn take_spare(uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String])
         return None;
     }
     // `OMNI_APP_SPARE=0` in the per-app switches: this start does without (an A/B on one device).
-    let off = std::env::var_os("OMNI_APP_ENV_FILE").and_then(|f| std::fs::read_to_string(f).ok()).is_some_and(|t| t.lines().any(|l| l.trim() == "OMNI_APP_SPARE=0"));
-    if off {
+    if app_switch("OMNI_APP_SPARE=0") {
         return None;
     }
     let spare = SPARE.lock().take()?;
@@ -568,6 +616,57 @@ shamiko=whitelist
         assert!(bound.is_some_and(|b| b.listening.load(std::sync::atomic::Ordering::SeqCst)));
         // Not a child zygote: an app.
         assert_eq!(child_zygote_socket(&args(&["--setuid=10115", "android.app.ActivityThread", "seq=1"])), None);
+    }
+
+    /// Every launched app process runs WrapperInit under `com.omnidroid.spare.App`, from the spare's
+    /// jar -- not the system server's class path -- so a crash of its main thread reaches
+    /// ActivityManager; the A/B's old entry is WrapperInit itself.
+    #[test]
+    fn an_app_runs_wrapper_init_under_the_crash_guard() {
+        let l = Launcher {
+            runner: PathBuf::from("/nonexistent/omni-linux-run"),
+            sysroot: PathBuf::new(),
+            instance: PathBuf::new(),
+            envp: vec![b"CLASSPATH=/system/framework/services.jar".to_vec(), b"ANDROID_ROOT=/system".to_vec()],
+            binder: String::new(),
+            vm_options: Vec::new(),
+        };
+        let line = |guarded: bool| {
+            let cmd = app_command(&l, 310_000, 1_010_116, Some("com.a"), 35, &args(&["android.app.ActivityThread", "seq=7"]), guarded);
+            cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>().join(" ")
+        };
+        let guarded = line(true);
+        assert!(guarded.contains("--env CLASSPATH=/vendor/framework/omni-spare.jar") && guarded.contains("--env ANDROID_ROOT=/system"), "{guarded}");
+        assert!(!guarded.contains("services.jar") && !guarded.contains("WrapperInit"), "{guarded}");
+        assert!(guarded.ends_with("--nice-name=com.a com.omnidroid.spare.App 0 35 android.app.ActivityThread seq=7"), "{guarded}");
+        let old = line(false);
+        assert!(!old.contains("CLASSPATH="), "{old}");
+        assert!(old.ends_with("--nice-name=com.a com.android.internal.os.WrapperInit 0 35 android.app.ActivityThread seq=7"), "{old}");
+    }
+
+    /// A process the root profile hides root from starts as WrapperInit itself: the guard's jar,
+    /// class path and frames would tell its anti-tamper of omnidroid. Every other process is guarded,
+    /// on a hiding device too.
+    #[test]
+    fn a_process_hidden_from_root_starts_unguarded() {
+        // One instance dir per profile: the profile cache is per directory.
+        let guards = |tag: &str, profile: Option<&str>, nice: &str, uid: u32| {
+            let dir = std::env::temp_dir().join(format!("omni-zygote-guard-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            if let Some(p) = profile {
+                std::fs::write(dir.join(crate::root::profile::PROFILE_FILE), p).unwrap();
+            }
+            let l = Launcher { runner: PathBuf::new(), sysroot: PathBuf::new(), instance: dir.clone(), envp: Vec::new(), binder: String::new(), vm_options: Vec::new() };
+            let r = guarded(&l, uid, Some(nice));
+            let _ = std::fs::remove_dir_all(&dir);
+            r
+        };
+        assert!(guards("none", None, "com.x", 1_010_116), "no profile");
+        assert!(!guards("deny", Some("root=1\ndenylist=com.x\nmodule=emu-hide\n"), "com.x:gl", 1_010_116), "a process of a denylisted package, spoofed");
+        assert!(guards("deny-other", Some("root=1\ndenylist=com.x\n"), "com.y", 1_010_117), "not on the denylist");
+        assert!(!guards("white", Some("root=1\nshamiko=whitelist\n"), "com.y", 1_010_117));
+        assert!(guards("white-system", Some("root=1\nshamiko=whitelist\n"), "com.android.settings", 1000), "whitelist mode spares system uids");
     }
 
     #[test]

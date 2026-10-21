@@ -81,7 +81,10 @@ pub(super) fn kind_from_raw(code: i32) -> NetErrorKind {
 
 fn os_error(operation: &'static str, endpoint: impl Into<String>, api: &str) -> NetError {
     let code = errno();
-    NetError::kinded(operation, endpoint, kind_from_raw(code), format!("{api} failed with errno {code}"))
+    match kind_from_raw(code) {
+        NetErrorKind::WouldBlock => NetError::would_block(operation),
+        kind => NetError::kinded(operation, endpoint, kind, format!("{api} failed with errno {code}")),
+    }
 }
 
 const fn address_family(family: IpFamily) -> libc::c_int {

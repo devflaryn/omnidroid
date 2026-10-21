@@ -15,6 +15,8 @@
 
 namespace Dynarmic::Optimization {
 
+std::atomic<std::uint32_t> live_precise_get_set{1};  // patch 0110: was x64's
+
 void A64GetSetElimination(IR::Block& block, A64GetSetEliminationOptions opt) {
     using Iterator = IR::Block::iterator;
 

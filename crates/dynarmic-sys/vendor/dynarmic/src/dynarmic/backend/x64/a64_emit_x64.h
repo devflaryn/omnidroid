@@ -38,11 +38,6 @@ class RegAlloc;
 extern std::atomic<std::uint32_t> live_fp_optimizations;
 inline constexpr std::uint32_t live_fp_optimizations_allowed = 0x000F0000;
 
-/// Omnidroid patch 0037: non-zero runs `GetSetElimination` in its precise form for every block
-/// translated from now on whose config sets `check_halt_on_memory_access` (which otherwise skips
-/// the pass). Process-wide, read at translation: a block translated before the switch keeps what
-/// it was translated with.
-extern std::atomic<std::uint32_t> live_precise_get_set;
 /// Omnidroid patch 0098: `IC IVAU` batched until `ISB` (`A64::TranslationOptions::batch_ic_ivau`), for
 /// blocks translated from now on.
 extern std::atomic<std::uint32_t> live_batch_ic_ivau;

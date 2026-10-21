@@ -1952,7 +1952,8 @@ fn read_waiting(p: &Process, t: &mut Task, file: &Arc<BinderFile>, at: u64, size
             None => match watching.take() {
                 None => {
                     let own = thread_key(Arc::as_ptr(&file.broker) as usize, file.id, t.tid);
-                    watching = Some(crate::poll::watch(Some(if takes_proc { vec![file.key(), own] } else { vec![own] })));
+                    let keys: crate::poll::Keys = if takes_proc { [file.key(), own].into() } else { [own].into() };
+                    watching = Some(crate::poll::watch(Some(keys)));
                 }
                 Some(w) => w.wait(None, t)?,
             },

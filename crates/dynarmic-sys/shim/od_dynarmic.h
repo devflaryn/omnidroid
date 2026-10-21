@@ -175,10 +175,11 @@ typedef struct od_config {
     void* ctx;
 
     /* D13: `TPIDR_EL0` must be a valid bionic TLS block before any guest code
-     * runs. dynarmic bakes these pointers into generated code and reads
-     * through them directly -- no callback -- so the pointee must stay put and
-     * stay valid for the jit's whole life. Null means the guest read faults
-     * into `exception_raised`. */
+     * runs. Generated code reads and writes through these pointers directly --
+     * no callback; kept in the jit's state (arm64, patch 0112; x64's shared
+     * cache, patch 0022) or baked in (an x64 cache of its own) -- so the
+     * pointee must stay put and stay valid for the jit's whole life. Null
+     * means the guest read faults into `exception_raised`. */
     uint64_t* tpidr_el0;
     const uint64_t* tpidrro_el0;
 
@@ -280,6 +281,8 @@ typedef struct od_effective_config {
      * uses on every write, and which `tests/wx.rs` measures by writing to the
      * cache and dying. */
     int code_cache_w_xor_x;  /* one of OD_CODE_CACHE_* below */
+    /* The thread pointers' slots generated code reads and writes; on arm64 as
+     * the jit's state holds them (patch 0112). */
     uint64_t tpidr_el0_ptr;
     uint64_t tpidrro_el0_ptr;
     /* D41 (patch 0030): 1 if `fastmem_pointer` applies below 2^32 only. */
@@ -550,6 +553,14 @@ void od_jit_invalidate_range(void* jit, uint64_t addr, uint64_t len);
 void od_jit_clear_cache(void* jit);
 void od_jit_clear_exclusive(void* jit);
 
+/* Back to the state a new jit starts in: every register, SP, PC, PSTATE, FPCR,
+ * FPSR and the exclusive state zero. What is the thread's own and not the
+ * guest's stays -- its callbacks, its thread pointers' slots, its reservation
+ * slots in the monitor -- which the arm64 backend's generated code reads from
+ * that state (patch 0112). Returns 1; 0, changing nothing, from inside one of
+ * the jit's callbacks. */
+uint32_t od_jit_reset(void* jit);
+
 /* Bytes the arm64 backend's per-block bookkeeping holds in pages of its own
  * (patch 0013's `PageBackedAllocator`), over every jit in the process -- the
  * part of that bookkeeping the C heap's statistics no longer see. 0 on a host
@@ -573,11 +584,11 @@ uint64_t od_invalidation_ranges_checked(void);
  * Returns the mask in force. A no-op returning 0 on arm64. */
 uint32_t od_set_live_fp_optimizations(uint32_t mask);
 
-/* Patch 0037 (x64 only): non-zero runs `GetSetElimination`, in a form precise at every guest data
- * access, on every block translated from now on by a jit whose config sets
+/* Patch 0037 (both backends since 0110): non-zero runs `GetSetElimination`, in a form precise at
+ * every guest data access, on every block translated from now on by a jit whose config sets
  * `check_halt_on_memory_access` (which otherwise skips the pass). Blocks already translated keep
  * what they were translated with: clear the cache to have them again. Returns the value in force
- * (1 or 0); a no-op returning 0 on arm64. `od_precise_get_set` reads it. */
+ * (1 or 0). `od_precise_get_set` reads it. */
 uint32_t od_set_precise_get_set(uint32_t on);
 /* Patch 0098: `IC IVAU` batched until `ISB` for blocks translated from now on (the embedder's
  * instruction-cache callback collects the lines and invalidates them on `SynchronizeBatched`, op 3,
@@ -647,8 +658,57 @@ void od_jit_effective_config(void* jit, od_effective_config* out);
 void od_jit_code_bytes(void* jit, uint64_t* in_use, uint64_t* emitted);
 /* arm64 (patch 0104): from any thread, if the jit's thread has been inside an `SVC` callback for at
  * least `parked_at_least_ns`, give back its cache's translated code (a clear made when it next
- * runs). The bytes given back; 0 when not parked so long, or elsewhere. */
+ * runs). The bytes given back; 0 when not parked so long, or elsewhere. Patch 0107: its per-block
+ * tables are given back too. */
 uint64_t od_jit_discard_parked(void* jit, uint64_t parked_at_least_ns);
+/* arm64 (patch 0107): the bytes the jit's per-block tables hold, from any thread; 0 elsewhere. */
+uint64_t od_jit_table_bytes(void* jit);
+/* arm64 (patch 0112): what the jit's generated code reads per thread from its state instead of
+ * immediates, in this order: the callbacks object, the config the non-inline exclusives are given,
+ * TPIDR_EL0's slot, TPIDRRO_EL0's slot, and this processor's reservation-address and reserved-value
+ * slots in the monitor (0 without one). Up to `n` of the `OD_THREAD_VALUES` into `out`; returns
+ * how many. 0 elsewhere. Not while the jit's thread may be in `od_jit_reset`. */
+#define OD_THREAD_VALUES 6u
+uint32_t od_jit_thread_values(void* jit, uint64_t* out, uint32_t n);
+/* arm64 (patch 0107): lookups and fastmem faults made by jits whose tables were given back while
+ * parked, before their clear, in this process. Always 0; a test hook. */
+uint64_t od_lookups_after_give_back(void);
+
+/* arm64 (patch 0106): a census of translated blocks, for measuring how many of a process's threads
+ * translate the same code (`OMNI_JIT_CENSUS`). The sink gets `count` blocks -- each its location
+ * (guest PC and mode, dynarmic's `LocationDescriptor`) and host code bytes -- with the group of the
+ * jit they are of: `OD_CENSUS_LIVE`, every block one jit holds, in one call; `OD_CENSUS_EMITTED`, one
+ * block just emitted, on the emitting thread. Process-wide; null (the default) sends nothing. No-ops
+ * elsewhere. */
+#define OD_CENSUS_LIVE 0u
+#define OD_CENSUS_EMITTED 1u
+typedef void (*od_census_sink)(void* group, uint32_t kind, const uint64_t* locations, const uint32_t* host_bytes, uint64_t count);
+void od_set_census_sink(od_census_sink sink);
+/* `jit`'s blocks go to `group` from now on (null: nowhere, and no emission hook). Before it first
+ * runs, and before another thread can ask for its census: the group is a plain field. */
+void od_jit_census_join(void* jit, void* group);
+/* Ask for `jit`'s live blocks, from any thread: read at once if its thread is parked in an `SVC`
+ * callback (1), else by its own thread at the end of its next run (0). A running thread is not
+ * stopped for it. */
+uint32_t od_jit_block_census(void* jit);
+
+/* arm64 (patch 0114), a test hook: the block `jit`'s cache holds for `location` (dynarmic's
+ * `LocationDescriptor`: the guest PC while FPCR is 0) and up to `capacity` of its link sites, each its
+ * offset from the entry point and its kind -- `OD_LINK_BRANCH`, one instruction word (`B` linked,
+ * `NOP` not); `OD_LINK_RSB_SLOT`, 8 aligned bytes of data a `PushRSB` loads (the predicted block's
+ * entry linked, `unlinked_slot` not). On the jit's own thread, outside a run. All zero elsewhere. */
+#define OD_LINK_BRANCH 0u
+#define OD_LINK_RSB_SLOT 1u
+typedef struct od_block_links {
+    uint64_t entry_point;       /* 0: the cache holds no block for `location` */
+    uint64_t host_bytes;
+    uint64_t unlinked_slot;     /* what an unlinked slot holds: the dispatcher's entry */
+    uint64_t relink_maintained; /* bytes of code the cache's relinks have handed to cache maintenance */
+    uint32_t count;             /* link sites, those past `capacity` too */
+    uint32_t reserved;
+} od_block_links;
+void od_jit_block_links(void* jit, uint64_t location, od_block_links* out, uint32_t* offsets, uint32_t* kinds, uint32_t capacity);
+
 void od_jit_stats(void* jit, od_stats* out);
 void od_jit_reset_stats(void* jit);
 

@@ -8,7 +8,9 @@ import java.nio.file.Files;
  * host process, ART and binder up and then waits for the app it will become. Its one argument is a
  * file the zygote writes when ActivityManager asks for an app: {@code <uid> <target sdk> <class>
  * [args...]}. It takes the app's uid (it starts as root) and runs WrapperInit as a launched app
- * process runs it -- the pid ActivityManager was given is already this process's.
+ * process runs it -- the pid ActivityManager was given is already this process's -- guarded as
+ * {@link App} guards it. Android's classes are reached by reflection: the jar builds from java.*
+ * alone.
  */
 public final class Spare {
     public static void main(String[] args) throws Throwable {
@@ -30,22 +32,33 @@ public final class Spare {
         String[] w = new String(Files.readAllBytes(go.toPath()), "UTF-8").trim().split(" ");
         go.delete();
         int uid = Integer.parseInt(w[0]);
-        android.system.Os.setgid(uid);
-        android.system.Os.setuid(uid);
+        Class<?> os = Class.forName("android.system.Os");
+        os.getMethod("setgid", int.class).invoke(null, uid);
+        os.getMethod("setuid", int.class).invoke(null, uid);
         Class<?> wrapper = Class.forName("com.android.internal.os.WrapperInit");
         if (preloaded) {
             // WrapperInit.main less its preload: wrapperInit(target sdk, class and args).run().
-            String[] argv = new String[w.length - 2];
+            final String[] argv = new String[w.length - 2];
             System.arraycopy(w, 2, argv, 0, argv.length);
-            java.lang.reflect.Method init = wrapper.getDeclaredMethod("wrapperInit", int.class, String[].class);
+            final java.lang.reflect.Method init = wrapper.getDeclaredMethod("wrapperInit", int.class, String[].class);
             init.setAccessible(true);
-            ((Runnable) init.invoke(null, Integer.parseInt(w[1]), (Object) argv)).run();
+            final int sdk = Integer.parseInt(w[1]);
+            App.guarded(new App.Body() {
+                public void run() throws Throwable {
+                    ((Runnable) init.invoke(null, sdk, (Object) argv)).run();
+                }
+            });
             return;
         }
         // WrapperInit <pipe fd> <target sdk> <class> [args...]: no pipe.
-        String[] rest = new String[w.length];
+        final String[] rest = new String[w.length];
         rest[0] = "0";
         System.arraycopy(w, 1, rest, 1, w.length - 1);
-        wrapper.getMethod("main", String[].class).invoke(null, (Object) rest);
+        final java.lang.reflect.Method main = wrapper.getMethod("main", String[].class);
+        App.guarded(new App.Body() {
+            public void run() throws Throwable {
+                main.invoke(null, (Object) rest);
+            }
+        });
     }
 }

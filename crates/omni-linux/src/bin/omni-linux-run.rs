@@ -149,6 +149,14 @@ fn main() -> ExitCode {
     // killed leaves none of them running. An app's host process ends with the system's.
     if zygote {
         omni_platform::process::hold_children();
+        // What ended sessions left in the shared-memory directory: files of host processes that
+        // have ended (`omni_linux::shm::remove_stale`).
+        if omni_linux::shm::SWEEP.load(std::sync::atomic::Ordering::Relaxed) {
+            let (files, bytes) = omni_linux::shm::remove_stale(&omni_linux::shm::host_dir());
+            if files > 0 {
+                eprintln!("[shm] {files} files of ended host processes removed ({} MiB)", bytes >> 20);
+            }
+        }
     }
     if omni_linux::remote::is_remote() {
         omni_platform::process::end_with_parent();
@@ -499,9 +507,11 @@ fn main() -> ExitCode {
             let all = omni_linux::process::all_live();
             let mut each: Vec<(String, u64, u64)> = all.iter().map(|p| (String::from_utf8_lossy(&p.comm.lock()).into_owned(), p.guest_committed() >> 20, p.code_cache_committed() >> 20)).collect();
             let (guest, code): (u64, u64) = each.iter().fold((0, 0), |(g, c), e| (g + e.1, c + e.2));
+            // Each thread's own caches (arm64): their per-block tables, beside their code.
+            let tables: u64 = all.iter().map(|p| p.code_table_bytes()).sum::<u64>() >> 20;
             each.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
             let largest: Vec<String> = each.iter().take(6).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
-            eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB; largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
+            eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB (their tables {tables} MiB); largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
             // The translation caches' own tables, on the host's heap (not in the caches' commit).
             let census = omni_cpu::stats::code_caches_with_tables();
             let tables: Vec<String> = census.tables.iter().filter(|t| t.bytes > 0).map(|t| format!("{} {} entries {} KiB", t.name, t.entries, t.bytes >> 10)).collect();
@@ -609,7 +619,10 @@ fn main() -> ExitCode {
             }
         }
     }
-    eprint!("{}", p.report());
+    // The gate first: an app host outliving its launcher writes to a pipe nobody reads, and
+    // `eprint!` panics on that EPIPE (2026-10-20: the gate files left after a pool stopped).
+    omni_linux::remote::remove_own_gate();
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), p.report().as_bytes());
     match status {
         ExitStatus::Exited(code) => ExitCode::from(code as u8),
         ExitStatus::Killed { signal, .. } => ExitCode::from(128 + signal as u8),

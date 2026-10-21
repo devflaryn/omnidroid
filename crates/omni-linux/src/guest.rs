@@ -477,6 +477,55 @@ pub fn with_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
     f(&mut crate::zbuf::ZeroBuf::new(len))
 }
 
+/// The largest receive [`with_recv_scratch`] takes into this host thread's receive buffer.
+pub const RECV_SCRATCH_MAX: usize = 256 << 10;
+
+/// Whether a host socket's receive (`recvfrom`, `recvmsg`) goes into this host thread's own receive
+/// buffer ([`with_recv_scratch`]) rather than a fresh zeroed one each call -- a reservation, a
+/// commit and a release from 64 KiB up (`crate::zbuf`), plus the kernel's zero-fill faults on what
+/// the host writes. MEASURED (Roblox at Home, M4, 2026-10-20): HttpClient's `recvfrom` ~10 us a
+/// call at 860-1,285 calls a second; a 64 KiB buffer that gets 16 KiB costs 3.6-4.1 us fresh and
+/// 0.26-0.31 us kept (`what_a_receives_buffer_costs`, same day). On by default: the bytes are the
+/// same, and the buffer is one per receiving thread, resident only as far as its largest receive.
+/// The lever `recv_scratch=0` (`crate::lever`) or `OMNI_RECV_SCRATCH=0`: a fresh one each call, as
+/// before.
+pub static RECV_SCRATCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `OMNI_RECV_SCRATCH=0`: [`RECV_SCRATCH`] off from the start.
+pub fn recv_scratch_from_env() {
+    if std::env::var("OMNI_RECV_SCRATCH").as_deref() == Ok("0") {
+        RECV_SCRATCH.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_RECV_SCRATCH: recv_scratch=0");
+    }
+}
+
+thread_local! {
+    static RECV: std::cell::RefCell<Option<crate::zbuf::ZeroBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f` on a buffer of `len` bytes for a host socket's receive: this host thread's receive buffer
+/// ([`RECV_SCRATCH_MAX`] bytes of pages of its own, made at its first receive and kept) when `len`
+/// fits and [`RECV_SCRATCH`] is on, a fresh zeroed one otherwise. Its contents are what the last
+/// receive left: the caller uses only the count the host wrote.
+pub fn with_recv_scratch<R>(len: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    if !RECV_SCRATCH.load(std::sync::atomic::Ordering::Relaxed) {
+        // Switched off: a kept buffer goes, so an A/B's other phase holds none.
+        let _ = RECV.with(|r| r.try_borrow_mut().ok().and_then(|mut kept| kept.take()));
+    } else if len <= RECV_SCRATCH_MAX {
+        // Taken out while `f` runs (a blocking receive waits in it): a nested use makes its own.
+        if let Some(mut buf) = RECV.with(|r| r.try_borrow_mut().ok().map(|mut kept| kept.take().unwrap_or_else(|| crate::zbuf::ZeroBuf::new(RECV_SCRATCH_MAX)))) {
+            let r = f(&mut buf[..len]);
+            RECV.with(|r| {
+                if let Ok(mut slot) = r.try_borrow_mut() {
+                    *slot = Some(buf);
+                }
+            });
+            return r;
+        }
+    }
+    f(&mut crate::zbuf::ZeroBuf::new(len))
+}
+
 #[cfg(test)]
 mod gate_tests {
     use super::*;
@@ -499,6 +548,76 @@ mod gate_tests {
         mem.start_journal();
         let _ = mem.take_journal();
         assert!(!*mem.gated.lock());
+    }
+}
+
+#[cfg(test)]
+mod recv_scratch_tests {
+    use super::*;
+
+    /// A receive that fits takes this thread's kept buffer, the same memory each call (whatever the
+    /// last one left in it); a larger one, or a nested one, gets its own; switched off, none is
+    /// kept. Run on a thread of its own, so the kept buffer is this test's.
+    #[test]
+    fn a_receive_that_fits_reuses_its_threads_buffer() {
+        let _held = crate::lever::held();
+        std::thread::spawn(|| {
+            let first = with_recv_scratch(100, |b| {
+                b[..3].copy_from_slice(b"abc");
+                b.as_ptr() as usize
+            });
+            let (again, left) = with_recv_scratch(64 << 10, |b| (b.as_ptr() as usize, b[..3].to_vec()));
+            assert_eq!(again, first, "the kept buffer");
+            assert_eq!(left, b"abc", "what the last receive left: a caller uses only its count");
+            let big = with_recv_scratch(RECV_SCRATCH_MAX + 1, |b| (b.as_ptr() as usize, b.len(), b.iter().all(|&x| x == 0)));
+            assert_ne!(big.0, first, "a receive past the bound gets a fresh buffer");
+            assert_eq!(big.1, RECV_SCRATCH_MAX + 1);
+            assert!(big.2, "zeroed");
+            let nested = with_recv_scratch(8, |outer| {
+                let inner = with_recv_scratch(8, |inner| inner.as_ptr() as usize);
+                (outer.as_ptr() as usize, inner)
+            });
+            assert_eq!(nested.0, first);
+            assert_ne!(nested.1, first, "a nested receive makes its own");
+            RECV_SCRATCH.store(false, std::sync::atomic::Ordering::Relaxed);
+            let off = with_recv_scratch(8, |b| b.as_ptr() as usize);
+            RECV_SCRATCH.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_ne!(off, first, "off: a fresh buffer");
+            assert!(RECV.with(|r| r.borrow().is_none()), "and the kept one gone");
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// **What a receive's buffer costs** (`--ignored --nocapture`): a 64 KiB `recvfrom` that gets
+    /// 16 KiB (a TLS record), into a fresh buffer each call as before and into the kept one.
+    #[test]
+    #[ignore = "a measurement; run by hand"]
+    fn what_a_receives_buffer_costs() {
+        let _held = crate::lever::held();
+        const N: u32 = 20_000;
+        let record = vec![7u8; 16 << 10];
+        let time = |f: &dyn Fn()| {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                f();
+            }
+            t.elapsed().as_nanos() / u128::from(N)
+        };
+        for round in 0..3 {
+            let fresh = time(&|| {
+                let mut buf = crate::zbuf::ZeroBuf::new(64 << 10);
+                buf[..record.len()].copy_from_slice(&record);
+                assert_eq!(buf[100], 7);
+            });
+            let kept = time(&|| {
+                with_recv_scratch(64 << 10, |buf| {
+                    buf[..record.len()].copy_from_slice(&record);
+                    assert_eq!(buf[100], 7);
+                });
+            });
+            eprintln!("[recv] round {round}: {fresh} ns a fresh 64 KiB buffer, {kept} ns the kept one (16 KiB written)");
+        }
     }
 }
 

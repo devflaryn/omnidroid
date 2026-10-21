@@ -44,8 +44,15 @@ public:
         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
 #endif
 
+#if defined(_WIN32)
         if (m_memory == nullptr)
             throw std::bad_alloc{};
+#else
+        // Omnidroid patch 0113: mmap fails with MAP_FAILED (all ones), never null, so a cache that
+        // could not be mapped was taken for one at the top of the address space and written to.
+        if (static_cast<void*>(m_memory) == MAP_FAILED)
+            throw std::bad_alloc{};
+#endif
     }
 
     ~CodeBlock()

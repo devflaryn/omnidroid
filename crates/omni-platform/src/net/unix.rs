@@ -122,12 +122,15 @@ pub(super) fn last_errno() -> i32 {
 /// A [`NetError::Io`] from the thread's `errno`, classified by [`kind_from_raw`].
 pub(super) fn errno_error(operation: &'static str, endpoint: impl Into<String>, api: &str) -> NetError {
     let code = last_errno();
-    NetError::kinded(
-        operation,
-        endpoint,
-        kind_from_raw(code),
-        format!("{api} failed with errno {code} ({})", std::io::Error::from_raw_os_error(code)),
-    )
+    match kind_from_raw(code) {
+        NetErrorKind::WouldBlock => NetError::would_block(operation),
+        kind => NetError::kinded(
+            operation,
+            endpoint,
+            kind,
+            format!("{api} failed with errno {code} ({})", std::io::Error::from_raw_os_error(code)),
+        ),
+    }
 }
 
 /// The host descriptor under a socket.

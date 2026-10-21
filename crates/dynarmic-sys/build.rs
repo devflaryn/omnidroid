@@ -54,6 +54,7 @@ fn main() {
     // object files without changing a single watched source file.
     println!("cargo:rerun-if-env-changed=CMAKE");
     println!("cargo:rerun-if-env-changed=CXX");
+    println!("cargo:rerun-if-env-changed=CXXFLAGS");
     println!("cargo:rerun-if-env-changed=CC");
     println!("cargo:rerun-if-env-changed=OMNIDROID_DYNARMIC_ALLOW_BROKEN_WX");
 
@@ -358,6 +359,19 @@ fn configure(
     ));
     c.arg(format!("-DCMAKE_C_COMPILER={}", cmake_path(&c_compiler_for(compiler))));
     c.arg(format!("-DCMAKE_CXX_COMPILER={}", cmake_path(compiler.path())));
+    // The vendored fmt 10.1 checks format strings in `consteval` constructors, which Apple clang
+    // 21 refuses ("call to consteval function ... is not a constant expression" in fmt's os.cc,
+    // MEASURED 2026-10-20); defined empty, fmt checks them `constexpr` instead and formats the
+    // same. Given on every configure, so a build directory first configured by an older compiler
+    // takes it too; `CXXFLAGS` is kept, as CMake would read it on a first configure. Windows'
+    // configure line is left as it was measured.
+    if !compiler.is_like_msvc() {
+        let flags = match env::var("CXXFLAGS") {
+            Ok(f) if !f.trim().is_empty() => format!("{} -DFMT_CONSTEVAL=", f.trim()),
+            _ => "-DFMT_CONSTEVAL=".to_owned(),
+        };
+        c.arg(format!("-DCMAKE_CXX_FLAGS={flags}"));
+    }
 
     run(c, "CMake configure", build_dir);
 }

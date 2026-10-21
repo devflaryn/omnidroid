@@ -928,6 +928,12 @@ for. Both approximations are gone.
 * An unhinted mapping gets host pages of its own, so separate mappings never share one.
 * A file view is whole host pages at a host-page offset. Anything else is a private copy, and a
   shared mapping that cannot be shared exactly is refused (`EINVAL`).
+  *Amended 2026-10-20:* a view may start at the host page below a 4 KiB offset, or be of the file
+  moved on to agree with a fixed address (`omni-linux`'s shifted files); and a fixed mapping's
+  edge host page is the view too where its other parts are a never-touched `PROT_NONE`
+  reservation's or the same file's view at the same offset (`GuestSpace::map_file_exact`), each
+  part keeping its protection, a reservation's part reading zero once made accessible. What can
+  be none of these is still a copy.
 * Shared memory's host file is whole host pages; the guest's length is exact.
 
 **Costs, stated.**
@@ -943,3 +949,32 @@ for. Both approximations are gone.
 **Reverses it.** A 4 KiB guest that runs code a 16 KiB one did not, *slower* than the approximation
 by more than the gate tolerates, with no placement fix. Or a host-side access to guest memory
 found bypassing `access_ptr`.
+
+## D43 — A pool device's disk is volatile: its guest `fsync` asks nothing of the host
+
+**Ruling (2026-10-20).** A guest `fsync` or `fdatasync` of a writable-mount file does what
+`omni_linux::fd::DISK_SYNC` says:
+* `full`, the engine's default and the behaviour before: `omni_platform::fs::sync_data(Full)` --
+  macOS `F_FULLFSYNC`, Linux `fdatasync`, Windows `FlushFileBuffers`;
+* `os`, the host's own sync: macOS `fsync`, the same calls elsewhere;
+* `off`: the descriptor is checked and 0 answered, nothing asked of the host.
+
+`OMNI_DISK_SYNC=off|os|full` sets it for a host process and its children; the lever `disk_sync=`
+switches it live. **The pool starts every device it boots with `off`** (`omni_pool::device::boot`)
+unless its caller set the variable. The sync runs on a second handle, so the descriptor's lock is
+not held while the host syncs.
+
+**Why.** A pool device's disk does not outlive the device. Each boot is a new directory with the
+saved device copied into it (`tests/r_app.rs` `warm_device`), and a stopped device's directory is
+not used again. Durability across a host crash protects data that nothing reads again. Meanwhile
+`F_FULLFSYNC` flushes the whole drive. MEASURED (M4, APFS, 2026-10-20): 3.9 ms a call against 23 us
+for `fsync`; with four threads at once, 10.8 ms a call and ~335 syncs a second for the whole Mac.
+A Roblox launch made ~1,070 syncs, ~3.7 s of guest threads blocked in them, and system_server's
+main, binder and android.io threads stalled 4-5 ms each time.
+
+**Costs, stated.** A pool device's `fsync` never fails and returns at once. A host power loss
+loses its last writes, which its next boot discards anyway. Durability was already partial
+everywhere: a directory's `fsync`, `O_SYNC`/`O_DSYNC` and `msync` ask nothing of the host.
+
+**Reverses it.** A pool device whose disk is kept from one boot to the next (a user's profile
+kept, say). It then needs `os` at least.

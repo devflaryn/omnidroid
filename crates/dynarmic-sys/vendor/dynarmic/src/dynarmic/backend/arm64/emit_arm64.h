@@ -138,8 +138,8 @@ struct EmitConfig {
     u64 cntfreq_el0;
     u32 ctr_el0;
     u32 dczid_el0;
-    const u64* tpidrro_el0;
-    u64* tpidr_el0;
+    // Omnidroid patch 0112: no `tpidrro_el0`/`tpidr_el0` slot pointers: A64 code reads them from
+    // A64JitState at run time (`od_tpidrro_el0`, `od_tpidr_el0`), so nothing here is one thread's.
 
     // Memory
     bool check_halt_on_memory_access;
@@ -165,7 +165,8 @@ struct EmitConfig {
     // accepted by the A64 UserConfig and ignored by this backend.
     bool fastmem_exclusive_access;
     ExclusiveMonitor* global_monitor;
-    size_t processor_id;
+    // Omnidroid patch 0112: no `processor_id`: this processor's reservation slots are read from
+    // the state at run time (`state_exclusive_address_offset`, `state_exclusive_value_offset`).
 
     // Timing
     bool wall_clock_cntpct;
@@ -185,6 +186,11 @@ struct EmitConfig {
     size_t state_nzcv_offset;
     size_t state_fpsr_offset;
     size_t state_exclusive_state_offset;
+    // Omnidroid patch 0112: where the state holds the pointers to this processor's reservation
+    // slots in the monitor (A64JitState's `od_exclusive_address`, `od_exclusive_value`). A64 only,
+    // as the inline exclusives are.
+    size_t state_exclusive_address_offset;
+    size_t state_exclusive_value_offset;
 
     // A32 specific
     std::array<std::shared_ptr<A32::Coprocessor>, 16> coprocessors{};

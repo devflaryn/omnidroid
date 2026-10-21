@@ -1065,6 +1065,16 @@ impl MappableFile {
     pub(super) fn is_shared(&self) -> bool {
         self.shared
     }
+
+    pub(super) fn len_now(&self) -> u64 {
+        let mut len: i64 = 0;
+        // SAFETY: `self.file` is a live file handle this value owns, and `len` is a live i64 the
+        // call writes.
+        if unsafe { GetFileSizeEx(self.file, &mut len) } == 0 {
+            return self.len;
+        }
+        len as u64
+    }
 }
 
 impl Drop for MappableFile {
@@ -1607,6 +1617,24 @@ mod tests {
 /// (a 16 KiB Linux) keeps its guest at the host's page until one is written (spec
 /// 2026-09-29-4k-guest-pages, "Out of scope").
 pub(super) const fn supports_alias() -> bool {
+    false
+}
+
+/// Not measured for a read-only section: a view of such a file ends at or before its last byte,
+/// as it always has (a shared file's view is sized to its bytes instead, `map_file`).
+pub(super) const fn private_view_may_end_in_last_page() -> bool {
+    false
+}
+
+/// `open_file_for_mapping` opens the file `FILE_SHARE_READ` only: while a view of it lives, a
+/// rename of it or of its directory fails.
+pub(super) const fn mapped_file_may_be_renamed() -> bool {
+    false
+}
+
+/// A section is the file's length when it is made (`share_file_for_mapping`): a view cannot run
+/// past it, and a larger section would grow the file.
+pub(super) const fn shared_view_may_pass_end_of_file() -> bool {
     false
 }
 

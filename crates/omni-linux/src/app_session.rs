@@ -85,6 +85,56 @@ pub fn says(line: &str, marker: Option<&str>) -> bool {
     marker.is_some_and(|m| line.contains(m))
 }
 
+/// **The session's app dying**, read from the device's log line by line: its main process on user
+/// 0 (the session's), as the zygote launched it (`[zygote] launching <package> as pid P uid U`),
+/// dead at ActivityManager's `Process <package> (pid P) has died` or the zygote's `pid P ended` /
+/// `pid P: signal`, each death once. ActivityManager logs no `has died` for a process it killed
+/// itself -- as it kills the current user's app after its repeat-crash dialog, which a main-thread
+/// crash reaches since `crate::zygote`'s `com.omnidroid.spare.App` reports it (2026-10-20): only
+/// `Killing P:<package>/u0a..: crash` and the zygote's end.
+#[derive(Debug, Default)]
+pub struct AppDeaths {
+    /// The app's main process now, once launched.
+    pid: Option<u32>,
+    /// The last one whose death was told.
+    gone: Option<u32>,
+}
+
+impl AppDeaths {
+    /// Whether `line` tells that `package`'s main process died: a death not told before.
+    pub fn died(&mut self, line: &str, package: &str) -> bool {
+        let digits = |s: &str| s[..s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len())].parse::<u32>().ok();
+        if let Some((_, rest)) = line.split_once("[zygote] launching ") {
+            let launched = rest.split_once(" as pid ").filter(|(process, _)| *process == package).and_then(|(_, rest)| {
+                let uid = digits(rest.split_once(" uid ")?.1)?;
+                digits(rest).filter(|_| uid / 100_000 == 0)
+            });
+            if launched.is_some() {
+                self.pid = launched;
+            }
+            return false;
+        }
+        // The zygote's line names a pid alone; ActivityManager's names the package, and counts
+        // before its launch was read.
+        let dead = if let Some((_, rest)) = line.split_once("[zygote] pid ") {
+            let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            digits(rest).filter(|pid| (after.starts_with(" ended") || after.starts_with(": signal ")) && self.pid == Some(*pid))
+        } else {
+            line.split_once(&format!("Process {package} (pid "))
+                .filter(|(_, rest)| rest.contains(") has died"))
+                .and_then(|(_, rest)| digits(rest))
+                .filter(|pid| self.pid.is_none_or(|p| p == *pid))
+        };
+        match dead.filter(|pid| self.gone != Some(*pid)) {
+            Some(pid) => {
+                (self.pid, self.gone) = (None, Some(pid));
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +155,30 @@ mod tests {
         assert_eq!(s.loaded_id("something else"), None);
         assert_eq!(AppSession::default().loaded_id("loaded placeId: 1"), None);
         assert!(says("a b c", Some("b")) && !says("a b c", None) && !says("a", Some("b")));
+    }
+
+    /// The app's death is told once, however the log tells it: ActivityManager's `has died`, or --
+    /// for a process ActivityManager killed itself (its crash dialog's end), which logs none -- the
+    /// zygote's end of its main process; not another process's end, nor another user's launch.
+    #[test]
+    fn the_app_s_death_is_told_once_whoever_logs_it() {
+        let mut d = AppDeaths::default();
+        let mut told = |line: &str| d.died(line, "com.a");
+        assert!(told("I/ActivityManager( 1210): Process com.a (pid 300000) has died: fg  TOP "), "before its launch was read");
+        assert!(!told("[zygote] pid 300000 ended: Ok(ExitStatus(unix_wait_status(9)))"), "told already");
+        assert!(!told("[zygote] launching com.a:remote as pid 301000 uid 10116: android.app.ActivityThread seq=3"));
+        assert!(!told("[zygote] launching com.a as pid 302000 uid 1010116: android.app.ActivityThread seq=4"), "user 10's");
+        assert!(!told("[zygote] launching com.a as pid 303000 uid 10116: android.app.ActivityThread seq=5"));
+        assert!(!told("[zygote] pid 301000 ended: Ok(ExitStatus(unix_wait_status(0)))"), "its other process");
+        assert!(!told("I/ActivityManager( 1210): Process com.a (pid 302000) has died: cch"), "not its main process now");
+        // Killed by ActivityManager after its crash dialog: no `has died`.
+        assert!(!told("I/ActivityManager( 1210): Killing 303000:com.a/u0a116 (adj 0): crash"));
+        assert!(told("[zygote] pid 303000: signal 9, its host process ended"));
+        assert!(!told("[zygote] pid 303000 ended: Ok(ExitStatus(unix_wait_status(9)))"));
+        assert!(!told("I/ActivityManager( 1210): Process com.a (pid 303000) has died: fg  TOP "));
+        // Started again (the spare's line too): its end is told.
+        assert!(!told("[zygote] launching com.a as pid 304000 uid 10116 (the spare process): android.app.ActivityThread seq=6"));
+        assert!(told("[zygote] pid 304000 ended: Ok(ExitStatus(unix_wait_status(35072)))"));
+        assert!(!told("I/ActivityManager( 1210): Process com.ab (pid 305000) has died: cch"), "another package");
     }
 }

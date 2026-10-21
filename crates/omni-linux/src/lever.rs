@@ -9,8 +9,9 @@
 //!   (`omni_cpu::dynarmic::set_live_fp_optimizations`), then every process's translations are
 //!   dropped so what runs next is translated with them. 0 is the accurate default.
 //! - `jit_getset=0|1`: dynarmic's `GetSetElimination` in the form precise at every guest memory
-//!   access (patch 0037, `omni_cpu::dynarmic::set_precise_get_set`), then every process's
-//!   translations are dropped. 1 is the default; 0 is upstream's behaviour under the memory-abort
+//!   access (patch 0037, `omni_cpu::dynarmic::set_precise_get_set`; arm64 hosts too since patch
+//!   0110), then every process's translations are dropped. 1 is the default
+//!   (`OMNI_JIT_PRECISE_GETSET=0` from the start); 0 is upstream's behaviour under the memory-abort
 //!   check (every guest register read a load from `JitState`, every write a store).
 //! - `jit_fpxmm=0|1`: scalar floating-point operands kept in XMM registers rather than copied
 //!   through a general register and back (patch 0039, `omni_cpu::dynarmic::set_scalar_fp_in_xmm`;
@@ -111,6 +112,14 @@
 //!   default) (`crate::poll::KEYED`; `OMNI_POLL_STATS` counts what is left).
 //! - `epoll_et=0|1`: `EPOLLET` epoll entries edge-triggered (1, the default; Linux's meaning) or
 //!   level-triggered as before (0) (`crate::poll::EDGE_TRIGGERED`).
+//! - `wake_dedupe=0|1`: a change -- a herd above all, `wake_everyone` and `notify` -- marks each of
+//!   its waiters woken once under the queue locks and signals them after dropping them, and skips
+//!   the waiters-on-anything lock while none waits there (1, the default; `OMNI_WAKE_DEDUPE=0` from
+//!   the start), or wakes each key's waiters under its lock, a waiter on k keys k times (0)
+//!   (`crate::poll::DEDUPE`; `OMNI_POLL_STATS` counts herds and their wake-ups).
+//! - `waiter_park=0|1`: a poll-family wait sleeps on its host thread's park token with a relative
+//!   timeout (1, the default; `OMNI_WAITER_PARK=0` from the start) or on a `parking_lot` condition
+//!   variable with an absolute deadline (0) (`crate::poll::PARK`). A wait keeps the way it began.
 //! - `remote_direct=0|1`: the system's host process reads and writes an app's guest memory itself
 //!   (1, the default) rather than over the app thread's connection (0; `OMNI_REMOTE_DIRECT=0`)
 //!   (`crate::remote::DIRECT`; `OMNI_REMOTE_STATS` counts both).
@@ -158,6 +167,23 @@
 //! - `binder_spawn=kernel|eager`: when a guest process is asked for another binder looper -- the
 //!   kernel's rule (no other looper waits idle) or the eager one this driver had (the default).
 //!   Threads already spawned stay; see `crate::binder::spawn` (also `OMNI_BINDER_MAX_LOOPERS`).
+//!
+//! - `disk_sync=off|os|full`: what a guest `fsync`/`fdatasync` of a writable-mount file asks of the
+//!   host (`crate::fd::DISK_SYNC`): nothing, the host's own sync (macOS `fsync`), or through the
+//!   drive's cache (macOS `F_FULLFSYNC`; the default). `OMNI_DISK_SYNC` from the start; the pool's
+//!   devices start `off` (D43).
+//! - `procfs_usage=0|1`: `/proc/<pid>/stat|status|statm`'s memory figures from the space's
+//!   remembered usage (1, the default; `omni_mem::GuestSpace::usage`) or one walk of its regions
+//!   each open (0; `OMNI_PROCFS_USAGE=0`) (`crate::procfs::USAGE`).
+//! - `recv_scratch=0|1`: a host socket's `recvfrom`/`recvmsg` into the receiving thread's kept
+//!   buffer (1, the default; `crate::guest::with_recv_scratch`) or a fresh zeroed one each call (0;
+//!   `OMNI_RECV_SCRATCH=0`) (`crate::guest::RECV_SCRATCH`).
+//! - `statsd_sink=0|1`: an app host process's connect to statsd's `/dev/socket/statsdw` succeeds
+//!   and its datagrams are dropped (1, the default) or fails `ENOENT` as before (0;
+//!   `OMNI_STATSD_SINK=0`) (`crate::socket::STATSD_SINK`).
+//! - `shm_sweep=0|1`: the files host processes that ended left in the shared-memory directory
+//!   removed -- an app host's gate when it is reaped, ended sessions' files when a system's host
+//!   process starts -- or left (0; `OMNI_SHM_SWEEP=0`) (`crate::shm::SWEEP`). 1 is the default.
 //!
 //! `OMNI_JIT_UNSAFE_FP=<hex mask>` sets the same flags from the start, without a file;
 //! `OMNI_ZERO_RECLAIM=<seconds>` and `OMNI_MADV_FREE=1` the last two.
@@ -430,6 +456,24 @@ pub fn apply(line: &str) -> Option<String> {
             crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
             Some(format!("poll_keyed={}: {}", u8::from(on), if on { "fewer waits on anything" } else { "unkeyed descriptors wait on anything" }))
         }
+        "wake_dedupe" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::poll::DEDUPE.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("wake_dedupe={}: {}", u8::from(on), if on { "each waiter woken once a change, after the queue locks" } else { "each key's waiters woken under its lock" }))
+        }
+        "waiter_park" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::poll::PARK.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("waiter_park={}: poll-family waits from now on sleep {}", u8::from(on), if on { "parked" } else { "on a condition variable" }))
+        }
         "binder_host_pool" => {
             let on = match value.trim() {
                 "1" => true,
@@ -504,6 +548,50 @@ pub fn apply(line: &str) -> Option<String> {
             };
             crate::binder::spawn::KERNEL_RULE.store(kernel, std::sync::atomic::Ordering::Relaxed);
             Some(format!("binder_spawn={}: a looper is asked for {}", value.trim(), if kernel { "only when none waits idle" } else { "whenever one takes work" }))
+        }
+        "disk_sync" => {
+            let name = crate::fd::set_disk_sync(value)?;
+            Some(format!("disk_sync={name}: a guest fsync {}", match name {
+                "off" => "asks nothing of the host",
+                "os" => "is the host's own sync",
+                _ => "goes through the drive's cache",
+            }))
+        }
+        "procfs_usage" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::procfs::USAGE.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("procfs_usage={}: /proc stat, status and statm {}", u8::from(on), if on { "read the space's remembered usage" } else { "walk the regions" }))
+        }
+        "recv_scratch" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::guest::RECV_SCRATCH.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("recv_scratch={}: a host socket receives into {}", u8::from(on), if on { "its thread's kept buffer" } else { "a fresh buffer each call" }))
+        }
+        "statsd_sink" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::socket::STATSD_SINK.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("statsd_sink={}: an app's connect to statsd {}", u8::from(on), if on { "succeeds, its atoms dropped" } else { "fails (ENOENT)" }))
+        }
+        "shm_sweep" => {
+            let on = match value.trim() {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            crate::shm::SWEEP.store(on, std::sync::atomic::Ordering::Relaxed);
+            Some(format!("shm_sweep={}: ended host processes' shared-memory files {}", u8::from(on), if on { "removed" } else { "left" }))
         }
         "madv_free" => {
             let on = match value.trim() {
@@ -632,11 +720,24 @@ pub fn apply(line: &str) -> Option<String> {
     }
 }
 
+/// Held by a test that switches a lever another test reads (`recv_scratch`, `statsd_sink`): the
+/// switches are process-wide and tests run in parallel.
+#[cfg(test)]
+pub(crate) fn held() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Start the lever reader for this host process (once), and apply `OMNI_JIT_UNSAFE_FP`.
 pub fn start() {
     crate::mm::madv_free_from_env();
     crate::binder::spawn::from_env();
     crate::guest::read_no_commit_from_env();
+    crate::fd::disk_sync_from_env();
+    crate::procfs::usage_from_env();
+    crate::guest::recv_scratch_from_env();
+    crate::socket::statsd_sink_from_env();
+    crate::shm::sweep_from_env();
     if let Some(mask) = std::env::var("OMNI_JIT_UNSAFE_FP").ok().as_deref().and_then(parse_hex) {
         let kept = omni_cpu::dynarmic::set_live_fp_optimizations(mask);
         eprintln!("[lever] OMNI_JIT_UNSAFE_FP: jit_fp={kept:#x}");
@@ -645,6 +746,16 @@ pub fn start() {
         let on = v.trim() != "0";
         crate::poll::KEYED.store(on, std::sync::atomic::Ordering::Relaxed);
         eprintln!("[lever] OMNI_POLL_KEYED: poll_keyed={}", u8::from(on));
+    }
+    if let Ok(v) = std::env::var("OMNI_WAKE_DEDUPE") {
+        let on = v.trim() != "0";
+        crate::poll::DEDUPE.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_WAKE_DEDUPE: wake_dedupe={}", u8::from(on));
+    }
+    if let Ok(v) = std::env::var("OMNI_WAITER_PARK") {
+        let on = v.trim() != "0";
+        crate::poll::PARK.store(on, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_WAITER_PARK: waiter_park={}", u8::from(on));
     }
     if let Ok(v) = std::env::var("OMNI_REMOTE_DIRECT") {
         let on = v.trim() != "0";
@@ -784,6 +895,31 @@ mod tests {
     }
 
     #[test]
+    fn the_syscall_cost_levers_switch_and_refuse_what_they_do_not_know() {
+        use std::sync::atomic::Ordering;
+        let level = crate::fd::DISK_SYNC.load(Ordering::Relaxed);
+        assert!(apply("disk_sync=off").expect("understood").starts_with("disk_sync=off"));
+        assert_eq!(crate::fd::DISK_SYNC.load(Ordering::Relaxed), 0);
+        apply("disk_sync=os").expect("understood");
+        assert_eq!(crate::fd::DISK_SYNC.load(Ordering::Relaxed), 1);
+        apply("disk_sync= full").expect("understood");
+        assert_eq!(crate::fd::DISK_SYNC.load(Ordering::Relaxed), 2);
+        assert_eq!(apply("disk_sync=fast"), None);
+        assert_eq!(crate::fd::DISK_SYNC.load(Ordering::Relaxed), 2, "unchanged by a value not known");
+        crate::fd::DISK_SYNC.store(level, Ordering::Relaxed);
+        let _held = held();
+        for (name, lever) in [("procfs_usage", &crate::procfs::USAGE), ("recv_scratch", &crate::guest::RECV_SCRATCH), ("statsd_sink", &crate::socket::STATSD_SINK), ("shm_sweep", &crate::shm::SWEEP)] {
+            let was = lever.load(Ordering::Relaxed);
+            apply(&format!("{name}=0")).expect("understood");
+            assert!(!lever.load(Ordering::Relaxed));
+            apply(&format!("{name}=1")).expect("understood");
+            assert!(lever.load(Ordering::Relaxed));
+            assert_eq!(apply(&format!("{name}=on")), None);
+            lever.store(was, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
     fn the_binder_pool_lever_switches_the_pool() {
         use std::sync::atomic::Ordering;
         let was = crate::binder::HOST_POOL.load(Ordering::Relaxed);
@@ -793,6 +929,22 @@ mod tests {
         assert!(!crate::binder::HOST_POOL.load(Ordering::Relaxed));
         assert_eq!(apply("binder_host_pool=2"), None);
         crate::binder::HOST_POOL.store(was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn the_wait_levers_switch() {
+        use std::sync::atomic::Ordering;
+        let _one = crate::poll::LEVERS_IN_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        apply("wake_dedupe=0").expect("understood");
+        assert!(!crate::poll::DEDUPE.load(Ordering::Relaxed));
+        apply("waiter_park=0").expect("understood");
+        assert!(!crate::poll::PARK.load(Ordering::Relaxed));
+        apply("wake_dedupe=1").expect("understood");
+        assert!(crate::poll::DEDUPE.load(Ordering::Relaxed));
+        apply("waiter_park=1").expect("understood");
+        assert!(crate::poll::PARK.load(Ordering::Relaxed));
+        assert_eq!(apply("wake_dedupe=yes"), None);
+        assert_eq!(apply("waiter_park=2"), None);
     }
 
     #[test]
@@ -818,13 +970,13 @@ mod tests {
 
     #[test]
     fn the_getset_lever_switches_the_precise_pass() {
-        let want = cfg!(target_arch = "x86_64");
+        // Both backends since dynarmic patch 0110.
         let done = apply("jit_getset=0").expect("understood");
         assert!(done.starts_with("jit_getset=0"), "{done}");
         assert!(!omni_cpu::dynarmic::precise_get_set());
         let done = apply("jit_getset=1").expect("understood");
-        assert!(done.starts_with(if want { "jit_getset=1" } else { "jit_getset=0" }), "{done}");
-        assert_eq!(omni_cpu::dynarmic::precise_get_set(), want);
+        assert!(done.starts_with("jit_getset=1"), "{done}");
+        assert!(omni_cpu::dynarmic::precise_get_set());
         assert_eq!(apply("jit_getset=on"), None);
     }
 

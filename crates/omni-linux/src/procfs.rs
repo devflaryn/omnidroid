@@ -136,12 +136,33 @@ fn maps(p: &Process) -> Vec<u8> {
     out.into_bytes()
 }
 
-fn mapped_bytes(p: &Process) -> u64 {
-    p.mem.space().mapped_regions().iter().map(|r| r.len as u64).sum()
+/// Whether `stat`, `status` and `statm` take their memory figures from the space's remembered
+/// usage ([`omni_mem::GuestSpace::usage`]: no allocation, nothing walked while the map is
+/// unchanged) rather than one walk of its mapped regions each open. On by default; the lever
+/// `procfs_usage=0` (`crate::lever`) or `OMNI_PROCFS_USAGE=0` walks. VmSize is the same either way;
+/// VmRSS can only lose the walk's over-count of a split 4 KiB page in a partly committed region.
+/// MEASURED (M4, a loaded host, 2026-10-20; `tests/procfs.rs` `what_an_open_of_statm_costs`): an
+/// open and read of `statm` in a process of 3,500 mappings, 2.3-2.8 us against 870-950 us walking.
+pub static USAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `OMNI_PROCFS_USAGE=0`: [`USAGE`] off from the start.
+pub fn usage_from_env() {
+    if std::env::var("OMNI_PROCFS_USAGE").as_deref() == Ok("0") {
+        USAGE.store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[lever] OMNI_PROCFS_USAGE: procfs_usage=0");
+    }
 }
 
-fn committed_pages(p: &Process) -> u64 {
-    p.mem.space().mapped_regions().iter().map(|r| r.committed as u64).sum::<u64>() / 4096
+/// The bytes mapped and the 4 KiB pages committed, from one look at the space ([`USAGE`]).
+fn memory(p: &Process) -> (u64, u64) {
+    let space = p.mem.space();
+    let (mapped, committed) = if USAGE.load(std::sync::atomic::Ordering::Relaxed) {
+        let usage = space.usage();
+        (usage.mapped, usage.committed)
+    } else {
+        space.mapped_regions().iter().fold((0, 0), |(m, c), r| (m + r.len, c + r.committed))
+    };
+    (mapped as u64, committed as u64 / 4096)
 }
 
 /// Clock ticks (100 Hz) since the process started.
@@ -153,6 +174,7 @@ fn stat(p: &Process) -> Vec<u8> {
     let pid = p.sys.pid;
     let comm = String::from_utf8_lossy(&p.comm.lock()).into_owned();
     let t = ticks(p);
+    let (mapped, rss) = memory(p);
     // proc(5)'s 52 fields: pid, (comm), state, then these 49. What nothing here tracks is 0.
     let fields: [u64; 49] = [
         p.family.ppid() as u64, // ppid
@@ -167,8 +189,8 @@ fn stat(p: &Process) -> Vec<u8> {
         p.tids().len() as u64, // num_threads
         0,                 // itrealvalue
         0,                 // starttime
-        mapped_bytes(p),   // vsize
-        committed_pages(p),// rss
+        mapped,            // vsize
+        rss,               // rss
         u64::MAX,          // rsslim
         // startstack: bionic finds the main thread's stack by the maps line holding it.
         0, 0, p.start.lock().map_or(0, |(_, sp)| sp), 0, 0, // startcode endcode startstack kstkesp kstkeip
@@ -200,8 +222,8 @@ fn status(p: &Process) -> Vec<u8> {
     let tracer = p.traced.tracer().unwrap_or(0);
     let _ = write!(out, "Tgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t{tracer}\n", p.family.ppid());
     let _ = write!(out, "Uid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\n");
-    let vmsize = mapped_bytes(p) / 1024;
-    let vmrss = committed_pages(p) * 4;
+    let (mapped, rss) = memory(p);
+    let (vmsize, vmrss) = (mapped / 1024, rss * 4);
     let _ = write!(out, "FDSize:\t64\nGroups:\t3003 9997 20{uid:03} 50{uid:03}\n", uid = uid % 1000);
     // Real app memory lines. A watchdog comparing these keeps its illusion whole.
     let _ = write!(out, "VmPeak:\t{vmsize} kB\nVmSize:\t{vmsize} kB\nVmLck:\t0 kB\nVmPin:\t0 kB\nVmHWM:\t{vmrss} kB\nVmRSS:\t{vmrss} kB\n");
@@ -220,7 +242,8 @@ fn status(p: &Process) -> Vec<u8> {
 }
 
 fn statm(p: &Process) -> Vec<u8> {
-    format!("{} {} 0 0 0 0 0\n", mapped_bytes(p) / 4096, committed_pages(p)).into_bytes()
+    let (mapped, rss) = memory(p);
+    format!("{} {rss} 0 0 0 0 0\n", mapped / 4096).into_bytes()
 }
 
 fn cmdline(p: &Process) -> Vec<u8> {

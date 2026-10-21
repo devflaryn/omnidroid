@@ -768,6 +768,16 @@ pub(crate) fn gate(exposed: bool) {
     }
 }
 
+/// This app host process is ending: its gate's file goes with it. The gate is a static, never
+/// dropped, and off Windows (where the file is deleted on close) every app host left its file in
+/// the temp directory -- ~70 after a pool's 11-minute run (2026-10-20). A killed one's is left for
+/// the session's launcher, which removes the files of processes gone (`omnidroid aosp`).
+pub fn remove_own_gate() {
+    if let Some(Some(page)) = GATE.get() {
+        let _ = std::fs::remove_file(page.path());
+    }
+}
+
 /// The app's memory, reached through the current connection.
 pub struct RemoteMemory;
 

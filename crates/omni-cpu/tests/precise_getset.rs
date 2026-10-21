@@ -6,6 +6,9 @@
 //! The patched pass keeps every write that comes before an instruction that can stop the block,
 //! and still forwards the value to later reads. These tests say that a fault in the middle of a
 //! block sees exactly the state a non-eliminating translation sees, with the switch on and off.
+//!
+//! Both backends: x64 since patch 0037, arm64 since 0110 (before it the switch did nothing there,
+//! and these tests compared the pass-off translation with itself).
 
 #![cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), feature = "dynarmic"))]
 
@@ -22,6 +25,11 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serialized() -> std::sync::MutexGuard<'static, ()> {
     SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The switch, which this host's backend must honour.
+fn switch(precise: bool) {
+    assert_eq!(set_precise_get_set(precise), precise, "the switch is not this host's backend's");
 }
 
 fn v(n: u8) -> VReg {
@@ -84,7 +92,7 @@ fn faulting_accesses() -> Vec<(&'static str, u32, AccessKind)> {
 fn a_fault_in_the_middle_of_a_block_sees_every_write_before_it() {
     let _serial = serialized();
     for precise in [true, false] {
-        set_precise_get_set(precise);
+        switch(precise);
         let guest = Guest::new();
         let pattern: [u64; 4] = [0x1111_2222_3333_4444, 0x5555_6666_7777_8888, 0x9999, 0xAAAA];
         for (i, word) in pattern.iter().enumerate() {
@@ -136,7 +144,7 @@ fn a_fault_in_the_middle_of_a_block_sees_every_write_before_it() {
             );
         }
     }
-    set_precise_get_set(true);
+    switch(true);
 }
 
 /// **A load whose value nobody reads still faults.** Two ways to write one: into the zero register
@@ -153,7 +161,7 @@ fn a_load_whose_value_is_never_read_still_faults() {
         0xB940_0000 | (rn << 5) | rt
     }
     for precise in [false, true] {
-        set_precise_get_set(precise);
+        switch(precise);
         let guest = Guest::new();
         for (name, load) in [
             ("LDR XZR", ldr_imm(31, 1, 0)),
@@ -178,7 +186,7 @@ fn a_load_whose_value_is_never_read_still_faults() {
             assert_eq!(cpu.x(x(0)), 1, "{name} (precise {precise})");
         }
     }
-    set_precise_get_set(true);
+    switch(true);
 }
 
 /// A value forwarded past an access that did *not* fault is still the right value: the pass keeps
@@ -186,7 +194,7 @@ fn a_load_whose_value_is_never_read_still_faults() {
 #[test]
 fn a_value_is_forwarded_past_an_access_that_does_not_fault() {
     let _serial = serialized();
-    set_precise_get_set(true);
+    switch(true);
     let guest = Guest::new();
     guest.write_u64(guest.data, 40);
     let mut program = mov64(2, guest.data as u64);
@@ -205,6 +213,82 @@ fn a_value_is_forwarded_past_an_access_that_does_not_fault() {
     assert_eq!(exit, ExitReason::Returned { pc: sentinel });
     assert_eq!((cpu.x(x(0)), cpu.x(x(6)), cpu.x(x(8)), cpu.x(x(9))), (2, 42, 2, 42));
     assert_eq!(guest.read_u64(guest.data + 8), 2);
+}
+
+/// `ANDS Wd, Wn, Wm`: sets N and Z from the result (`GetNZCVFromOp`), C and V clear.
+const fn ands_w(rd: u32, rn: u32, rm: u32) -> u32 {
+    0x6A00_0000 | (rm << 16) | (rn << 5) | rd
+}
+/// `MOVN Wd, #imm16`: `!imm16`, 32 bits.
+const fn movn_w(rd: u32, imm16: u16) -> u32 {
+    0x1280_0000 | ((imm16 as u32) << 5) | rd
+}
+
+/// **An `ANDS` with an operand the pass makes a constant of all ones** folds to its other operand
+/// (ConstantPropagation), its flags still read: the arm64 emitter's identity forwarding (patch
+/// 0110) once moved the flags' pseudo-operation onto that operand, which `Inst::Use` refuses --
+/// Roblox's host process aborted in its first seconds (2026-10-20). Run with the operand a guest
+/// register's value at entry and a constant, and the result zero, negative and positive.
+#[test]
+fn an_ands_folded_away_keeps_its_flags() {
+    let _serial = serialized();
+    for precise in [false, true] {
+        switch(precise);
+        for (w1, want) in [(0u64, 0x4000_0000u64), (0x8000_0000, 0x8000_0000), (5, 0)] {
+            for constant in [false, true] {
+                let guest = Guest::new();
+                let mut program = if constant { mov64(1, w1) } else { Vec::new() };
+                if constant && w1 == 0 {
+                    program.push(movz(1, 0, 0));
+                }
+                program.push(movn_w(2, 0)); // W2 = 0xFFFF_FFFF
+                program.push(ands_w(0, 1, 2));
+                program.push(mrs_nzcv(3));
+                program.push(ret(30));
+                let entry = guest.load(&program);
+                let (mut cpu, sentinel) = guest.thread();
+                cpu.set_x(x(1), w1);
+                assert_eq!(cpu.run(entry, RunLimit::Unlimited).expect("runs"), ExitReason::Returned { pc: sentinel });
+                assert_eq!((cpu.x(x(0)), cpu.x(x(3))), (w1, want), "W1 {w1:#x}, constant {constant}, precise {precise}");
+            }
+        }
+    }
+    switch(true);
+}
+
+/// **The switch reaches this host's backend.** A constant moved into `X0`, then sixteen
+/// `ADD X0, X0, #1`: with the pass the reads are forwarded and the sum folds to one store of 17;
+/// without it every instruction loads `X0` from `JitState` and stores it back. So the block is
+/// smaller with the switch on, or the tests here compare the pass-off translation with itself.
+#[test]
+fn the_switch_changes_what_this_hosts_backend_emits() {
+    let _serial = serialized();
+    let mut program = vec![movz(0, 1, 0)];
+    program.extend(std::iter::repeat_n(add_imm(0, 0, 1), 16));
+    program.push(ret(30));
+    let mut emitted = [0u64; 2];
+    for precise in [false, true] {
+        switch(precise);
+        let guest = Guest::new();
+        let entry = guest.load(&program);
+        let (mut cpu, sentinel) = guest.thread();
+        let bytes = || guest.backend.code_cache_stats().map(|s| s.code_bytes_emitted);
+        let Some(before) = bytes() else {
+            // x64 without a shared cache counts nothing; the differential below still runs.
+            if cfg!(target_arch = "aarch64") {
+                panic!("this host's backend counts no emitted code");
+            }
+            switch(true);
+            return;
+        };
+        assert_eq!(cpu.run(entry, RunLimit::Unlimited).expect("runs"), ExitReason::Returned { pc: sentinel });
+        assert_eq!(cpu.x(x(0)), 17, "precise {precise}");
+        emitted[usize::from(precise)] = bytes().expect("still counted") - before;
+    }
+    switch(true);
+    let [off, on] = emitted;
+    println!("the block: {off} bytes emitted without the pass, {on} with");
+    assert!(on < off, "emitted {on} bytes with the pass, {off} without");
 }
 
 /// Deterministic xorshift64.
@@ -323,16 +407,16 @@ fn random_blocks_leave_the_same_state_with_and_without_the_pass() {
     for trial in 0..TRIALS {
         let seed = rng.next();
         let program = random_program(&mut Rng(seed), guest.unmapped as u64, guest.data as u64);
-        set_precise_get_set(true);
+        switch(true);
         let on = run_once(&guest, &program, seed);
-        set_precise_get_set(false);
+        switch(false);
         let off = run_once(&guest, &program, seed);
         if on.exit.contains("faulted") {
             faults += 1;
         }
         assert_eq!(on, off, "trial {trial} (seed {seed:#x}) diverged: {program:08x?}");
     }
-    set_precise_get_set(true);
+    switch(true);
     println!("{TRIALS} random blocks, {faults} of them faulting mid-block: identical state");
     assert!(faults > TRIALS / 3, "too few faulting blocks ({faults}) to say anything about faults");
 }

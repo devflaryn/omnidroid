@@ -91,7 +91,7 @@ static IR::Block TranslateBlock(IR::LocationDescriptor current_location, const U
     // guest register read a load from `JitState`, every write a store); the precise variant keeps
     // the state exact wherever the block can leave early, so it runs there too, while switched on.
     // And there a load is never dead code: it may fault, which is the point of the check.
-    const bool precise = conf.check_halt_on_memory_access && live_precise_get_set.load(std::memory_order_relaxed) != 0;
+    const bool precise = conf.check_halt_on_memory_access && Optimization::live_precise_get_set.load(std::memory_order_relaxed) != 0;
     const Optimization::DeadCodeEliminationOptions dce{.keep_memory_reads = conf.check_halt_on_memory_access};
     if (conf.HasOptimization(OptimizationFlag::GetSetElimination) && (!conf.check_halt_on_memory_access || precise)) {
         // Patch 0081: `OMNI_JIT_GETSET_WIDTH=0` turns the width forwarding off.
@@ -1261,7 +1261,7 @@ u64 SharedCodeCache::Impl::CodeShape() const {
     f.Value(conf.enable_cycle_counting);
     f.Value(conf.global_monitor == nullptr);
     f.Value(live_fp_optimizations.load(std::memory_order_relaxed));
-    f.Value(live_precise_get_set.load(std::memory_order_relaxed));
+    f.Value(Optimization::live_precise_get_set.load(std::memory_order_relaxed));
     f.Value(live_batch_ic_ivau.load(std::memory_order_relaxed));  // patch 0098
     f.Value(live_fast_dispatch_inline.load(std::memory_order_relaxed));
     f.Value(live_scalar_fp_in_xmm.load(std::memory_order_relaxed));

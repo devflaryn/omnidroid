@@ -64,8 +64,13 @@ const APP_USAGE: &str = "\
 usage: omnidroid                    open the omnidroid app: warm Androids, any APK run on them
        omnidroid <app.apk> [xN]     open it and launch N instances of that APK
        omnidroid <app.apk> [xN] --cookie <c> --place <id>   ... with a plugin's options (`roblox`)
+       omnidroid restart <id>... | all          restart instances' apps on their windows (in 5 s)
+       omnidroid autorestart [on|off <id>...|all]  restart an app when it crashes (all: the pool's
+                                    setting, for instances without their own; ids bare, as 3: a
+                                    shell drops a word beginning with # as a comment)
 
-In the app: run <apk> [xN] [plugin options], close <#id>, warm, kill <D#>, shell, plugins, settings, mcp, help.
+In the app: run <apk> [xN] [plugin options], close <#id>, restart <#id>, autorestart on|off [#id], warm, kill <D#>,
+shell, plugins, settings, mcp, help.
 Coding agents drive it through its MCP server (`mcp on` in the app, then `mcp status`).
 Its settings: <app-data>/../app.conf (OMNI_APP_CONFIG). The one-shot commands scripts use: `omnidroid help commands`.";
 
@@ -82,6 +87,8 @@ usage: omnidroid <app.apk> [xN]                    (the app, launching that APK)
        omnidroid which [--apk <path>]
        omnidroid plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name>
                          | new <name> [<dir>]]
+       omnidroid restart <id>... | all
+       omnidroid autorestart [on|off <id>... | on|off all]
 
   --apk <path>      the APK to run, any APK (else OMNI_APK, else the newest *.apk in the
                     repository root); a bare path ending in .apk is the same
@@ -140,6 +147,17 @@ usage: omnidroid <app.apk> [xN]                    (the app, launching that APK)
                     status in <id>.rc) -- the MCP server's install_apk and start_instance. Saved
                     once (<session dir>/omni-golden/base-...), booted from a copy after; ready when
                     <instance>/data/local/tmp/warm-ready is there. --minutes defaults to 720
+
+  restart           for the app's pool running on this computer (a window's, or `omnidroid serve`'s),
+  autorestart       as typed at its prompt, but with bare ids (3, not #3: a shell drops a word
+                    beginning with # as a comment): restart starts instances' apps again on their
+                    windows once their cards have counted down 5 s (all: every instance running or
+                    showing its card); autorestart on|off starts an app again when it crashes --
+                    these instances' own setting, or with all the pool's (kept in the settings) for
+                    every instance without its own (never without a word: an id the shell dropped
+                    would change the pool's); alone it says the setting. What the pool says is
+                    printed; no pool running, or a refusal (no such instance, one still starting):
+                    exit status 1
 
   plugins           this user's plugins (<app-data>/../plugins, or OMNI_PLUGINS): what one app
                     needs -- options, variables, default arguments, hooks, commands -- declared
@@ -200,6 +218,22 @@ fn with_hint(message: String) -> String {
     }
 }
 
+/// Why a one-shot `restart` or `autorestart` (`rest`, the shell's words after it) is refused before
+/// the pool hears it, if it is. A shell drops a word beginning with `#` -- a comment in bash, sh,
+/// fish and PowerShell -- so `omnidroid autorestart off #3` arrived as `autorestart off`: the
+/// pool's setting, turned off for every instance without its own, and saved. Here the pool's
+/// setting needs `all`, and `restart` with no id says why it may have lost one.
+fn one_shot_refusal(word: &str, rest: &[String]) -> Option<String> {
+    const BARE: &str = "ids bare, as 3: a shell drops a word beginning with # as a comment";
+    match app::command::parse(&format!("{word} {}", rest.join(" "))) {
+        Ok(app::command::Command::AutoRestart(on, ids)) if ids.is_empty() && rest.len() == 1 => {
+            Some(format!("autorestart {} <id>... | all (all: the pool's setting, for instances without their own; {BARE})", if on { "on" } else { "off" }))
+        }
+        Err(_) if word == "restart" && rest.is_empty() => Some(format!("restart <id>... | all ({BARE})")),
+        _ => None,
+    }
+}
+
 /// The app's first launch from its arguments: `<apk> [xN | N] [plugin options]`.
 fn app_launch(rest: &[String]) -> Result<Option<(PathBuf, u32, Vec<String>)>, String> {
     let Some((apk, after)) = rest.split_first() else { return Ok(None) };
@@ -252,6 +286,14 @@ fn main() -> ExitCode {
     }
     if command.as_deref() == Some("plugins") {
         return plugins_command(&rest);
+    }
+    // For the pool running on this computer, as typed at a window's prompt (`app::host::one_shot`).
+    if let Some(word @ ("restart" | "autorestart")) = command.as_deref() {
+        if let Some(refusal) = one_shot_refusal(word, &rest) {
+            eprintln!("omnidroid: {refusal}");
+            return ExitCode::from(2);
+        }
+        return app::host::one_shot(&format!("{word} {}", rest.join(" ")));
     }
     let registry = plugin::Registry::installed();
     let plugins = match registry.active() {
@@ -781,14 +823,21 @@ fn aosp_work_dir(tmpdir_named: bool, temp_is_tmpfs: bool, app_data: Option<&Path
     Some(app_data?.parent()?.join("aosp"))
 }
 
-/// Whether `dir` is mounted as a tmpfs (`/proc/mounts`; false where there is none).
-/// The host process an `omni-shm-<pid>-<n>` (or `omni-shm-probe-<pid>`) file is a region of.
-fn shm_owner(name: &str) -> Option<u32> {
-    let rest = name.strip_prefix("omni-shm-")?;
-    let rest = rest.strip_prefix("probe-").unwrap_or(rest);
-    rest.split('-').next()?.parse().ok()
+/// Remove the files in `dirs` of host processes gone ([`omni_linux::shm::remove_stale`]). A
+/// process removes its own only when it ends cleanly, and keeps a region it handed another (opened
+/// there by its path) for its whole life; a session's end kills its system host. A pool stopped on
+/// 2026-10-20 left ~950 regions of its system host and ~70 app hosts' gates, which nothing removed
+/// off Windows. The session dir is every device's: a running device's files are its own (removing
+/// them failed every app its Android started after: "failed to complete startup"), and so is a
+/// region an ended app host of it made and its system host passes on by path -- so regions go only
+/// once no device's host process lives, gates whenever their maker has ended.
+fn remove_gone_host_files(dirs: &[PathBuf]) {
+    for dir in dirs {
+        omni_linux::shm::remove_stale(dir);
+    }
 }
 
+/// Whether `dir` is mounted as a tmpfs (`/proc/mounts`; false where there is none).
 fn is_tmpfs(dir: &Path) -> bool {
     let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else { return false };
     let dir = dir.to_string_lossy();
@@ -900,18 +949,11 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
     if !options.fresh_device {
         run.env("OMNI_R_GOLDEN", session_dir.join("omni-golden"));
     }
-    // Graphics buffers a finished session handed between its processes (`omni-shm-*`): only those
-    // of processes gone -- the session dir is every device's, and a running device's are its own
-    // (removing them failed every app its Android started after: "failed to complete startup").
-    for dir in [session_dir.clone(), PathBuf::from("/dev/shm")] {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for e in entries.flatten() {
-                if shm_owner(&e.file_name().to_string_lossy()).is_some_and(|pid| !omni_platform::process::is_alive(pid)) {
-                    let _ = std::fs::remove_file(e.path());
-                }
-            }
-        }
-    }
+    // What finished sessions' host processes left (`remove_gone_host_files`), and again once this
+    // one ends: its system host is gone then (killed and waited for), so a stopped pool leaves
+    // none of its files -- only those of an app host still ending, taken at the next boot.
+    let host_files = [session_dir.clone(), PathBuf::from("/dev/shm")];
+    remove_gone_host_files(&host_files);
     println!(
         "Omnidroid: a {}-minute session; the log is {}/omni-linux-r-<pid>.log, the display's screenshots beside it",
         options.minutes,
@@ -924,6 +966,7 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
             1
         }
     };
+    remove_gone_host_files(&host_files);
     plugin::end(plugged.plugins, &plugged.given, &info, &base, code);
     ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
@@ -932,13 +975,37 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
 mod tests {
     use super::*;
 
+    /// What bash makes of `omnidroid autorestart off #3` (`autorestart off`) never changes the
+    /// pool's setting; `all` does, and bare ids go through.
     #[test]
-    fn a_shared_memory_file_names_the_process_it_is_of() {
-        assert_eq!(shm_owner("omni-shm-78932-17"), Some(78932));
-        assert_eq!(shm_owner("omni-shm-78932-17-1791910224000000000"), Some(78932));
-        assert_eq!(shm_owner("omni-shm-probe-412"), Some(412));
-        assert_eq!(shm_owner("omni-shm-stale-test-9"), None);
-        assert_eq!(shm_owner("omni-crossing-9-1"), None);
+    fn a_one_shot_restart_takes_bare_ids_and_the_pool_s_setting_with_all() {
+        let words = |w: &[&str]| w.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(one_shot_refusal("autorestart", &words(&["off"])).is_some_and(|r| r.contains("| all") && r.contains("# as a comment")));
+        assert_eq!(one_shot_refusal("autorestart", &words(&["off", "all"])), None);
+        assert_eq!(one_shot_refusal("autorestart", &words(&["on", "3", "4"])), None);
+        assert_eq!(one_shot_refusal("autorestart", &[]), None, "alone: the setting said");
+        assert!(one_shot_refusal("restart", &[]).is_some_and(|r| r.contains("# as a comment")));
+        assert_eq!(one_shot_refusal("restart", &words(&["3"])), None);
+        assert_eq!(one_shot_refusal("autorestart", &words(&["maybe"])), None, "the pool's own refusal says what is wrong");
+    }
+
+    /// A session's end takes what its host processes left -- the regions and the app hosts' gates
+    /// of processes gone -- and nothing of a live process's, nor any other file. (A gone process's
+    /// region kept while another device's host lives: `omni_linux::shm`'s own tests.)
+    #[test]
+    fn only_the_files_of_host_processes_gone_are_removed() {
+        let dir = std::env::temp_dir().join(format!("omnidroid-host-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // No host has a process with this id (Unix: past pid_t; Windows: not a multiple of 4).
+        let (gone, live) = (u32::MAX, std::process::id());
+        let names = [format!("omni-shm-{gone}-3"), format!("omni-remote-gate-{gone}"), format!("omni-shm-{live}-3"), format!("omni-remote-gate-{live}"), "omni-warm-1.log".to_string()];
+        for name in &names {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        remove_gone_host_files(&[dir.clone(), dir.join("missing")]);
+        let left: Vec<bool> = names.iter().map(|n| dir.join(n).exists()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left, [false, false, true, true, true]);
     }
 
     #[test]

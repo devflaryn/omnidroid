@@ -7,8 +7,9 @@
 //! code set its thread pointer (D13: bionic does, before any other guest code runs).
 //!
 //! What the arm64 backend does (`emit_arm64_a64.cpp`, `A64GetTPIDR`/`A64SetTPIDR`/`A64GetTPIDRRO`):
-//! load and store through the `tpidr_el0`/`tpidrro_el0` **pointers** in the config -- memory slots --
-//! and no emitter names the system registers. A guest `MSR TPIDRRO_EL0` is UNDEFINED at EL0 (ARM
+//! load and store through the `tpidr_el0`/`tpidrro_el0` **pointers** in the config -- memory slots,
+//! the pointers read from the jit's state at run time (vendored patch 0112) -- and no emitter names
+//! the system registers. A guest `MSR TPIDRRO_EL0` is UNDEFINED at EL0 (ARM
 //! ARM) and the frontend does not translate it: it reaches the interpreter fallback.
 //!
 //! Measured here: the host's `TPIDRRO_EL0` -- the one macOS keeps its TLS behind -- read before a

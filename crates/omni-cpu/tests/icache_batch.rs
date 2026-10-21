@@ -10,6 +10,7 @@ mod harness;
 
 use harness::a64::*;
 use harness::{x, Guest};
+use omni_cpu::dynarmic::DynarmicOptions;
 use omni_cpu::{ExitReason, GuestCpu, RunLimit};
 use omni_mem::Protection;
 
@@ -78,7 +79,19 @@ fn code_rewritten_by_one_thread_is_run_new_by_another() {
 #[test]
 fn a_line_named_without_an_isb_is_invalidated_when_the_thread_leaves_the_jit() {
     assert!(batched());
-    let guest = Guest::new();
+    named_without_an_isb(&Guest::new());
+}
+
+/// The same on a cache of the thread's own: the exit's invalidation is queued on its jit and halts
+/// it, after the run returned, and that halt has to reach the next `run` -- the run loop's clear of
+/// its own halt bits erased it, and the old translation ran (2026-10-20).
+#[test]
+fn a_line_named_without_an_isb_is_invalidated_when_the_thread_leaves_a_jit_of_its_own() {
+    assert!(batched());
+    named_without_an_isb(&Guest::with_options(DynarmicOptions { shared_code_cache: false, ..DynarmicOptions::default() }));
+}
+
+fn named_without_an_isb(guest: &Guest) {
     let f = guest.load(&[movz(0, 1, 0), ret(30)]);
     let rewriter = guest.load_at(0x100, &[str_w(1, 2), ic_ivau(2), ret(30)]);
     guest.space.protect(guest.code, harness::CODE_BYTES, Protection::ReadWriteExecute).expect("the code is writable");

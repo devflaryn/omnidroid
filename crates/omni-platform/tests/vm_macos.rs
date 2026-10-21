@@ -215,6 +215,96 @@ fn a_view_past_the_end_of_the_file_and_a_view_with_no_access_are_refused() {
     let _ = fs::remove_file(&path);
 }
 
+/// A private view of a file whose size is not a whole number of pages may end inside its last page
+/// (`vm::private_view_may_end_in_last_page`): the bytes past the end read as zero, a write there is
+/// the mapping's own, and the file keeps its size and bytes. A page wholly past the end is still
+/// refused.
+#[test]
+fn a_private_view_may_end_inside_the_files_last_page() {
+    assert!(vm::private_view_may_end_in_last_page());
+    let path = fixture(2);
+    let mut data = fs::read(&path).expect("read fixture");
+    data.truncate(page() + 100);
+    fs::write(&path, &data).expect("shorten fixture");
+    let file = vm::open_file_for_mapping(&path, MapExecutability::NonExecutable).expect("open");
+    let reservation = vm::reserve_placeholder(2 * page(), page()).expect("reserve");
+    // SAFETY: an exact-size placeholder this test owns; unmapped at the end.
+    unsafe {
+        vm::map_file(&file, 0, 2 * page(), reservation.as_ptr(), Protection::ReadWrite).expect("a view to the last page");
+        let seen = read_mapped(reservation.as_ptr(), 2 * page());
+        assert_eq!(&seen[..data.len()], &data[..]);
+        assert!(seen[data.len()..].iter().all(|&b| b == 0), "past the end reads as zero");
+        *reservation.as_ptr().add(page() + 200) = 0x5A;
+        assert_eq!(*reservation.as_ptr().add(page() + 200), 0x5A);
+        vm::unmap_and_release(reservation.as_ptr(), 2 * page()).expect("unmap and release");
+    }
+    assert_eq!(fs::read(&path).expect("read back"), data, "the file keeps its size and bytes");
+    let reservation = vm::reserve_placeholder(3 * page(), page()).expect("reserve");
+    // SAFETY: refused before any OS call.
+    unsafe {
+        assert!(matches!(
+            vm::map_file(&file, 0, 3 * page(), reservation.as_ptr(), Protection::Read),
+            Err(VmError::ViewPastEndOfFile { .. })
+        ));
+    }
+    vm::release(reservation).expect("release");
+    let _ = fs::remove_file(&path);
+}
+
+/// A shared view may run whole pages past its file's end (`vm::shared_view_may_pass_end_of_file`)
+/// and follows the file as another descriptor grows it: what is written there shows in the view, a
+/// store through the view reaches the file, and `len_now` is the file's length now. (A page wholly
+/// past the end faults until then: not touched here.)
+#[test]
+fn a_shared_view_may_pass_the_files_end_and_follows_it_as_it_grows() {
+    assert!(vm::shared_view_may_pass_end_of_file());
+    let page = vm::page_size();
+    let path = fixture(1);
+    fs::write(&path, [7u8; 100]).expect("a 100-byte file");
+    let rw = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open read-write");
+    let file = vm::share_file_for_mapping(rw, &path).expect("share");
+    assert_eq!((file.len(), file.len_now()), (100, 100));
+    let reservation = vm::reserve_placeholder(4 * page, page).expect("reserve");
+    let other = fs::OpenOptions::new().write(true).open(&path).expect("another descriptor");
+    // SAFETY: an exact-size placeholder this test owns; unmapped at the end.
+    unsafe {
+        vm::map_file(&file, 0, 4 * page, reservation.as_ptr(), Protection::ReadWrite).expect("a view past the end");
+        other.set_len(3 * page as u64).expect("grow");
+        assert_eq!(file.len_now(), 3 * page as u64);
+        std::os::unix::fs::FileExt::write_all_at(&other, b"grown", 2 * page as u64 + 8).expect("write past the old end");
+        assert_eq!(read_mapped(reservation.as_ptr().add(2 * page + 8), 5), b"grown");
+        *reservation.as_ptr().add(page + 1) = 0x5A;
+        vm::unmap_and_release(reservation.as_ptr(), 4 * page).expect("unmap and release");
+    }
+    assert_eq!(fs::read(&path).expect("read back")[page + 1], 0x5A, "a store through the view is the file's");
+    let _ = fs::remove_file(&path);
+}
+
+/// An empty file is shared too, its view wholly past its end, and the view follows the file once
+/// another descriptor grows it -- a new icing array file, mapped at its largest while 0 bytes.
+#[test]
+fn an_empty_file_is_shared_and_its_view_follows_it_as_it_grows() {
+    let page = vm::page_size();
+    let path = fixture(1);
+    fs::write(&path, []).expect("an empty file");
+    let rw = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open read-write");
+    let file = vm::share_file_for_mapping(rw, &path).expect("share an empty file");
+    assert_eq!((file.len(), file.len_now()), (0, 0));
+    let reservation = vm::reserve_placeholder(2 * page, page).expect("reserve");
+    let other = fs::OpenOptions::new().read(true).write(true).open(&path).expect("another descriptor");
+    // SAFETY: an exact-size placeholder this test owns; unmapped at the end.
+    unsafe {
+        vm::map_file(&file, 0, 2 * page, reservation.as_ptr(), Protection::ReadWrite).expect("a view wholly past the end");
+        other.set_len(2 * page as u64).expect("grow");
+        std::os::unix::fs::FileExt::write_all_at(&other, b"pwritten", 8).expect("write");
+        assert_eq!(read_mapped(reservation.as_ptr().add(8), 8), b"pwritten");
+        *reservation.as_ptr().add(page + 3) = 0x5A;
+        vm::unmap_and_release(reservation.as_ptr(), 2 * page).expect("unmap and release");
+    }
+    assert_eq!(fs::read(&path).expect("read back")[page + 3], 0x5A, "a store through the view is the file's");
+    let _ = fs::remove_file(&path);
+}
+
 #[test]
 fn an_executable_view_needs_a_file_opened_executable_and_really_is_r_x() {
     let path = fixture(2);

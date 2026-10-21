@@ -238,6 +238,12 @@ impl Process {
         self.backend.as_ref().and_then(|b| b.code_cache_stats()).map_or(0, |s| s.committed_bytes)
     }
 
+    /// Bytes its translation caches' per-block tables hold (arm64 per-thread caches; 0 otherwise).
+    #[must_use]
+    pub fn code_table_bytes(&self) -> u64 {
+        self.backend.as_ref().map_or(0, |b| b.table_bytes())
+    }
+
     /// Bytes of host code its translation cache has emitted, ever.
     #[must_use]
     pub fn code_emitted(&self) -> u64 {
@@ -255,6 +261,37 @@ impl Process {
     /// (`crate::code_trim`; arm64): the bytes given back.
     pub fn discard_parked_code(&self, parked: std::time::Duration) -> u64 {
         self.backend.as_ref().map_or(0, |b| b.discard_parked(parked))
+    }
+
+    /// Which CPU backend it runs on, as an address (0: none). A vfork child shares its parent's
+    /// until it execs, so two processes can name one.
+    #[must_use]
+    pub fn backend_key(&self) -> usize {
+        self.backend.as_ref().map_or(0, |b| Arc::as_ptr(b) as usize)
+    }
+
+    /// Start a look of the duplication census (`OMNI_JIT_CENSUS=1`, `crate::code_trim`): its
+    /// threads are asked for their live blocks. False without a census.
+    pub fn census_begin(&self) -> bool {
+        self.backend.as_ref().is_some_and(|b| b.census_begin())
+    }
+
+    /// End the look: what its threads sent, and what it has emitted since its start.
+    pub fn census_end(&self) -> Option<omni_cpu::dynarmic::census::Census> {
+        self.backend.as_ref().and_then(|b| b.census_end())
+    }
+
+    /// Its threads' own translation caches (arm64): a key for each, the code bytes it holds and has
+    /// emitted (`crate::code_trim`'s quiet threads).
+    pub fn thread_caches(&self) -> Vec<(usize, u64, u64)> {
+        self.backend.as_ref().map_or_else(Vec::new, |b| b.thread_caches())
+    }
+
+    /// Drop the translations of one of its threads, named by [`Process::thread_caches`]' key: the
+    /// code bytes given back now if it was parked in a system call, else 0 (cleared when it next
+    /// runs). `None` when it has no such thread now.
+    pub fn trim_thread_code(&self, key: usize) -> Option<u64> {
+        self.backend.as_ref().and_then(|b| b.clear_thread_code(key))
     }
 
     /// Drop its translations (`crate::code_trim`).
@@ -1416,9 +1453,21 @@ impl Process {
                 }
                 (ExitReason::MemoryFault { pc: at, address, access }, _) => {
                     let address = crate::guest::untag(address as u64);
-                    let mapped = self.mem.space().region_at(address as usize).is_some_and(|r| r.mapping.is_some());
+                    let space = self.mem.space();
+                    let mapped = space.region_at(address as usize).is_some_and(|r| r.mapping.is_some());
                     let code = if mapped { crate::signal::SEGV_ACCERR } else { crate::signal::SEGV_MAPERR };
-                    let info = crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0, ..crate::signal::SigInfo::default() };
+                    // A shared file mapping's page wholly past the file's end, mapped and letting
+                    // the access through: SIGBUS, as Linux raises.
+                    let want = match access {
+                        omni_cpu::AccessKind::Read => omni_mem::FaultAccess::Read,
+                        omni_cpu::AccessKind::Write => omni_mem::FaultAccess::Write,
+                        omni_cpu::AccessKind::Execute => omni_mem::FaultAccess::Execute,
+                    };
+                    let info = if space.past_end_of_file(address as usize, want) {
+                        crate::signal::SigInfo { signo: 7, code: crate::signal::BUS_ADRERR, addr: address, pid: 0, uid: 0, ..crate::signal::SigInfo::default() }
+                    } else {
+                        crate::signal::SigInfo { signo: 11, code, addr: address, pid: 0, uid: 0, ..crate::signal::SigInfo::default() }
+                    };
                     let what = format!("{access:?} at {address:#x}");
                     match self.fault(cpu, task, info, at as u64, address, &what) {
                         Ok(next) => pc = next,

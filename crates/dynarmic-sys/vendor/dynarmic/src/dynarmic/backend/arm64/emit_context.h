@@ -42,6 +42,14 @@ struct EmitContext {
 
     std::vector<std::function<void()>> deferred_emits;
 
+    // Omnidroid patch 0114: the return-stack slots this block's `PushRSB`s load, each with the
+    // location it predicts; placed after the deferred code (`EmitArm64`).
+    struct RSBSlot {
+        IR::LocationDescriptor target;
+        oaknut::Label label;
+    };
+    std::vector<RSBSlot> rsb_slots;
+
     FP::FPCR FPCR(bool fpcr_controlled = true) const {
         const FP::FPCR fpcr = conf.descriptor_to_fpcr(block.Location());
         return fpcr_controlled ? fpcr : fpcr.ASIMDStandardValue();

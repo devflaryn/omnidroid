@@ -8,12 +8,14 @@
 
 #include <boost/icl/interval_set.hpp>
 #include <mcl/assert.hpp>
+#include <mcl/bit_cast.hpp>
 #include <mcl/scope_exit.hpp>
 #include <mcl/stdint.hpp>
 
 #include "dynarmic/backend/arm64/a64_address_space.h"
 #include "dynarmic/backend/arm64/a64_core.h"
 #include "dynarmic/backend/arm64/a64_jitstate.h"
+#include "dynarmic/backend/x64/exclusive_monitor_friend.h"
 #include "dynarmic/common/atomic.h"
 #include "dynarmic/interface/A64/a64.h"
 #include "dynarmic/interface/A64/config.h"
@@ -26,7 +28,9 @@ struct Jit::Impl final {
     Impl(Jit*, A64::UserConfig conf)
             : conf(conf)
             , current_address_space(conf)
-            , core(conf) {}
+            , core(conf) {
+        OdFillThreadValues();  // patch 0112
+    }
 
     HaltReason Run() {
         ASSERT(!is_executing);
@@ -74,6 +78,10 @@ struct Jit::Impl final {
 
     void Reset() {
         current_state = {};
+        // Omnidroid patch 0112: the guest's state goes, the thread's own values stay -- generated
+        // code reads them from here at run time, and a zero would be a callback on a null object
+        // or a load through a null slot pointer.
+        OdFillThreadValues();
     }
 
     void HaltExecution(HaltReason hr) {
@@ -169,7 +177,62 @@ struct Jit::Impl final {
         if (resume == 0 || parked.load(std::memory_order_seq_cst) != resume) {
             return 0;
         }
-        return current_address_space.OdDiscardExcept(resume);
+        // Omnidroid patch 0108: given back already, and not run since (its clear is still to come):
+        // nothing more to give. The same pages were counted again at every pass while the thread
+        // stayed parked, which overstated what the trim gave back.
+        if (current_address_space.OdTablesGivenBack()) {
+            return 0;
+        }
+        const std::size_t given = current_address_space.OdDiscardExcept(resume);
+        current_address_space.OdGiveBackTables();  // patch 0107
+        return given;
+    }
+
+    std::size_t OdTableBytes() const {
+        return current_address_space.OdTableBytes();
+    }
+
+    // Omnidroid patch 0106: see the header. A parked thread's tables are read as 0104 gives back its
+    // code: the halt is up before the look, so a thread that has left the callback since goes from
+    // the rest of its block to the dispatcher, sees the halt before any lookup, and leaves the run;
+    // it then waits on this lock before it clears or emits. That edge does only what was asked of
+    // it already: the halt alone asks nothing.
+    bool OdForEachBlock(Jit::OdBlockVisitor fn, void* ctx, std::uint64_t resume, const std::atomic<std::uint64_t>* parked) {
+        if (parked == nullptr) {
+            current_address_space.OdForEachBlock(fn, ctx);
+            return true;
+        }
+        std::unique_lock lock{invalidation_mutex};
+        HaltExecution(HaltReason::CacheInvalidation);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        if (resume == 0 || parked->load(std::memory_order_seq_cst) != resume) {
+            return false;
+        }
+        current_address_space.OdForEachBlock(fn, ctx);
+        return true;
+    }
+
+    void OdSetEmitHook(Jit::OdBlockVisitor fn, void* ctx) {
+        current_address_space.OdSetEmitHook(fn, ctx);
+    }
+
+    Jit::OdThreadValues OdGetThreadValues() const {
+        return Jit::OdThreadValues{
+            .callbacks = current_state.od_callbacks,
+            .conf = current_state.od_conf,
+            .tpidr_el0 = current_state.od_tpidr_el0,
+            .tpidrro_el0 = current_state.od_tpidrro_el0,
+            .exclusive_address = current_state.od_exclusive_address,
+            .exclusive_value = current_state.od_exclusive_value,
+        };
+    }
+
+    Jit::OdBlockLinkInfo OdBlockLinks(std::uint64_t location, Jit::OdLinkVisitor fn, void* ctx) const {
+        Jit::OdBlockLinkInfo info{};
+        info.entry_point = mcl::bit_cast<u64>(current_address_space.OdBlockLinks(IR::LocationDescriptor{location}, info.host_bytes, fn, ctx));
+        info.unlinked_slot = mcl::bit_cast<u64>(current_address_space.OdUnlinkedSlot());
+        info.relink_maintained = current_address_space.OdRelinkMaintained();
+        return info;
     }
 
     std::vector<std::string> Disassemble() const {
@@ -177,6 +240,24 @@ struct Jit::Impl final {
     }
 
 private:
+    // Omnidroid patch 0112: this thread's values, where generated code reads them (see
+    // `A64JitState`). `conf` is this jit's own copy, so `od_conf` lives as long as the jit; the
+    // monitor slots are this processor's (`processor_id`), and only the lock and the slot scan --
+    // the same for every thread of a monitor -- are still immediates.
+    void OdFillThreadValues() {
+        current_state.od_callbacks = reinterpret_cast<u64>(conf.callbacks);
+        current_state.od_conf = reinterpret_cast<u64>(&conf);
+        current_state.od_tpidr_el0 = reinterpret_cast<u64>(conf.tpidr_el0);
+        current_state.od_tpidrro_el0 = reinterpret_cast<u64>(conf.tpidrro_el0);
+        current_state.od_exclusive_address = conf.global_monitor
+                                               ? reinterpret_cast<u64>(GetExclusiveMonitorAddressPointer(conf.global_monitor, conf.processor_id))
+                                               : 0;
+        current_state.od_exclusive_value = conf.global_monitor
+                                             ? reinterpret_cast<u64>(GetExclusiveMonitorValuePointer(conf.global_monitor, conf.processor_id))
+                                             : 0;
+        current_state.od_thread = 0;
+    }
+
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
             std::unique_lock lock{invalidation_mutex};
@@ -350,6 +431,26 @@ std::uint64_t Jit::OdCodeBytesEmitted() const {
 
 std::size_t Jit::OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked) {
     return impl->OdDiscardParked(resume, parked);
+}
+
+std::size_t Jit::OdTableBytes() const {
+    return impl->OdTableBytes();
+}
+
+bool Jit::OdForEachBlock(OdBlockVisitor fn, void* ctx, std::uint64_t resume, const std::atomic<std::uint64_t>* parked) {
+    return impl->OdForEachBlock(fn, ctx, resume, parked);
+}
+
+void Jit::OdSetEmitHook(OdBlockVisitor fn, void* ctx) {
+    impl->OdSetEmitHook(fn, ctx);
+}
+
+Jit::OdThreadValues Jit::OdGetThreadValues() const {
+    return impl->OdGetThreadValues();
+}
+
+Jit::OdBlockLinkInfo Jit::OdBlockLinks(std::uint64_t location, OdLinkVisitor fn, void* ctx) const {
+    return impl->OdBlockLinks(location, fn, ctx);
 }
 
 }  // namespace Dynarmic::A64

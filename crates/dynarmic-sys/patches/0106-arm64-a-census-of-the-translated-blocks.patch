@@ -1,0 +1,119 @@
+diff -ru a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -172,6 +172,30 @@
+         return current_address_space.OdDiscardExcept(resume);
+     }
+ 
++    // Omnidroid patch 0106: see the header. A parked thread's tables are read as 0104 gives back its
++    // code: the halt is up before the look, so a thread that has left the callback since goes from
++    // the rest of its block to the dispatcher, sees the halt before any lookup, and leaves the run;
++    // it then waits on this lock before it clears or emits. That edge does only what was asked of
++    // it already: the halt alone asks nothing.
++    bool OdForEachBlock(Jit::OdBlockVisitor fn, void* ctx, std::uint64_t resume, const std::atomic<std::uint64_t>* parked) {
++        if (parked == nullptr) {
++            current_address_space.OdForEachBlock(fn, ctx);
++            return true;
++        }
++        std::unique_lock lock{invalidation_mutex};
++        HaltExecution(HaltReason::CacheInvalidation);
++        std::atomic_thread_fence(std::memory_order_seq_cst);
++        if (resume == 0 || parked->load(std::memory_order_seq_cst) != resume) {
++            return false;
++        }
++        current_address_space.OdForEachBlock(fn, ctx);
++        return true;
++    }
++
++    void OdSetEmitHook(Jit::OdBlockVisitor fn, void* ctx) {
++        current_address_space.OdSetEmitHook(fn, ctx);
++    }
++
+     std::vector<std::string> Disassemble() const {
+         ASSERT_FALSE("Unimplemented");
+     }
+@@ -352,4 +376,12 @@
+     return impl->OdDiscardParked(resume, parked);
+ }
+ 
++bool Jit::OdForEachBlock(OdBlockVisitor fn, void* ctx, std::uint64_t resume, const std::atomic<std::uint64_t>* parked) {
++    return impl->OdForEachBlock(fn, ctx, resume, parked);
++}
++
++void Jit::OdSetEmitHook(OdBlockVisitor fn, void* ctx) {
++    impl->OdSetEmitHook(fn, ctx);
++}
++
+ }  // namespace Dynarmic::A64
+diff -ru a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -242,9 +242,22 @@
+ 
+     RegisterNewBasicBlock(block, block_info);
+ 
++    // Omnidroid patch 0106: the census's emission count (`OMNI_JIT_CENSUS`), when asked for.
++    if (od_emit_hook) {
++        od_emit_hook(od_emit_hook_ctx, block.Location().Value(), static_cast<u32>(block_info.size));
++    }
++
+     return block_info;
+ }
+ 
++// Omnidroid patch 0106: each live block -- one `block_entries` holds -- with its record's size.
++void AddressSpace::OdForEachBlock(OdBlockVisitor fn, void* ctx) const {
++    for (const auto& [location, entry_point] : block_entries) {
++        const BlockRecord* record = FindBlockRecord(entry_point);
++        fn(ctx, location.Value(), record && record->entry_point == entry_point ? record->size : 0);
++    }
++}
++
+ // Omnidroid patch 0010: keep what is read after emission, and only that. See `BlockRecord`.
+ u32 AddressSpace::RecordBlock(IR::LocationDescriptor location, const EmittedBlockInfo& block_info) {
+     // The pin asserted that the entry point was new to `reverse_block_entries` and `block_infos`.
+diff -ru a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -103,7 +103,18 @@
+     // pointer into the rest. The bytes given back.
+     std::size_t OdDiscardExcept(std::uint64_t keep);
+ 
++    // Omnidroid patch 0106: the census (`Jit::OdForEachBlock`, `Jit::OdSetEmitHook`).
++    using OdBlockVisitor = void (*)(void* ctx, u64 location, u32 host_bytes);
++    void OdForEachBlock(OdBlockVisitor fn, void* ctx) const;
++    void OdSetEmitHook(OdBlockVisitor fn, void* ctx) {
++        od_emit_hook_ctx = ctx;
++        od_emit_hook = fn;
++    }
++
+ protected:
++    OdBlockVisitor od_emit_hook = nullptr;
++    void* od_emit_hook_ctx = nullptr;
++
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+ 
+diff -ru a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -143,6 +143,20 @@
+     /// thread was no longer parked there.
+     std::size_t OdDiscardParked(std::uint64_t resume, const std::atomic<std::uint64_t>& parked);
+ 
++    /// Omnidroid patch 0106 (arm64 backend only): a census of translated blocks, for measuring how
++    /// many threads translate the same code. `fn(ctx, location, host_bytes)` once per block; it
++    /// must not call into this jit or take a lock.
++    using OdBlockVisitor = void (*)(void* ctx, std::uint64_t location, std::uint32_t host_bytes);
++    /// Every block this jit's cache holds now (a location invalidated is not held). On the jit's
++    /// own thread outside Run; or, with `parked`, from another thread while the jit's thread is
++    /// parked in a callback that returns to `resume` and `parked` still says so once a halt is
++    /// raised, under the invalidation lock as OdDiscardParked (the thread leaves its run on waking,
++    /// and takes the lock before it emits again). False, and nothing read, when it was not parked.
++    bool OdForEachBlock(OdBlockVisitor fn, void* ctx, std::uint64_t resume = 0, const std::atomic<std::uint64_t>* parked = nullptr);
++    /// `fn` for every block emitted from now on, on the emitting thread at the end of its emission;
++    /// null stops it. Set before the jit first runs.
++    void OdSetEmitHook(OdBlockVisitor fn, void* ctx);
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl;

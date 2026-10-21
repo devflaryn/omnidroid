@@ -12,6 +12,9 @@
 //! (memory-abort checks, value-compare monitor, inline exclusives, `INTERRUPTIBLE`, cycle
 //! counting). The harness's guest memory is a mirrored arena, so no access faults and every one
 //! keeps its fastmem path and out-of-line fault stub, as in a game. Skipped without a sysroot.
+//!
+//! On an arm64 host patch 0060's counters are x64's and read zero; the first test then reports the
+//! blocks emitted and their host bytes from vendored patch 0106's census instead.
 
 mod harness;
 
@@ -83,14 +86,38 @@ fn census() -> Vec<u64> {
 }
 
 /// Translate the first blocks of every function of `lib`; the census over it, and the functions.
-fn translate_library(lib: &str, blocks_per_function: usize) -> Option<(Vec<u64>, usize)> {
-    translate_library_with(lib, blocks_per_function, optimization::ALL_SAFE).map(|t| (t.census, t.functions))
+fn translate_library(lib: &str, blocks_per_function: usize) -> Option<(Vec<u64>, usize, (u64, u64))> {
+    translate_library_with(lib, blocks_per_function, optimization::ALL_SAFE).map(|t| (t.census, t.functions, t.emitted))
+}
+
+/// arm64: the blocks a jit emitted and their host bytes, counted by vendored patch 0106's census
+/// (`OD_CENSUS_EMITTED`, on the emitting thread).
+#[cfg(target_arch = "aarch64")]
+#[derive(Default)]
+struct Emitted {
+    blocks: std::sync::atomic::AtomicU64,
+    bytes: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" fn count_emitted(group: *mut std::ffi::c_void, kind: u32, _locations: *const u64, host_bytes: *const u32, count: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if kind != dynarmic_sys::OD_CENSUS_EMITTED {
+        return;
+    }
+    // SAFETY: the only group joined in this file is an `Emitted` that outlives its jit; the shim
+    // passes `count` sizes.
+    let (group, sizes) = unsafe { (&*group.cast::<Emitted>(), std::slice::from_raw_parts(host_bytes, count as usize)) };
+    group.blocks.fetch_add(count, Relaxed);
+    group.bytes.fetch_add(sizes.iter().map(|&b| u64::from(b)).sum(), Relaxed);
 }
 
 /// What [`translate_library_with`] measured.
 struct Translated {
     census: Vec<u64>,
     functions: usize,
+    /// arm64: blocks emitted and their host bytes (patch 0106's census); zero on x64.
+    emitted: (u64, u64),
     /// The shared cache's counters (zero on a per-thread cache).
     stats: OdCodeCacheStats,
     /// Wall time of the whole pass (translation, the dispatcher, one tick of each block).
@@ -105,6 +132,8 @@ fn translate_library_with(lib: &str, blocks_per_function: usize, optimizations: 
     let ((off, vaddr, len), funcs) = text_and_functions(&elf);
     let bytes = &elf[off as usize..(off + len) as usize];
     let code: Vec<u32> = bytes.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    #[cfg(target_arch = "aarch64")]
+    let emitted = Emitted::default(); // before `vm`: dropped after the jit that reports into it
     let vm = Vm::new(
         code,
         VmOptions {
@@ -112,12 +141,20 @@ fn translate_library_with(lib: &str, blocks_per_function: usize, optimizations: 
             check_halt_on_memory_access: true,
             fastmem_exclusive: true,
             optimizations: (optimizations & optimization::INTERRUPTIBLE) | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
-            code_cache_size: 256 << 20,
+            // arm64 refuses a cache over 128 MiB (`B`/`BL` reach); one pass over `libc.so` emits
+            // far less than either.
+            code_cache_size: if cfg!(target_arch = "aarch64") { 128 << 20 } else { 256 << 20 },
             ..VmOptions::default()
         },
     );
     // SAFETY: a process-wide counter reset; this binary runs one test.
     unsafe { od_codegen_census_reset() };
+    // SAFETY: `count_emitted` is safe from any thread; `emitted` outlives the jit, which has not run.
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        dynarmic_sys::od_set_census_sink(Some(count_emitted));
+        dynarmic_sys::od_jit_census_join(vm.raw(), std::ptr::from_ref(&emitted).cast_mut().cast());
+    }
     let started = std::time::Instant::now();
     for &f in &funcs {
         vm.set_pc(CODE_BASE + (f - vaddr));
@@ -145,7 +182,63 @@ fn translate_library_with(lib: &str, blocks_per_function: usize, optimizations: 
         // SAFETY: the cache is live (the `Vm` holds it) and `stats` is writable.
         unsafe { od_code_cache_stats_of(cache, &mut stats) };
     }
-    Some(Translated { census: census(), functions: funcs.len(), stats, wall })
+    #[cfg(target_arch = "aarch64")]
+    let emitted = (emitted.blocks.load(std::sync::atomic::Ordering::Relaxed), emitted.bytes.load(std::sync::atomic::Ordering::Relaxed));
+    #[cfg(not(target_arch = "aarch64"))]
+    let emitted = (0, 0);
+    Some(Translated { census: census(), functions: funcs.len(), emitted, stats, wall })
+}
+
+/// **What a block costs in arm64 code, on real Android code**: the corpus of
+/// [`the_speed_of_emission`] -- the first blocks of every function of libc, libart, libhwui and
+/// libandroid_runtime -- each library on a jit of its own with the arm64 backend's per-thread cache,
+/// as omni-cpu runs on an arm64 host. Per library and in all: the blocks emitted, their host bytes
+/// (patch 0106's emission hook: a block's code with its out-of-line part and, from vendored patch
+/// 0114, its return-stack slots), and the wall time of the pass per block (translation, the
+/// dispatcher and one tick of each block).
+///
+/// MEASURED (M4, 2026-10-20; the bytes are the same every run): 11,007 blocks, 369.81 bytes a block
+/// before vendored patch 0112 and 368.40 after (4,070,548 -> 4,054,972): a thread-pointer `MRS` or
+/// `MSR`, and each exclusive access's reservation slots, take one `LDR` from the jit's state where a
+/// `MOV` of up to four instructions baked in one thread's address. On top of 0110 (whose precise
+/// get/set elimination makes code smaller) with 0112-0114 together, 352.06 -> 352.54 (3,875,172 ->
+/// 3,880,364): 0114's return-stack slots take back a little more than 0112 saves.
+///
+/// ```text
+/// OMNI_SYSROOT=<sysroot/aosp-35> cargo test -p dynarmic-sys --release --test code_size -- --ignored --nocapture arm64
+/// ```
+#[cfg(target_arch = "aarch64")]
+#[test]
+#[ignore = "measurement, not a test"]
+fn the_bytes_of_a_block_on_arm64() {
+    let libs = [
+        "/apex/com.android.runtime/lib64/bionic/libc.so",
+        "/apex/com.android.art/lib64/libart.so",
+        "/system/lib64/libhwui.so",
+        "/system/lib64/libandroid_runtime.so",
+    ];
+    let (mut blocks, mut bytes, mut wall) = (0u64, 0u64, 0f64);
+    for lib in libs {
+        let Some(t) = translate_library_with(lib, 4, optimization::ALL_SAFE) else {
+            println!("{lib}: not in the sysroot (OMNI_SYSROOT): skipped");
+            return;
+        };
+        let (b, n) = t.emitted;
+        println!(
+            "{lib}: {} fns, {b} blocks, {:.2} B/block, wall {:.2} us/block",
+            t.functions,
+            n as f64 / b.max(1) as f64,
+            t.wall.as_secs_f64() * 1e6 / b.max(1) as f64
+        );
+        blocks += b;
+        bytes += n;
+        wall += t.wall.as_secs_f64();
+    }
+    println!(
+        "corpus: {blocks} blocks, {bytes} bytes, {:.2} B/block, wall {:.2} us/block",
+        bytes as f64 / blocks.max(1) as f64,
+        wall * 1e6 / blocks.max(1) as f64
+    );
 }
 
 fn report(lib: &str, c: &[u64], functions: usize) {
@@ -184,10 +277,17 @@ fn where_the_bytes_of_translated_code_go() {
         dynarmic_sys::od_set_fast_dispatch_inline(u32::from(inline));
         dynarmic_sys::od_set_compact_code(compact);
     }
-    let Some((c, functions)) = translate_library(&lib, 4) else {
+    let Some((c, functions, (blocks, bytes))) = translate_library(&lib, 4) else {
         println!("no sysroot (OMNI_SYSROOT) or no {lib}: skipped");
         return;
     };
+    if cfg!(target_arch = "aarch64") {
+        println!(
+            "\n== {lib} (arm64): {functions} functions, {blocks} blocks, {bytes} bytes of host code, {:.2} B/block ==",
+            bytes as f64 / blocks.max(1) as f64
+        );
+        return;
+    }
     println!(
         "(0042 inline dispatch {}, 0061 compact code {})",
         if inline { "on" } else { "off" },

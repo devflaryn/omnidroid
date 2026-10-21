@@ -1416,10 +1416,52 @@ fn sys_ftruncate(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
     }
 }
 
-fn sys_fsync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
-    if let FileKind::Host { file, sysroot: false, .. } = &*p.fds.get(fd_arg(a[0]))?.kind.lock() {
-        file.sync_data().map_err(|_| EIO)?;
+/// What a guest `fsync`/`fdatasync` of a writable-mount file asks of the host: 0 `off`, nothing
+/// (the descriptor is checked, 0 answered); 1 `os`, the host's own sync
+/// (`omni_platform::fs::SyncLevel::Os`, macOS `fsync`); 2 `full`, through the drive's cache too
+/// (`SyncLevel::Full`, macOS `F_FULLFSYNC`), the default and the behaviour before the switch. The
+/// lever `disk_sync=off|os|full` (`crate::lever`), or `OMNI_DISK_SYNC` from the start. MEASURED
+/// (Roblox launch, M4, 2026-10-20): ~1,070 syncs, ~3.7 s of guest threads blocked in them,
+/// system_server's main, binder and android.io threads 4-5 ms a stall. A pool device's disk is
+/// thrown away at every boot, so the pool starts its devices `off` (D43).
+pub static DISK_SYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// [`DISK_SYNC`] set by its name; the name, or `None` for one it does not know.
+pub fn set_disk_sync(name: &str) -> Option<&'static str> {
+    let (level, name) = match name.trim() {
+        "off" => (0, "off"),
+        "os" => (1, "os"),
+        "full" => (2, "full"),
+        _ => return None,
+    };
+    DISK_SYNC.store(level, std::sync::atomic::Ordering::Relaxed);
+    Some(name)
+}
+
+/// `OMNI_DISK_SYNC=off|os|full`: [`DISK_SYNC`] from the start (read once, by the lever reader).
+pub fn disk_sync_from_env() {
+    if let Ok(v) = std::env::var("OMNI_DISK_SYNC") {
+        match set_disk_sync(&v) {
+            Some(name) => eprintln!("[lever] OMNI_DISK_SYNC: disk_sync={name}"),
+            None => eprintln!("[lever] OMNI_DISK_SYNC={v:?} not understood (off, os or full): disk_sync=full"),
+        }
     }
+}
+
+fn sys_fsync(p: &Process, _t: &mut Task, a: [u64; 6]) -> SysResult {
+    let file = p.fds.get(fd_arg(a[0]))?;
+    let level = match DISK_SYNC.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => return Ok(0),
+        1 => omni_platform::fs::SyncLevel::Os,
+        _ => omni_platform::fs::SyncLevel::Full,
+    };
+    // A second handle on the host file: the sync -- milliseconds on a disk -- then holds nothing
+    // of the descriptor's, whose reads and writes go on meanwhile.
+    let host = match &*file.kind.lock() {
+        FileKind::Host { file, sysroot: false, .. } => file.try_clone().map_err(|_| EIO)?,
+        _ => return Ok(0),
+    };
+    omni_platform::fs::sync_data(&host, level).map_err(|_| EIO)?;
     Ok(0)
 }
 

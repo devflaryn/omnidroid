@@ -1,0 +1,63 @@
+diff -ru a/externals/oaknut/include/oaknut/code_block.hpp b/externals/oaknut/include/oaknut/code_block.hpp
+--- a/externals/oaknut/include/oaknut/code_block.hpp
++++ b/externals/oaknut/include/oaknut/code_block.hpp
+@@ -44,8 +44,15 @@
+         m_memory = (std::uint32_t*)mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+ #endif
+ 
++#if defined(_WIN32)
+         if (m_memory == nullptr)
+             throw std::bad_alloc{};
++#else
++        // Omnidroid patch 0113: mmap fails with MAP_FAILED (all ones), never null, so a cache that
++        // could not be mapped was taken for one at the top of the address space and written to.
++        if (static_cast<void*>(m_memory) == MAP_FAILED)
++            throw std::bad_alloc{};
++#endif
+     }
+ 
+     ~CodeBlock()
+diff -ru a/src/dynarmic/backend/arm64/a64_address_space.cpp b/src/dynarmic/backend/arm64/a64_address_space.cpp
+--- a/src/dynarmic/backend/arm64/a64_address_space.cpp
++++ b/src/dynarmic/backend/arm64/a64_address_space.cpp
+@@ -455,7 +455,17 @@
+ }
+ 
+ IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor) const {
+-    const auto get_code = [this](u64 vaddr) { return conf.callbacks->MemoryReadCode(vaddr); };
++    return GenerateIR(descriptor, conf);
++}
++
++// Omnidroid patch 0113: the guest code is read -- by the frontend, and by the pass that merges
++// interpreted instructions -- through the callbacks of the thread translating (`translator`), and
++// everything that shapes the block comes from this address space's own config. One jit per
++// address space, as here, they are one config; a cache shared by a process's threads translates on
++// whichever thread missed, and only that thread's callbacks are sure to reach its memory as it is
++// now: the template's are no thread's.
++IR::Block A64AddressSpace::GenerateIR(IR::LocationDescriptor descriptor, const A64::UserConfig& translator) const {
++    const auto get_code = [&translator](u64 vaddr) { return translator.callbacks->MemoryReadCode(vaddr); };
+     IR::Block ir_block = A64::Translate(A64::LocationDescriptor{descriptor}, get_code,
+                                         {conf.define_unpredictable_behaviour, conf.wall_clock_cntpct});
+ 
+@@ -486,7 +496,7 @@
+         Optimization::DeadCodeElimination(ir_block, dce);
+     }
+     if (conf.HasOptimization(OptimizationFlag::MiscIROpt)) {
+-        Optimization::A64MergeInterpretBlocksPass(ir_block, conf.callbacks);
++        Optimization::A64MergeInterpretBlocksPass(ir_block, translator.callbacks);
+     }
+     // Omnidroid patch 0103: the IR's consistency check only when asked for (`OMNI_JIT_VERIFY=1`),
+     // as on x64 (patch 0077): it asserts and changes nothing.
+diff -ru a/src/dynarmic/backend/arm64/a64_address_space.h b/src/dynarmic/backend/arm64/a64_address_space.h
+--- a/src/dynarmic/backend/arm64/a64_address_space.h
++++ b/src/dynarmic/backend/arm64/a64_address_space.h
+@@ -23,6 +23,9 @@
+     explicit A64AddressSpace(const A64::UserConfig& conf);
+ 
+     IR::Block GenerateIR(IR::LocationDescriptor) const override;
++    // Omnidroid patch 0113: translated on the thread whose config `translator` is, whose callbacks
++    // read the guest's code; see the definition.
++    IR::Block GenerateIR(IR::LocationDescriptor descriptor, const A64::UserConfig& translator) const;
+ 
+     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
+ 

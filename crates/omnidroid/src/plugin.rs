@@ -40,8 +40,10 @@ use json::Json;
 pub const MANIFEST: &str = "omnidroid-plugin.json";
 /// The commands that run a session: the ones a plugin's options, env and hooks are for.
 pub const SESSION_COMMANDS: &[&str] = &["play", "aosp"];
-/// The launcher's own commands: a plugin's command cannot take one of these names.
-const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release"];
+/// The launcher's own commands: a plugin's command cannot take one of these names -- the ones
+/// `main` answers before a plugin's command is looked for (`serve`, `host`, `app`, `restart`,
+/// `autorestart`) too, or a plugin's of that name was accepted and never ran.
+const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release", "serve", "host", "app", "restart", "autorestart"];
 /// The launcher's own options: a plugin's option cannot take one of these.
 const CORE_FLAGS: &[&str] = &[
     "--apk", "--minutes", "--fresh", "--phone", "--data-dir", "--headless", "--no-window", "--control", "--size",
@@ -783,6 +785,7 @@ mod tests {
         assert!(bad(r#"{"name": "x", "args": [{"flag": "--apk"}]}"#).contains("launcher's own"));
         assert!(bad(r#"{"name": "x", "args": [{"flag": "--y", "type": "colour"}]}"#).contains("colour"));
         assert!(bad(r#"{"name": "x", "commands": {"play": {"run": ["a"]}}}"#).contains("play"));
+        assert!(bad(r#"{"name": "x", "commands": {"autorestart": {"run": ["a"]}}}"#).contains("autorestart"), "answered by the launcher first");
         assert!(bad(r#"{"name": "x", "hooks": {"whenever": ["a"]}}"#).contains("whenever"));
         assert!(bad(r#"{"name": "x", "env": {"which": {}}}"#).contains("which"));
     }

@@ -36,7 +36,8 @@ namespace {
 /// twice (a search of every location that always runs to the end) and that every location is
 /// unlocked after each instruction (a walk of all 129) -- run with the IR verification
 /// (`OMNI_JIT_VERIFY=1`, patch 0077), as the x64 allocator's do (patch 0080). They assert and
-/// change nothing.
+/// change nothing. Patch 0111: so does the walk after each block that every location is empty
+/// (0.85% of an app host's busy time while it launched, M4, 2026-10-20).
 bool VerifyAllocation() {
     static const bool on = [] {
         const char* v = std::getenv("OMNI_JIT_VERIFY");
@@ -305,6 +306,9 @@ void RegAlloc::AssertAllUnlocked() const {
 }
 
 void RegAlloc::AssertNoMoreUses() const {
+    if (!VerifyAllocation()) {
+        return;  // patch 0111
+    }
     const auto is_empty = [](const auto& i) { return i.IsCompletelyEmpty(); };
     ASSERT(std::all_of(gprs.begin(), gprs.end(), is_empty));
     ASSERT(std::all_of(fprs.begin(), fprs.end(), is_empty));

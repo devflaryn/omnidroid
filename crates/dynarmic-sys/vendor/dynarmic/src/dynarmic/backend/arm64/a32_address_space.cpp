@@ -375,8 +375,6 @@ EmitConfig A32AddressSpace::GetEmitConfig() {
         .cntfreq_el0{},
         .ctr_el0{},
         .dczid_el0{},
-        .tpidrro_el0{},
-        .tpidr_el0{},
 
         .check_halt_on_memory_access = conf.check_halt_on_memory_access,
 

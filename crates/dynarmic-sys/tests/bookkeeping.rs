@@ -150,9 +150,10 @@ fn a_translated_block_costs_bytes_of_bookkeeping_not_kilobytes() {
     eprintln!("dynarmic bookkeeping per translated block: {per_block:.0} bytes (n = {BLOCKS} blocks)");
     // MEASURED on the pin: 1,785 bytes per block of this shape (2,100 in the gate, where blocks
     // have more patch sites). The bound is well above what the records cost and well below what
-    // the maps did.
+    // the maps did. Patch 0109 (M4, 2026-10-20): 284 bytes, 381 with the block map and the link
+    // heads at tsl's load factor of 0.5 -- each a doubling larger at these 32,769 entries.
     assert!(
-        per_block < 700.0,
+        per_block < 330.0,
         "{per_block:.0} bytes of bookkeeping per block: the jit is keeping each block's emission \
          products (EmittedBlockInfo in map buckets) rather than the records read after emission"
     );

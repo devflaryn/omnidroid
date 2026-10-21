@@ -93,6 +93,18 @@ pub(crate) struct SharedPage {
     view: View,
     path: std::path::PathBuf,
     _file: std::fs::File,
+    /// Made here ([`SharedPage::create`]): its file goes when it does. An app host process's gate
+    /// lives as long as the process; its file goes after it ends ([`remove_gate_of`],
+    /// [`remove_stale`]).
+    made: bool,
+}
+
+impl Drop for SharedPage {
+    fn drop(&mut self) {
+        if self.made {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 impl SharedPage {
@@ -113,7 +125,7 @@ impl SharedPage {
         let file = options.open(&path).ok()?;
         file.set_len(omni_platform::vm::page_size() as u64).ok()?;
         let view = View::map(&file, &path, omni_platform::vm::page_size() as u64)?;
-        Some(Self { view, path, _file: file })
+        Some(Self { view, path, _file: file, made: true })
     }
 
     /// The page another process made, by its path: only a file in [`host_dir`] named with `prefix`.
@@ -128,7 +140,7 @@ impl SharedPage {
             return None;
         }
         let view = View::map(&file, path, len)?;
-        Some(Self { view, path: path.to_path_buf(), _file: file })
+        Some(Self { view, path: path.to_path_buf(), _file: file, made: false })
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
@@ -198,6 +210,88 @@ pub fn host_dir() -> std::path::PathBuf {
         if writable { shm.to_path_buf() } else { std::env::temp_dir() }
     })
     .clone()
+}
+
+/// The host process a file this module makes in [`host_dir`] is of, by its name: a region's
+/// `omni-shm-<pid>-<n>` (`-<nanos>` after a clash), the probe's `omni-shm-probe-<pid>`, a
+/// [`SharedPage`]'s `<prefix>-<pid>` (the direct-access gate's `omni-remote-gate-<pid>`,
+/// `crate::remote`; a test's `omni-remote-gate-<name>-<pid>`). `None` for any other name.
+#[must_use]
+pub fn owner_of(name: &str) -> Option<u32> {
+    if let Some(rest) = name.strip_prefix("omni-remote-gate-") {
+        return rest.rsplit('-').next()?.parse().ok();
+    }
+    let rest = name.strip_prefix("omni-shm-")?;
+    let rest = rest.strip_prefix("probe-").unwrap_or(rest);
+    rest.split('-').next()?.parse().ok()
+}
+
+/// **`shm_sweep`** (lever; on by default): the files a host process that has ended left in
+/// [`host_dir`] are removed -- its direct-access gate when the system's host process reaps it
+/// ([`remove_gate_of`]), and what ended sessions left when a system's host process starts
+/// ([`remove_stale`]). `shm_sweep=0` (`OMNI_SHM_SWEEP=0`) leaves them, as before. A region's file
+/// is never removed while a session that may hold it lives: one crossed to another host process is
+/// opened by its path again whenever its holder passes it on ([`Shm::host_path_crossing`] -- a
+/// shared bitmap system_server sends on to the launcher), long after its maker has ended.
+pub static SWEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `OMNI_SHM_SWEEP=0`: [`SWEEP`] off from the start.
+pub fn sweep_from_env() {
+    if std::env::var("OMNI_SHM_SWEEP").as_deref() == Ok("0") {
+        SWEEP.store(false, Ordering::Relaxed);
+        eprintln!("[lever] OMNI_SHM_SWEEP: shm_sweep=0");
+    }
+}
+
+/// A direct-access gate's file (`crate::remote`): used by its maker and by the system's host
+/// process, which opens it once by path when it connects -- never after the maker has ended.
+fn is_gate(name: &str) -> bool {
+    name.starts_with("omni-remote-gate-")
+}
+
+/// **The direct-access gate of host process `pid`** removed, once it has ended ([`SWEEP`]). Only
+/// the gate: a region it made may have crossed to another host process of the session, which opens
+/// it by path again to pass it on. Answers the files and bytes removed.
+pub fn remove_gate_of(dir: &std::path::Path, pid: u32) -> (usize, u64) {
+    remove_where(dir, |name, owner| owner == pid && is_gate(name))
+}
+
+/// **The files in `dir` whose host process has ended** ([`owner_of`], `is_alive`) removed: what a
+/// killed session left, its processes having run no code of theirs at the end ([`SWEEP`]).
+/// MEASURED (pool on the Mac, 2026-10-20): 974 regions' files (154 MB) and 50 gates in its temp
+/// directory after the pool stopped. A gate goes whenever its maker has ended; a region only while
+/// no other host process with a file here is alive -- the devices of a pool share the directory,
+/// and a live session may still hold a region an ended app host made and pass it on by its path. A
+/// file of a pid the host has given to a new process is kept. Answers the files and bytes removed.
+pub fn remove_stale(dir: &std::path::Path) -> (usize, u64) {
+    remove_stale_with(dir, std::process::id(), omni_platform::process::is_alive)
+}
+
+/// [`remove_stale`], `alive` telling which pids are alive and `me` being this process's.
+fn remove_stale_with(dir: &std::path::Path, me: u32, alive: impl Fn(u32) -> bool) -> (usize, u64) {
+    let mut seen = std::collections::HashMap::new();
+    let mut is_alive = |pid: u32| *seen.entry(pid).or_insert_with(|| alive(pid));
+    let owners: Vec<u32> = std::fs::read_dir(dir).map_or_else(|_| Vec::new(), |entries| entries.flatten().filter_map(|e| e.file_name().to_str().and_then(owner_of)).collect());
+    let live_session = owners.iter().any(|&pid| pid != me && is_alive(pid));
+    remove_where(dir, |name, owner| owner != me && !is_alive(owner) && (is_gate(name) || !live_session))
+}
+
+fn remove_where(dir: &std::path::Path, mut gone: impl FnMut(&str, u32) -> bool) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return (0, 0) };
+    let mut removed = (0, 0);
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !owner_of(name).is_some_and(|owner| gone(name, owner)) {
+            continue;
+        }
+        let bytes = e.metadata().map_or(0, |m| m.len());
+        if std::fs::remove_file(e.path()).is_ok() {
+            removed.0 += 1;
+            removed.1 += bytes;
+        }
+    }
+    removed
 }
 
 /// Whether a file can be made (and is removed again) in `dir`.
@@ -526,6 +620,81 @@ impl Shm {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_names_the_host_process_it_is_of() {
+        assert_eq!(owner_of("omni-shm-78932-17"), Some(78932));
+        assert_eq!(owner_of("omni-shm-78932-17-1791910224000000000"), Some(78932));
+        assert_eq!(owner_of("omni-shm-probe-412"), Some(412));
+        assert_eq!(owner_of("omni-remote-gate-84203"), Some(84203));
+        assert_eq!(owner_of("omni-remote-gate-test-9"), Some(9), "a test's gate");
+        assert_eq!(owner_of("omni-remote-gate-"), None);
+        assert_eq!(owner_of("omni-shm-stale-test-9"), None);
+        assert_eq!(owner_of("omni-crossing-9-1"), None);
+    }
+
+    fn left(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    /// A stale sweep with no other session alive removes the files of host processes that have
+    /// ended -- regions, crossed or not, and gates -- and keeps this process's and every other name.
+    #[test]
+    fn the_files_of_an_ended_process_go_and_a_live_ones_stay() {
+        let dir = std::env::temp_dir().join(format!("omni-shm-sweep-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A pid that has ended: a child run and reaped, its handle closed.
+        let dead = {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--list")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            child.wait().unwrap();
+            child.id()
+        };
+        let live = std::process::id();
+        let names = [
+            format!("omni-shm-{dead}-0"),
+            format!("omni-shm-{dead}-7-1791910224000000000"),
+            format!("omni-remote-gate-{dead}"),
+            format!("omni-shm-{live}-3"),
+            format!("omni-remote-gate-{live}"),
+            "omni-warm-1792449570.log".to_string(),
+        ];
+        for name in &names {
+            std::fs::write(dir.join(name), b"0123456789").unwrap();
+        }
+        assert_eq!(remove_stale(&dir), (3, 30), "the ended process's three");
+        let mut kept = names[3..].to_vec();
+        kept.sort();
+        assert_eq!(left(&dir), kept);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// While another session lives, a region an ended app host made stays -- that session's system
+    /// host may hold it and open it by path again to pass it on -- and only gates go: an ended app
+    /// host's at its reaping, any ended process's at a start. Once no other session lives, the
+    /// regions go too.
+    #[test]
+    fn a_crossed_region_stays_while_a_session_may_hold_it() {
+        let dir = std::env::temp_dir().join(format!("omni-shm-session-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 7001: an app host that ended; 7002: another device's live system host; 7003: this one.
+        let names = ["omni-shm-7001-4", "omni-remote-gate-7001", "omni-shm-7002-9", "omni-remote-gate-7004"];
+        for name in names {
+            std::fs::write(dir.join(name), b"0123456789").unwrap();
+        }
+        assert_eq!(remove_gate_of(&dir, 7001), (1, 10), "its gate alone");
+        assert_eq!(left(&dir), ["omni-remote-gate-7004", "omni-shm-7001-4", "omni-shm-7002-9"]);
+        assert_eq!(remove_stale_with(&dir, 7003, |pid| pid == 7002), (1, 10), "an ended process's gate");
+        assert_eq!(left(&dir), ["omni-shm-7001-4", "omni-shm-7002-9"], "kept while 7002 lives");
+        assert_eq!(remove_stale_with(&dir, 7003, |_| false), (2, 20));
+        assert!(left(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A dead process that had this pid left its regions' files (a killed run, the pid reused):
     /// they do not refuse this process's regions.

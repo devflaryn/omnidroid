@@ -769,7 +769,7 @@ impl Socket {
             Inner::Tcp(stream) => stream.set_nonblocking(nonblocking),
             Inner::Udp(socket) => socket.set_nonblocking(nonblocking),
         }
-        .map_err(|error| NetError::io(OP, self.describe(), &error))?;
+        .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))?;
         self.nonblocking = nonblocking;
         Ok(())
     }
@@ -928,7 +928,7 @@ impl Socket {
             Inner::Udp(socket) => {
                 socket
                     .connect(address.to_std())
-                    .map_err(|error| NetError::io(OP, address.to_string(), &error))?;
+                    .map_err(|error| NetError::io_naming(OP, &error, || address.to_string()))?;
                 ConnectProgress::Connected
             }
         };
@@ -1035,7 +1035,7 @@ impl Socket {
             {
                 Ok(SocketAddress::unspecified(self.family))
             }
-            Err(error) => Err(NetError::io(OP, self.describe(), &error)),
+            Err(error) => Err(NetError::io_naming(OP, &error, || self.describe())),
         }
     }
 
@@ -1051,7 +1051,7 @@ impl Socket {
             Inner::Udp(socket) => socket.peer_addr(),
         }
         .map(SocketAddress::from_std)
-        .map_err(|error| NetError::io(OP, self.describe(), &error))
+        .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Send on a connected socket: `send(2)`.
@@ -1077,7 +1077,7 @@ impl Socket {
             Inner::Udp(socket) => socket.send(buf),
         }
         .inspect(|sent| record::note(self.record, record::Direction::Sent, &buf[..*sent]))
-        .map_err(|error| NetError::io(OP, self.describe(), &error))
+        .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Receive on a connected socket: `recv(2)`.
@@ -1101,7 +1101,7 @@ impl Socket {
             Inner::Udp(socket) => socket.recv(buf),
         }
         .inspect(|read| record::note(self.record, record::Direction::Received, &buf[..*read]))
-        .map_err(|error| NetError::io(OP, self.describe(), &error))
+        .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Send a datagram to an address: `sendto(2)`.
@@ -1135,7 +1135,7 @@ impl Socket {
         socket
             .send_to(buf, address.to_std())
             .inspect(|sent| record::note(self.record, record::Direction::Sent, &buf[..*sent]))
-            .map_err(|error| NetError::io(OP, address.to_string(), &error))
+            .map_err(|error| NetError::io_naming(OP, &error, || address.to_string()))
     }
 
     /// Receive a datagram and say where it came from: `recvfrom(2)`.
@@ -1168,7 +1168,7 @@ impl Socket {
                 record::note(self.record, record::Direction::Received, &buf[..*read]);
             })
             .map(|(read, from)| (read, SocketAddress::from_std(from)))
-            .map_err(|error| NetError::io(OP, self.describe(), &error))
+            .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Look at what has arrived without taking it: `recv(2)` with `MSG_PEEK`. On a datagram
@@ -1192,7 +1192,7 @@ impl Socket {
                 socket.peek_from(buf).map(|(read, from)| (read, Some(SocketAddress::from_std(from))))
             }
         }
-        .map_err(|error| NetError::io(OP, self.describe(), &error))
+        .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Close one or both directions of a stream: `shutdown(2)`.
@@ -1218,7 +1218,7 @@ impl Socket {
         };
         stream
             .shutdown(how.to_std())
-            .map_err(|error| NetError::io(OP, self.describe(), &error))
+            .map_err(|error| NetError::io_naming(OP, &error, || self.describe()))
     }
 
     /// Set a socket option: `setsockopt(2)`.
@@ -1255,7 +1255,7 @@ impl Socket {
             }
             SocketOption::NoDelay(on) => {
                 let stream = self.require_stream(OP, "TCP_NODELAY")?;
-                stream.set_nodelay(on).map_err(|e| NetError::io(OP, self.describe(), &e))
+                stream.set_nodelay(on).map_err(|e| NetError::io_naming(OP, &e, || self.describe()))
             }
             SocketOption::ReceiveBuffer(bytes) => {
                 backend::set_buffer_bytes(&self.inner, Buffer::Receive, bytes)
@@ -1269,7 +1269,7 @@ impl Socket {
                     Inner::Tcp(stream) => stream.set_read_timeout(timeout),
                     Inner::Udp(socket) => socket.set_read_timeout(timeout),
                 }
-                .map_err(|e| NetError::io(OP, self.describe(), &e))
+                .map_err(|e| NetError::io_naming(OP, &e, || self.describe()))
             }
             SocketOption::SendTimeout(timeout) => {
                 let timeout = normalise_timeout(timeout);
@@ -1277,7 +1277,7 @@ impl Socket {
                     Inner::Tcp(stream) => stream.set_write_timeout(timeout),
                     Inner::Udp(socket) => socket.set_write_timeout(timeout),
                 }
-                .map_err(|e| NetError::io(OP, self.describe(), &e))
+                .map_err(|e| NetError::io_naming(OP, &e, || self.describe()))
             }
             SocketOption::V6Only(on) => {
                 self.require_v6(OP)?;
@@ -1358,7 +1358,7 @@ impl Socket {
                 stream
                     .nodelay()
                     .map(OptionValue::Flag)
-                    .map_err(|e| NetError::io(OP, self.describe(), &e))
+                    .map_err(|e| NetError::io_naming(OP, &e, || self.describe()))
             }
             SocketQuery::ReceiveBuffer => {
                 backend::buffer_bytes(&self.inner, Buffer::Receive).map(OptionValue::Bytes)
@@ -1371,13 +1371,13 @@ impl Socket {
                 Inner::Udp(socket) => socket.read_timeout(),
             }
             .map(OptionValue::Timeout)
-            .map_err(|e| NetError::io(OP, self.describe(), &e)),
+            .map_err(|e| NetError::io_naming(OP, &e, || self.describe())),
             SocketQuery::SendTimeout => match &self.inner {
                 Inner::Tcp(stream) => stream.write_timeout(),
                 Inner::Udp(socket) => socket.write_timeout(),
             }
             .map(OptionValue::Timeout)
-            .map_err(|e| NetError::io(OP, self.describe(), &e)),
+            .map_err(|e| NetError::io_naming(OP, &e, || self.describe())),
             SocketQuery::V6Only => {
                 self.require_v6(OP)?;
                 backend::v6only(&self.inner).map(OptionValue::Flag)
@@ -1673,6 +1673,36 @@ mod tests {
             "an empty poll slept: {:?}",
             started.elapsed()
         );
+    }
+
+    /// **What a would-block receive costs** (`--ignored --nocapture`): an empty bound UDP socket's
+    /// `recv` as it is, against the same call with the failure built as before -- the socket named
+    /// (`getsockname`, `format!`) and the host's message rendered. MEASURED (M4, macOS, a loaded
+    /// host, 2026-10-20): 369-450 ns a call now, 1,117-1,129 ns as before.
+    #[test]
+    #[ignore = "a measurement; run by hand"]
+    fn what_a_would_block_receive_costs() {
+        let mut socket = Socket::new(SocketKind::Datagram, IpFamily::V4, Arc::new(NetPolicy::unrestricted())).expect("a socket");
+        socket.bind(&SocketAddress::loopback(IpFamily::V4, 0)).expect("bound");
+        socket.set_nonblocking(true).expect("non-blocking");
+        let mut buf = [0u8; 2048];
+        const N: u32 = 200_000;
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                assert!(socket.recv(&mut buf).expect_err("nothing sent").is_would_block());
+            }
+            let now = t.elapsed().as_nanos() / u128::from(N);
+            let t = std::time::Instant::now();
+            for _ in 0..N {
+                let Inner::Udp(udp) = &socket.inner else { unreachable!("a datagram socket") };
+                let error = udp.recv(&mut buf).expect_err("nothing sent");
+                let before = NetError::Io { operation: "recv", endpoint: socket.describe(), kind: NetErrorKind::classify(&error), detail: error.to_string() };
+                assert!(before.is_would_block());
+            }
+            let before = t.elapsed().as_nanos() / u128::from(N);
+            eprintln!("[wouldblock] round {round}: {now} ns a recv now, {before} ns with the failure built as before");
+        }
     }
 
     /// A zero timeout is "no timeout", which is what a zero `timeval` means to `setsockopt`.

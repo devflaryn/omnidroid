@@ -723,13 +723,14 @@ pub const TEST_SHARED_CACHE_BYTES: u64 = 64 << 20;
 /// Regions of [`TEST_SHARED_CACHE_BYTES`].
 pub const TEST_SHARED_REGION_BYTES: u64 = 16 << 20;
 
-/// One guest thread: a jit, its context and the pointers dynarmic bakes into
-/// generated code.
+/// One guest thread: a jit, its context and the thread-pointer slots generated code
+/// reads and writes.
 pub struct Vm {
     jit: *mut c_void,
     /// Separate allocation from `Vm` on purpose: see the module docs.
     ctx: Box<UnsafeCell<Ctx>>,
-    /// Boxed so the address dynarmic inlines into generated code never moves.
+    /// Boxed so the address generated code reads it through (in the jit's state, or inlined into
+    /// an x64 cache of its own) never moves.
     tpidr: Box<u64>,
     tpidrro: Box<u64>,
     monitor: *mut c_void,
@@ -994,7 +995,7 @@ impl Vm {
         unsafe { od_jit_get_pstate(self.jit) }
     }
 
-    /// Set `TPIDR_EL0`, which dynarmic reads through an inlined pointer.
+    /// Set `TPIDR_EL0`, which generated code reads through a pointer to its slot.
     pub fn set_tpidr_el0(&mut self, v: u64) {
         *self.tpidr = v;
     }
@@ -1007,6 +1008,11 @@ impl Vm {
     /// Set `TPIDRRO_EL0`.
     pub fn set_tpidrro_el0(&mut self, v: u64) {
         *self.tpidrro = v;
+    }
+
+    /// Host address of the `TPIDRRO_EL0` slot.
+    pub fn tpidrro_el0_ptr(&self) -> u64 {
+        &*self.tpidrro as *const u64 as u64
     }
 
     /// The `TPIDR_EL0` slot's current value (what a guest `MSR TPIDR_EL0` wrote).

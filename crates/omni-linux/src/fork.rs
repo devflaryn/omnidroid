@@ -1010,3 +1010,99 @@ pub fn install(table: &mut Table) {
     table.set(nr::WAIT4, sys_wait4);
     table.set(nr::WAITID, sys_waitid);
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sha2::{Digest, Sha256};
+
+    use crate::fd::Output;
+    use crate::process::{Process, Task};
+    use crate::syscall::nr;
+    use crate::vfs::{Sysroot, Vfs};
+
+    /// A private writable mapping of an image file at a 4 KiB offset is a view on a 16 KiB host
+    /// (`mm`, D42), and is in a fork's image as a copy's pages were: what the child writes is put
+    /// back, the parent's own write before the fork stays, and the file is never written. Skipped
+    /// where the guest's page is not 4 KiB (Linux on 16 or 64 KiB pages: a 4 KiB offset is EINVAL).
+    #[test]
+    fn a_fork_puts_back_a_private_view_at_a_4k_offset() {
+        let dir = std::env::temp_dir().join(format!("omni-fork-view-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bytes: Vec<u8> = (0..64 * 4096).map(|i| (i / 4096) as u8 + 1).collect();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        let object = dir.join("objects").join(&sha[..2]).join(&sha);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, &bytes).unwrap();
+        let m = crate::manifest::parse(&format!("d\t755\t/\nf\t644\t{}\t{sha}\t/data.bin\n", bytes.len())).unwrap();
+        let p = Process::for_tests(Vfs::new(Sysroot::from_manifest(&dir, m), vec![], b"/x".to_vec()), Output::Capture(Default::default()));
+        if p.mm.page_size() != 4096 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut t = Task::new(4201, Arc::clone(&p));
+        let path = p.scratch();
+        p.mem.write(path, b"/data.bin\0").unwrap();
+        let fd = p.syscall(&mut t, nr::OPENAT, [(-100i64) as u64, path, 0, 0, 0, 0]);
+        assert!((fd as i64) >= 0);
+        let at = p.syscall(&mut t, nr::MMAP, [0, 8 * 4096, 3, 2, fd, 4096]); // PROT_READ|PROT_WRITE, MAP_PRIVATE
+        assert!((at as i64) > 0);
+        assert!(matches!(p.mem.space().region_at(at as usize).map(|r| r.kind), Some(omni_mem::RegionKind::File { .. })), "a view");
+        p.mem.write(at + 100, &[0xAA]).unwrap();
+        let image = super::Snapshot::take(&p);
+        p.mem.write(at + 100, &[0xBB]).unwrap();
+        p.mem.write(at + 5 * 4096, &[0xCC]).unwrap();
+        image.restore(&p);
+        assert_eq!(p.mem.read(at + 100, 1).unwrap(), vec![0xAA], "the parent's write stays");
+        assert_eq!(p.mem.read(at + 5 * 4096, 1).unwrap(), vec![7], "the child's is put back");
+        assert_eq!(std::fs::read(&object).unwrap(), bytes, "the host file is not written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A writable segment mapped `MAP_FIXED` into a reservation, its edge host pages views under the
+    /// reservation's parts (`GuestSpace::map_file_exact`), is in a fork's image as any private
+    /// mapping is: the parent's write before the fork stays, the child's after it is put back, the
+    /// file is never written, and the reservation's parts beside it are still the reservation's.
+    #[test]
+    fn a_fork_puts_back_a_segment_whose_edge_pages_are_views() {
+        let dir = std::env::temp_dir().join(format!("omni-fork-edges-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bytes: Vec<u8> = (0..64 * 4096).map(|i| (i / 4096) as u8 + 1).collect();
+        let sha = format!("{:x}", Sha256::digest(&bytes));
+        let object = dir.join("objects").join(&sha[..2]).join(&sha);
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::write(&object, &bytes).unwrap();
+        let m = crate::manifest::parse(&format!("d\t755\t/\nf\t644\t{}\t{sha}\t/data.bin\n", bytes.len())).unwrap();
+        let p = Process::for_tests(Vfs::new(Sysroot::from_manifest(&dir, m), vec![], b"/x".to_vec()), Output::Capture(Default::default()));
+        if p.mm.page_size() != 4096 {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut t = Task::new(4202, Arc::clone(&p));
+        let path = p.scratch();
+        p.mem.write(path, b"/data.bin\0").unwrap();
+        let fd = p.syscall(&mut t, nr::OPENAT, [(-100i64) as u64, path, 0, 0, 0, 0]);
+        let host = p.mem.space().page_size() as u64;
+        let r = p.syscall(&mut t, nr::MMAP, [0, 1 << 20, 0, 0x22, u64::MAX, 0]); // PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS
+        let at = r + 4 * host - 4096;
+        let len = 2 * host;
+        assert_eq!(p.syscall(&mut t, nr::MMAP, [at, len, 3, 0x12, fd, (at - r) % host]), at); // MAP_PRIVATE | MAP_FIXED
+        let file_at = |a: u64| matches!(p.mem.space().region_at(a as usize).map(|x| x.kind), Some(omni_mem::RegionKind::File { .. }));
+        assert!(file_at(at) && file_at(at + len - 4096), "its edge pages are views");
+        p.mem.write(at + 7, &[0xAA]).unwrap();
+        let image = super::Snapshot::take(&p);
+        p.mem.write(at + 7, &[0xBB]).unwrap();
+        p.mem.write(at + len - 4096, &[0xCC]).unwrap();
+        image.restore(&p);
+        assert_eq!(p.mem.read(at + 7, 1).unwrap(), vec![0xAA], "the parent's write stays");
+        let off = ((at - r) % host + len - 4096) as usize;
+        assert_eq!(p.mem.read(at + len - 4096, 1).unwrap(), vec![bytes[off]], "the child's is put back");
+        assert_eq!(std::fs::read(&object).unwrap(), bytes, "the host file is not written");
+        let space = p.mem.space();
+        for a in [at - 4096, at + len] {
+            assert!(space.region_at(a as usize).is_some_and(|x| x.protection == omni_mem::Protection::None && x.mapping.is_some()), "{a:#x}: the reservation's");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

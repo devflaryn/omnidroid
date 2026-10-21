@@ -1676,6 +1676,91 @@ fn read_write(file: &TempFile) -> std::fs::File {
         .expect("open the test file for reading and writing")
 }
 
+/// **A shared view past its file's end** (`vm::shared_view_may_pass_end_of_file`): its host pages
+/// wholly past the end as the file is now are inaccessible to every check (`region_at`, `admit`) --
+/// the host would answer with `SIGBUS` -- and are `past_end_of_file`, until the file grows over them.
+#[test]
+fn a_shared_view_past_its_files_end_is_refused_there_until_the_file_grows() {
+    if !omni_platform::vm::shared_view_may_pass_end_of_file() {
+        return;
+    }
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let file = TempFile::new("grows.bin", 100, page);
+    let backing = Backing::share(read_write(&file), "/data/grows.bin").expect("share the file");
+    let address = space
+        .map_file(&backing, 0, Placement::Anywhere { align: page }, 8 * page, Protection::ReadWrite)
+        .expect("a view past the file's end");
+    let inside = space.region_at(address).expect("mapped");
+    assert_eq!((inside.start, inside.len, inside.protection), (address, page, Protection::ReadWrite), "to the end of the file's host page");
+    let past = space.region_at(address + 3 * page).expect("mapped");
+    assert_eq!((past.start, past.len, past.protection), (address + page, 7 * page, Protection::None), "the rest, inaccessible");
+    assert!(omni_mem::admit(&space, address + 3 * page, 8, omni_mem::FaultAccess::Read).is_err());
+    assert!(space.past_end_of_file(address + 3 * page, omni_mem::FaultAccess::Read) && !space.past_end_of_file(address + 10, omni_mem::FaultAccess::Read));
+    std::fs::OpenOptions::new().write(true).open(file.path()).unwrap().set_len(4 * page as u64).expect("grow it");
+    assert!(!space.past_end_of_file(address + 3 * page, omni_mem::FaultAccess::Read) && space.past_end_of_file(address + 4 * page, omni_mem::FaultAccess::Read));
+    let grown = space.region_at(address + 3 * page).expect("mapped");
+    assert_eq!((grown.start, grown.len, grown.protection), (address, 4 * page, Protection::ReadWrite), "grown over");
+    assert!(omni_mem::admit(&space, address + 3 * page, 8, omni_mem::FaultAccess::Write).is_ok());
+    // SAFETY: the file covers this page now; the view is read-write.
+    unsafe { *(space.host_addr(address + 3 * page) as *mut u8) = 0x77 };
+    assert_eq!(std::fs::read(file.path()).unwrap()[3 * page], 0x77, "the file's own page");
+}
+
+/// The cut where the file ends now is never this thread's to remember: a file shrunk under the view
+/// by another descriptor (or process), with no change to the map, is refused at once past its new
+/// end -- the remembered grown region admitted the access, and the host's `SIGBUS` there would kill
+/// the host process.
+#[test]
+fn a_shared_view_past_its_files_end_is_refused_again_once_the_file_shrinks() {
+    if !omni_platform::vm::shared_view_may_pass_end_of_file() {
+        return;
+    }
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let file = TempFile::new("shrinks.bin", 100, page);
+    let backing = Backing::share(read_write(&file), "/data/shrinks.bin").expect("share the file");
+    let address = space
+        .map_file(&backing, 0, Placement::Anywhere { align: page }, 8 * page, Protection::ReadWrite)
+        .expect("a view past the file's end");
+    let other = std::fs::OpenOptions::new().write(true).open(file.path()).unwrap();
+    other.set_len(4 * page as u64).expect("grow it");
+    // What a syscall's pointer check does: a locked lookup, which fills this thread's slots.
+    assert_eq!(space.region_at(address + 3 * page).map(|r| r.protection), Some(Protection::ReadWrite));
+    assert!(omni_mem::admit(&space, address + 3 * page, 8, omni_mem::FaultAccess::Read).is_ok());
+    other.set_len(100).expect("shrink it");
+    assert!(omni_mem::admit(&space, address + 3 * page, 8, omni_mem::FaultAccess::Read).is_err(), "past the new end");
+    assert_eq!(space.region_at(address + 3 * page).map(|r| r.protection), Some(Protection::None));
+    assert!(omni_mem::admit(&space, address + 3 * page, 8, omni_mem::FaultAccess::Read).is_err(), "and after a locked lookup");
+}
+
+/// What a shared view past its file's end holds is the file's part (`held_ranges`, what `mremap`
+/// copies): the host pages wholly past the end hold nothing, and a read there would be the host's
+/// `SIGBUS`. And an access there is the guest's `SIGBUS` only where its protection permits it:
+/// else Linux's `SIGSEGV`.
+#[test]
+fn a_shared_view_past_its_files_end_holds_only_the_files_part() {
+    if !omni_platform::vm::shared_view_may_pass_end_of_file() {
+        return;
+    }
+    let space = space(64 * MIB);
+    let page = space.page_size();
+    let file = TempFile::new("holds.bin", 100, page);
+    let backing = Backing::share(read_write(&file), "/data/holds.bin").expect("share the file");
+    let address = space
+        .map_file(&backing, 0, Placement::Anywhere { align: page }, 8 * page, Protection::ReadWrite)
+        .expect("a view past the file's end");
+    assert_eq!(space.held_ranges(address, 8 * page), vec![(address, page)]);
+    std::fs::OpenOptions::new().write(true).open(file.path()).unwrap().set_len(2 * page as u64 + 1).expect("grow it");
+    assert_eq!(space.held_ranges(address, 8 * page), vec![(address, 3 * page)], "to the end of the file's last host page");
+    let past = address + 5 * page;
+    assert!(space.past_end_of_file(past, omni_mem::FaultAccess::Write));
+    space.protect(address, 8 * page, Protection::Read).expect("read-only");
+    assert!(space.past_end_of_file(past, omni_mem::FaultAccess::Read) && !space.past_end_of_file(past, omni_mem::FaultAccess::Write), "a write: SIGSEGV");
+    space.protect(address, 8 * page, Protection::None).expect("no access");
+    assert!(!space.past_end_of_file(past, omni_mem::FaultAccess::Read));
+}
+
 /// **A shared view writes its file, from the first store, through every protection it passes
 /// through, and through the emulated partial unmap** -- and the file keeps its own length.
 ///
@@ -1771,9 +1856,11 @@ fn sync_counts_only_shared_views_and_skips_holes() {
 
 /// A handle without write access cannot back a shared view: the section is refused, which is
 /// Linux's `EACCES` for a `MAP_SHARED` writable mapping of a descriptor not open for writing.
-/// An empty file cannot have one at all.
+/// An empty file cannot have one at all where a view stops at its file's end (Windows, Linux);
+/// where views pass it (`vm::shared_view_may_pass_end_of_file`) they follow the empty file as it
+/// grows.
 #[test]
-fn a_shared_backing_needs_write_access_and_a_non_empty_file() {
+fn a_shared_backing_needs_write_access_and_a_non_empty_file_where_views_stop_at_its_end() {
     let page = omni_platform_page();
     let file = TempFile::new("read-only.bin", page, page);
     let read_only = std::fs::File::open(file.path()).expect("open read-only");
@@ -1787,8 +1874,13 @@ fn a_shared_backing_needs_write_access_and_a_non_empty_file() {
     );
 
     let empty = TempFile::new("empty.bin", 0, page);
-    let error = Backing::share(read_write(&empty), "/data/empty.bin").expect_err("must refuse");
-    assert!(error.to_string().contains("0 bytes long"), "{error}");
+    let shared = Backing::share(read_write(&empty), "/data/empty.bin");
+    if omni_platform::vm::shared_view_may_pass_end_of_file() {
+        assert!(shared.expect("an empty file whose views pass its end").is_empty());
+    } else {
+        let error = shared.expect_err("must refuse");
+        assert!(error.to_string().contains("0 bytes long"), "{error}");
+    }
 }
 
 fn omni_platform_page() -> usize {

@@ -153,6 +153,10 @@ const fn madd(rd: u32, rn: u32, rm: u32, ra: u32) -> u32 {
 const fn ldr_w(rt: u32, rn: u32, byte_offset: u32) -> u32 {
     0xB940_0000 | ((byte_offset / 4) << 10) | (rn << 5) | rt
 }
+/// `MSR TPIDR_EL0, Xt`.
+const fn msr_tpidr_el0(rt: u32) -> u32 {
+    0xD51B_D040 | rt
+}
 
 /// **What `enable_cycle_counting` costs.** On, every block subtracts its length from the budget
 /// on the stack and each link compares it; off, each link compares the halt word instead. Short
@@ -264,6 +268,11 @@ fn the_cost_of_common_constructs() {
         ("LDXR+ADD+STXR (no retry) x4", reps(&[a64::ldxr(5, 1), a64::add_imm(5, 5, 1), a64::stxr(6, 5, 1)])),
         ("LDAXR+ADD+STLXR x4", reps(&[ldaxr(5, 1), a64::add_imm(5, 5, 1), stlxr(6, 5, 1)])),
         ("CBNZ (not taken, own block) x4", reps(&[cbnz(31, 1)])),
+        // The thread pointer: a load through its slot (bionic reads its TLS block this way), and
+        // a write to it.
+        ("MRS TPIDR_EL0 x4", reps(&[a64::mrs_tpidr_el0(4)])),
+        ("MRS TPIDR_EL0+LDR (TLS slot) x4", reps(&[a64::mrs_tpidr_el0(7), a64::ldr_imm(8, 7, 0x28)])),
+        ("MSR TPIDR_EL0 x4", reps(&[msr_tpidr_el0(2)])),
     ];
     for (name, body, ) in &cases {
         let code = looped(|_| body.clone(), &[]);

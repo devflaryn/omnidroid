@@ -10,6 +10,10 @@
 //! * `OMNI_R_LINK` with `OMNI_R_LINK_ID`: the link with its id, opened on the instance's display
 //!   once `OMNI_R_LINK_READY` or `OMNI_R_SIGNED_IN` is logged, again until `OMNI_R_LINK_TAKEN` is.
 //!
+//! A restart of the instance asks the plugins again ([`Extras::remake`]): the cookie store is gone
+//! once the first start has taken its copy, so the restarted app signs in again from a new one, and
+//! follows the link again.
+//!
 //! The device's language (`OMNI_R_LOCALE`) is not applied: a pool device has booted already.
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -58,6 +62,8 @@ pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
         (Some(link), Some(id)) => Some(link.replace("{id}", &id)),
         _ => None,
     };
+    // The same APK and options again, for a restart: the plugin's session-start answers anew.
+    let (apk, options) = (apk.to_path_buf(), options.to_vec());
     Ok(Extras {
         cookie_store,
         link,
@@ -65,6 +71,7 @@ pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
         signed_in: var("OMNI_R_SIGNED_IN"),
         link_taken: var("OMNI_R_LINK_TAKEN"),
         said: session.said,
+        remake: Some(Arc::new(move || extras(&apk, &options))),
     })
 }
 

@@ -494,6 +494,12 @@ pub(super) fn write(file: &File, buf: &[u8], append: bool) -> std::io::Result<us
     Ok(written)
 }
 
+/// `FlushFileBuffers` (`std`'s `sync_data` here) at either level: the one flush this crate binds.
+/// `NtFlushBuffersFileEx(FLUSH_FLAGS_NO_SYNC)` would be the lighter `Os`, and is not bound.
+pub(super) fn sync_data(file: &File, _level: super::SyncLevel) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 /// A descriptor on `file` is being closed: if the file has a logical end, try the host's
 /// shortening, which succeeds once no section of the file is left.
 pub(super) fn settle(file: &File) {

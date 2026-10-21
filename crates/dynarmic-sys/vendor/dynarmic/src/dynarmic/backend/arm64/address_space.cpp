@@ -4,6 +4,8 @@
  */
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdio>
 #include <limits>
 
@@ -33,6 +35,8 @@ AddressSpace::AddressSpace(size_t code_cache_size)
         , code(mem.ptr(), mem.ptr())
         , fastmem_manager(exception_handler) {
     ASSERT_MSG(code_cache_size <= 128 * 1024 * 1024, "code_cache_size > 128 MiB not currently supported");
+    OdUseLoadFactor(block_entries);  // patch 0109
+    OdUseLoadFactor(link_heads);
 
     exception_handler.Register(mem, code_cache_size);
     exception_handler.SetFastmemCallback([this](u64 host_pc) {
@@ -75,6 +79,11 @@ CodePtr AddressSpace::ReverseGetEntryPoint(CodePtr host_pc) {
 }
 
 CodePtr AddressSpace::GetOrEmit(IR::LocationDescriptor descriptor) {
+    // Omnidroid patch 0107: never, by the argument at `A64AddressSpace::OdGiveBackTables`; counted
+    // for `tests/parked_tables.rs`.
+    if (od_tables_given_back.load(std::memory_order_relaxed)) {
+        lookups_after_give_back.fetch_add(1, std::memory_order_relaxed);
+    }
     if (CodePtr block_entry = Get(descriptor)) {
         return block_entry;
     }
@@ -104,6 +113,17 @@ void AddressSpace::InvalidateBasicBlocks(const tsl::robin_set<IR::LocationDescri
 }
 
 void AddressSpace::ClearCache() {
+    OdDropTables();
+    od_tables_given_back.store(false, std::memory_order_relaxed);  // patch 0107
+    // Omnidroid patch 0102: and so are the pages the blocks were in.
+    const std::size_t used = static_cast<std::size_t>(code.offset());
+    code.set_offset(prelude_info.end_of_prelude);
+    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
+    od_in_use.store(0, std::memory_order_relaxed);
+    cache_clears++;
+}
+
+void AddressSpace::OdDropTables() {
     // Omnidroid patch 0010: given back rather than cleared (`clear()` keeps a robin_map's buckets
     // and a vector's capacity), so a cleared cache holds no memory for the blocks it no longer has.
     block_entries = {};
@@ -111,12 +131,12 @@ void AddressSpace::ClearCache() {
     decltype(fastmem_records){}.swap(fastmem_records);
     decltype(link_records){}.swap(link_records);
     link_heads = {};
-    // Omnidroid patch 0102: and so are the pages the blocks were in.
-    const std::size_t used = static_cast<std::size_t>(code.offset());
-    code.set_offset(prelude_info.end_of_prelude);
-    OdDiscard(static_cast<std::size_t>(prelude_info.end_of_prelude), used);
-    od_in_use.store(0, std::memory_order_relaxed);
-    cache_clears++;
+    OdUseLoadFactor(block_entries);  // patch 0109
+    OdUseLoadFactor(link_heads);
+}
+
+std::size_t AddressSpace::OdBaseTableBytes() const {
+    return OdBucketBytes(block_entries) + OdBucketBytes(link_heads) + OdVectorBytes(block_records) + OdVectorBytes(fastmem_records) + OdVectorBytes(link_records);
 }
 
 // Omnidroid patch 0102: the whole pages of `[from, to)` (offsets into the cache) given back. Their
@@ -242,7 +262,20 @@ EmittedBlockInfo AddressSpace::Emit(IR::Block block) {
 
     RegisterNewBasicBlock(block, block_info);
 
+    // Omnidroid patch 0106: the census's emission count (`OMNI_JIT_CENSUS`), when asked for.
+    if (od_emit_hook) {
+        od_emit_hook(od_emit_hook_ctx, block.Location().Value(), static_cast<u32>(block_info.size));
+    }
+
     return block_info;
+}
+
+// Omnidroid patch 0106: each live block -- one `block_entries` holds -- with its record's size.
+void AddressSpace::OdForEachBlock(OdBlockVisitor fn, void* ctx) const {
+    for (const auto& [location, entry_point] : block_entries) {
+        const BlockRecord* record = FindBlockRecord(entry_point);
+        fn(ctx, location.Value(), record && record->entry_point == entry_point ? record->size : 0);
+    }
 }
 
 // Omnidroid patch 0010: keep what is read after emission, and only that. See `BlockRecord`.
@@ -500,41 +533,127 @@ void AddressSpace::LinkBlockLink(const CodePtr entry_point, const CodePtr target
             c.NOP();
         }
         break;
-    case BlockRelocationType::MoveToScratch1:
-        if (target_ptr) {
-            c.ADRL(Xscratch1, (void*)target_ptr);
-        } else {
-            c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
-        }
+    case BlockRelocationType::MoveToScratch1: {
+        // Omnidroid patch 0114: the return-stack slot `PushRSB` loads -- data after the block's
+        // deferred code, never executed -- in one aligned 64-bit store, which a load sees whole: the
+        // old value or the new. No instruction changes, so nothing to make visible to instruction
+        // fetch. Unlinked, it holds the dispatcher, as the pin's `ADRL` did.
+        auto* const slot = reinterpret_cast<u64*>(entry_point + ptr_offset);
+        ASSERT(reinterpret_cast<std::uintptr_t>(slot) % 8 == 0);
+        const u64 value = target_ptr ? mcl::bit_cast<u64>(target_ptr) : mcl::bit_cast<u64>(prelude_info.return_to_dispatcher);
+        std::atomic_ref<u64>{*slot}.store(value, std::memory_order_release);
         break;
+    }
     default:
         ASSERT_FALSE("Invalid BlockRelocationType");
     }
 }
 
+namespace {
+
+// Omnidroid patch 0114: the branch words a relink rewrote, made visible to instruction fetch a
+// batch at a time. Each word is maintained by its own address: `DC CVAU` and `IC IVAU` act on the
+// whole cache line holding the address, and an aligned 4-byte word never straddles a line, so no
+// line size is read or assumed -- `CTR_EL0` traps at EL0 on macOS (oaknut's `invalidate` reads it
+// on other systems). The architecture's order: every clean, `DSB ISH` (the cleans reach the point of
+// unification before any invalidate can let a refetch in), every invalidate, `DSB ISH`, then `ISB`
+// for this thread's own pipeline -- the thread that runs the cache's code next. Batched where it was
+// measured, macOS on Apple silicon (M4, 2026-10-20, a probe of scattered words with the W^X toggle:
+// one link to a target ~150 ns either way, the fences dominating; 4 links 47 against 140 ns a link,
+// 32 links 10.5 against 132, against `sys_icache_invalidate` of 325-byte blocks); elsewhere
+// oaknut's `invalidate` (the `CTR_EL0` loop on Linux, `FlushInstructionCache` on Windows) of each
+// word, as the tree maintained whole blocks.
+class OdLinkWords {
+public:
+    OdLinkWords(oaknut::CodeBlock& mem, u64& maintained)
+            : mem{mem}, maintained{maintained} {}
+
+    void Add(CodePtr word) {
+        if (count == words.size()) {
+            Sync();
+        }
+        words[count++] = word;
+    }
+
+    void Sync() {
+        if (count == 0) {
+            return;
+        }
+#if defined(__APPLE__) && defined(__aarch64__)
+        for (std::size_t i = 0; i < count; i++) {
+            asm volatile("dc cvau, %0" : : "r"(words[i]) : "memory");
+        }
+        asm volatile("dsb ish" : : : "memory");
+        for (std::size_t i = 0; i < count; i++) {
+            asm volatile("ic ivau, %0" : : "r"(words[i]) : "memory");
+        }
+        asm volatile("dsb ish\n\tisb" : : : "memory");
+#else
+        for (std::size_t i = 0; i < count; i++) {
+            mem.invalidate(reinterpret_cast<u32*>(words[i]), sizeof(u32));
+        }
+#endif
+        maintained += count * sizeof(u32);
+        count = 0;
+    }
+
+private:
+    [[maybe_unused]] oaknut::CodeBlock& mem;  // the fallback's (not the batched path's)
+    u64& maintained;
+    std::array<CodePtr, 32> words;
+    std::size_t count = 0;
+};
+
+}  // namespace
+
 void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
-    // Omnidroid patch 0010: every block that links to `target_descriptor` -- the pin's
-    // `block_references[target_descriptor]` -- relinks its links to it and is invalidated once.
+    // Omnidroid patch 0010: every link to `target_descriptor` -- the pin's
+    // `block_references[target_descriptor]` -- relinked.
+    // Omnidroid patch 0114: and only the words rewritten are maintained -- each `B`/`NOP` word, not
+    // the linking block whole (`sys_icache_invalidate` of every block, a line at a time); a slot is
+    // data and needs none. Nothing else in a block changes when it is linked or unlinked.
     const auto head = link_heads.find(target_descriptor);
     if (head == link_heads.end()) {
         return;
     }
-    u32 index = head->second;
-    while (index != no_link) {
-        const u32 block_index = link_records[index].block;
-        const BlockRecord& block = block_records[block_index];
-        do {
-            const LinkRecord& link = link_records[index];
-            ASSERT(link.target == target_descriptor);
-            LinkBlockLink(block.entry_point, target_ptr, BlockRelocation{link.offset, link.type});
-            index = link.next;
-        } while (index != no_link && link_records[index].block == block_index);
-
-        mem.invalidate(reinterpret_cast<u32*>(block.entry_point), block.size);
+    OdLinkWords words{mem, od_relink_maintained};
+    for (u32 index = head->second; index != no_link;) {
+        const LinkRecord& link = link_records[index];
+        ASSERT(link.target == target_descriptor);
+        const CodePtr entry_point = block_records[link.block].entry_point;
+        LinkBlockLink(entry_point, target_ptr, BlockRelocation{link.offset, link.type});
+        if (link.type == BlockRelocationType::Branch) {
+            words.Add(entry_point + link.offset);
+        }
+        index = link.next;
     }
+    words.Sync();
+}
+
+// Omnidroid patch 0114: see `Jit::OdBlockLinks`. A test hook: the walk over every link record is
+// linear.
+CodePtr AddressSpace::OdBlockLinks(IR::LocationDescriptor location, u32& host_bytes, OdLinkVisitor fn, void* ctx) const {
+    host_bytes = 0;
+    const auto iter = block_entries.find(location);
+    if (iter == block_entries.end()) {
+        return nullptr;
+    }
+    const BlockRecord* record = FindBlockRecord(iter->second);
+    ASSERT(record && record->entry_point == iter->second);
+    const auto block_index = static_cast<u32>(record - block_records.data());
+    host_bytes = record->size;
+    for (const LinkRecord& link : link_records) {
+        if (link.block == block_index) {
+            fn(ctx, link.offset, link.type == BlockRelocationType::Branch ? 0 : 1);
+        }
+    }
+    return record->entry_point;
 }
 
 FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+    if (od_tables_given_back.load(std::memory_order_relaxed)) {  // patch 0107: as in `GetOrEmit`
+        lookups_after_give_back.fetch_add(1, std::memory_order_relaxed);
+    }
     {
         const auto host_ptr = mcl::bit_cast<CodePtr>(host_pc);
 

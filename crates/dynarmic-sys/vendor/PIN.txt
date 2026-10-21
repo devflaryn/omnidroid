@@ -90,6 +90,15 @@ dynarmic/
                and ../patches/0103-arm64-a-register-allocator-without-searches.patch
                and ../patches/0104-arm64-a-parked-thread-s-code-given-back.patch
                and ../patches/0105-arm64-top-byte-ignore-left-to-the-host.patch
+               and ../patches/0106-arm64-a-census-of-the-translated-blocks.patch
+               and ../patches/0107-arm64-a-parked-thread-s-tables-given-back.patch
+               and ../patches/0108-arm64-a-parked-thread-given-back-once.patch
+               and ../patches/0109-arm64-the-block-map-and-link-heads-at-three-quarters.patch
+               and ../patches/0110-arm64-get-set-elimination-precise-at-memory-aborts.patch
+               and ../patches/0111-arm64-assert-no-more-uses-only-with-verification.patch
+               and ../patches/0112-arm64-a-thread-s-own-values-read-from-its-state.patch
+               and ../patches/0113-arm64-translation-through-the-translating-thread-and-a-failed-mapping.patch
+               and ../patches/0114-arm64-a-link-rewrites-one-word.patch
                (see ../patches/README.md, "Applied")
     removed    .git/, .github/, docs/  -- build inputs only
 

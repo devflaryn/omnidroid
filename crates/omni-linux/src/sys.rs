@@ -958,9 +958,12 @@ fn send_signal(p: &Process, t: &mut Task, target: i64, sig: u64) -> SysResult {
     let tid = if own { t.tid } else { i32::try_from(target).map_err(|_| ESRCH)? };
     if !own && !p.tids().contains(&tid) {
         // An app launched in a host process of its own (`crate::zygote`), by its pid or its
-        // process group's (`kill(-pid)`): ActivityManager ending it.
-        if crate::zygote::signal(tid.abs(), sig as i32).is_some() {
-            return if (0..=64).contains(&sig) { Ok(0) } else { Err(EINVAL) };
+        // process group's (`kill(-pid)`): ActivityManager ending it. The number is checked before
+        // the app is touched -- `sig as i32` of 9 + (1 << 32) was 9, which ended it before the
+        // EINVAL -- and an invalid one goes as -1, no signal: whether the app is there alone.
+        let app_sig = i32::try_from(sig).ok().filter(|s| (0..=64).contains(s));
+        if crate::zygote::signal(tid.abs(), app_sig.unwrap_or(-1)).is_some() {
+            return if app_sig.is_some() { Ok(0) } else { Err(EINVAL) };
         }
         // A thread of a process this one traces: a debugger probes each with signal 0 and may stop
         // or kill it (`crate::ptrace`; the self-debugging watchdog checks its tracee this way).

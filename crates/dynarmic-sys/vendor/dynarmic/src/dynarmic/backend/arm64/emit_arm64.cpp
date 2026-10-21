@@ -200,7 +200,7 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
 
     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
     RegAlloc reg_alloc{code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()}, std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()}};
-    EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
+    EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}, {}};
 
     ebi.entry_point = code.xptr<CodePtr>();
 
@@ -263,6 +263,20 @@ EmittedBlockInfo EmitArm64(oaknut::CodeGenerator& code, IR::Block block, const E
     }
     code.BRK(0);
 
+    // Omnidroid patch 0114: the return-stack slots, after everything that executes, 8-aligned (an
+    // aligned 64-bit load and store are single-copy atomic). Each starts at 0; `AddressSpace::Link`
+    // fills it -- the predicted block, or the dispatcher -- before the block is first entered.
+    if (!ctx.rsb_slots.empty()) {
+        while (code.xptr<std::uintptr_t>() % 8 != 0) {
+            code.BRK(0);
+        }
+        for (EmitContext::RSBSlot& slot : ctx.rsb_slots) {
+            code.l(slot.label);
+            ebi.block_relocations[slot.target].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ebi.entry_point, BlockRelocationType::MoveToScratch1});
+            code.dx(0);
+        }
+    }
+
     ebi.size = code.xptr<CodePtr>() - ebi.entry_point;
     return ebi;
 }
@@ -273,14 +287,19 @@ void EmitRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, LinkTarget li
 }
 
 void EmitBlockLinkRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::LocationDescriptor& descriptor, BlockRelocationType type) {
-    ctx.ebi.block_relocations[descriptor].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ctx.ebi.entry_point, type});
     switch (type) {
     case BlockRelocationType::Branch:
+        ctx.ebi.block_relocations[descriptor].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ctx.ebi.entry_point, type});
         code.NOP();
         break;
     case BlockRelocationType::MoveToScratch1:
-        code.BRK(0);
-        code.NOP();
+        // Omnidroid patch 0114: one load from a data slot placed after the block's deferred code
+        // (`EmitArm64`), where the relocation points; linking rewrites the slot, never this word.
+        // The pin's `ADRL` was two instruction words rewritten one at a time: harmless while only
+        // the cache's own thread runs its code, but a thread running the block while another
+        // relinks it could execute an old `ADRP` with a new `ADD`.
+        ctx.rsb_slots.emplace_back(EmitContext::RSBSlot{descriptor, {}});
+        code.LDR(Xscratch1, ctx.rsb_slots.back().label);
         break;
     default:
         UNREACHABLE();

@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <mcl/assert.hpp>
 #include <mcl/bit_cast.hpp>
 #include <mcl/stdint.hpp>
 #include <mcl/type_traits/function_info.hpp>
@@ -52,6 +53,18 @@ DevirtualizedCall Devirtualize(mcl::class_type<decltype(mfp)>* this_) {
 #else
     return DevirtualizeDefault<mfp>(this_);
 #endif
+}
+
+/// Omnidroid patch 0112: the function `mfp` resolves to for `template_this`, for a call whose `this`
+/// is read at run time from JitState (`od_callbacks`) -- the running thread's own callbacks object,
+/// which must be of the same class (the address is resolved once, from `template_this`). The `this`
+/// adjustment must be zero, since what JitState holds is the unadjusted pointer (x64's
+/// `DevirtualizeFromJitState`, patch 0022).
+template<auto mfp>
+u64 DevirtualizeFromJitState(mcl::class_type<decltype(mfp)>* template_this) {
+    const DevirtualizedCall resolved = Devirtualize<mfp>(template_this);
+    ASSERT(resolved.this_ptr == mcl::bit_cast<u64>(template_this));
+    return resolved.fn_ptr;
 }
 
 }  // namespace Dynarmic::Backend::Arm64

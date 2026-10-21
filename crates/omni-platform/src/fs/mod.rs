@@ -159,6 +159,31 @@ pub fn compress_dir(dir: &std::path::Path) -> bool {
     }
 }
 
+/// How far [`sync_data`] pushes a file's written data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncLevel {
+    /// To the storage device, as the host's own `fsync` does: macOS `fsync(2)` (the drive may
+    /// still hold it in its cache), Linux `fdatasync(2)`, Windows `FlushFileBuffers`.
+    Os,
+    /// Through the device's cache too, where the host has a call for it: macOS `F_FULLFSYNC`
+    /// (`std`'s `sync_data` there), else as [`Os`](SyncLevel::Os).
+    Full,
+}
+
+/// A guest `fsync`/`fdatasync`: `file`'s written data pushed as far as `level` says.
+///
+/// MEASURED (M4, APFS, 4 KiB written then synced, 2026-10-20): `fsync` 23 us a call, `F_FULLFSYNC`
+/// 3.9 ms; four threads at once, 0.06 ms against 10.8 ms a call -- ~29,800 against ~335 syncs a
+/// second for the whole Mac, `F_FULLFSYNC` being a flush of the device. Windows has one call for
+/// both: `NtFlushBuffersFileEx`'s no-sync flag is not bound here.
+///
+/// # Errors
+///
+/// The host's error, as the host reported it.
+pub fn sync_data(file: &std::fs::File, level: SyncLevel) -> std::io::Result<()> {
+    backend::sync_data(file, level)
+}
+
 /// The host path an open file is at now (after any rename), for another host process to open the
 /// same file: Windows `GetFinalPathNameByHandleW`, Linux `/proc/self/fd`, macOS `F_GETPATH`.
 ///
@@ -3421,6 +3446,21 @@ mod tests {
 
     fn read_flags() -> OpenFlags {
         OpenFlags { read: true, ..OpenFlags::default() }
+    }
+
+    /// `sync_data` at either level syncs a written file through a second handle, as the guest's
+    /// `fsync` does, and the bytes are there.
+    #[test]
+    fn sync_data_syncs_at_either_level() {
+        let scratch = Scratch::new("sync");
+        let path = scratch.0.join("f");
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).expect("a file");
+        for level in [SyncLevel::Os, SyncLevel::Full, SyncLevel::Os] {
+            file.write_all(b"synced").expect("written");
+            sync_data(&file.try_clone().expect("a second handle"), level).expect("synced");
+        }
+        drop(file);
+        assert_eq!(std::fs::read(&path).expect("read back"), b"syncedsyncedsynced");
     }
 
     /// **`set_times` stamps the file's times**, read back from the host's own metadata; a

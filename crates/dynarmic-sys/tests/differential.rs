@@ -1,6 +1,7 @@
 //! **What the guest sees, as a differential** (measurement, `#[ignore]`d): every register and
 //! the PC after every block run over real code, hashed, to compare two configurations of the
-//! translator run in separate processes (e.g. OMNI_JIT_GETSET_WIDTH=1 vs 0). One hash per library.
+//! translator run in separate processes (e.g. OMNI_JIT_GETSET_WIDTH=1 vs 0, OD_PRECISE_GETSET=1
+//! vs 0). One hash per library.
 //!   OMNI_SYSROOT=... OD_EXTRA_LIB=/tmp/libroblox.so OD_TEST_SHARED_CACHE=1 \
 //!   cargo test -p dynarmic-sys --release --test differential -- --ignored --nocapture
 mod harness;
@@ -70,7 +71,8 @@ fn pass(elf: &[u8], starts: &[u64], text: (u64, u64, u64)) -> (u64, usize) {
             check_halt_on_memory_access: true,
             fastmem_exclusive: true,
             optimizations: optimization::INTERRUPTIBLE | optimization::UNSAFE_IGNORE_GLOBAL_MONITOR,
-            code_cache_size: 256 << 20,
+            // arm64's cache is at most 128 MiB (a branch's reach).
+            code_cache_size: if cfg!(target_arch = "aarch64") { 128 << 20 } else { 256 << 20 },
             ..VmOptions::default()
         },
     );
@@ -115,6 +117,13 @@ fn pass(elf: &[u8], starts: &[u64], text: (u64, u64, u64)) -> (u64, usize) {
 #[test]
 #[ignore = "measurement"]
 fn guest_visible_differential() {
+    // `OD_PRECISE_GETSET=0|1`: patch 0037's switch (both backends since 0110), for a differential
+    // of the precise pass itself.
+    if let Ok(v) = std::env::var("OD_PRECISE_GETSET") {
+        // SAFETY: a process-wide switch, set before anything is translated.
+        let kept = unsafe { od_set_precise_get_set(u32::from(v == "1")) };
+        println!("precise GetSetElimination {kept}");
+    }
     for lib in ["/apex/com.android.runtime/lib64/bionic/libc.so", "/apex/com.android.art/lib64/libart.so", "/system/lib64/libhwui.so", "/system/lib64/libandroid_runtime.so"] {
         let Some(path) = sysroot_file(lib) else {
             println!("{lib}: no sysroot");

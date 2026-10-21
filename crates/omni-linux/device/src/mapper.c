@@ -21,8 +21,9 @@
 //      6  usage, low 32 bits                13  offset of the pixels in the region (4096)
 //
 // Metadata page (offset 0 of the region; the same memory in every process that maps the buffer,
-// so a set in one process is seen by all). The allocator zero-fills it and writes only `name`;
-// every other field reads as its default while zero, and `magic` is written on the first set.
+// so a set in one process is seen by all). The allocator zero-fills it and writes only `name`
+// (and the requestor, a host field below); every other field reads as its default while zero,
+// and `magic` is written on the first set.
 //      0  u32  magic 0x4d474d4f ('OMGM') once any field was set, else 0
 //      4  i32  dataspace                    (default 0, Dataspace::UNKNOWN)
 //      8  i32  blend mode                   (default 0, BlendMode::INVALID)
@@ -40,8 +41,9 @@
 //   1544  reserved (zero) .. 2047
 //   2048  SMPTE2094_40: u32 present, u32 length, then up to 1024 bytes (2048 .. 3079)
 //   3080  reserved (zero) .. 4095; of it the host uses 3200 .. 3415 (a share image's description
-//         and its region's stale/taken marks, `gpu::share`) and 4080 .. 4095 (the pending and
-//         content generations)
+//         and its region's stale/taken marks, `gpu::share`), 3416 .. 3423 (the requestor's pid
+//         and uid, `hal::gralloc`'s OWNER_AT) and 4080 .. 4095 (the pending and content
+//         generations)
 // The Rust side writes `name` at 64 and those host fields; this file reads none of them.
 // ---------------------------------------------------------------------------------------------
 

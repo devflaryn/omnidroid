@@ -21,8 +21,13 @@ pub const LINK_TRIES: u32 = 4;
 /// How long a launch's link waits for its app to be ready, at most.
 pub const LINK_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// What makes a launch's [`Extras`] again for a restart: the plugin asked anew. A cookie store goes
+/// once the instance's start has taken its copy (it holds an account's session), so a restart needs
+/// a new one.
+pub type Remake = Arc<dyn Fn() -> Result<Extras, String> + Send + Sync>;
+
 /// What a launch does beyond the install and the start; nothing by default.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Extras {
     /// A cookie store (a host file) put in the app's WebView data before its first start. It holds
     /// an account's session: removed once every instance of the launch has taken its copy.
@@ -37,6 +42,24 @@ pub struct Extras {
     pub link_taken: Option<String>,
     /// What the plugins said of the launch, for the pool's log.
     pub said: Vec<String>,
+    /// Makes these extras again for a restart ([`Remake`]); without it a restart does them again
+    /// less the cookie store.
+    pub remake: Option<Remake>,
+}
+
+/// By hand: a [`Remake`] is a closure, shown as there or not.
+impl std::fmt::Debug for Extras {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Extras")
+            .field("cookie_store", &self.cookie_store)
+            .field("link", &self.link)
+            .field("link_ready", &self.link_ready)
+            .field("signed_in", &self.signed_in)
+            .field("link_taken", &self.link_taken)
+            .field("said", &self.said)
+            .field("remake", &self.remake.is_some())
+            .finish()
+    }
 }
 
 impl Extras {
@@ -44,6 +67,13 @@ impl Extras {
     #[must_use]
     pub fn any(&self) -> bool {
         self.cookie_store.is_some() || self.link.is_some()
+    }
+
+    /// What an instance keeps of these for a restart: all but the cookie store -- an account's
+    /// session, removed once the launch's starts took their copies, never held beyond that.
+    #[must_use]
+    pub fn kept(&self) -> Self {
+        Self { cookie_store: None, ..self.clone() }
     }
 }
 

@@ -70,8 +70,10 @@
 //!    forms its `&mut` for the body of that callback and never stores it.
 //! 2. **Unwinding.** Every callback body runs inside [`catch_unwind`]. A panic is recorded, the jit
 //!    is halted, and the panic is re-raised by `run` *after* the generated frames are gone.
-//! 3. **Pinned pointers.** `TPIDR_EL0` and `TPIDRRO_EL0` are inlined into generated code, so they
-//!    live in `Box`es owned by the context and are never moved.
+//! 3. **Pinned pointers.** Generated code reads and writes `TPIDR_EL0` and `TPIDRRO_EL0` through
+//!    pointers to them -- kept in the jit's state (arm64, vendored patch 0112; x64's shared cache,
+//!    0022) or inlined (an x64 cache of its own) -- so they live in `Box`es owned by the context
+//!    and are never moved.
 //!
 //! # Why the run loop is sliced
 //!
@@ -89,7 +91,8 @@ use std::sync::Arc;
 use dynarmic_sys::{
     optimization, od_code_cache_clear, od_code_cache_evict_to, od_code_cache_free, od_code_cache_invalidate_range, od_code_cache_new,
     od_code_cache_guest_pcs_of, od_code_cache_stats_of, od_code_cache_tables_of, od_jit_clear_halt,
-    od_jit_clear_cache, od_jit_code_bytes, od_jit_discard_parked, od_jit_effective_config,
+    od_jit_block_census, od_jit_census_join, od_jit_clear_cache, od_jit_code_bytes, od_jit_discard_parked, od_jit_effective_config,
+    od_jit_table_bytes,
     od_jit_free, od_jit_get_pc, od_jit_get_pstate, od_jit_get_reg, od_jit_get_sp, od_jit_get_vec,
     od_jit_halt, od_jit_invalidate_range, od_jit_new, od_jit_new_shared, od_jit_reset_stats, od_jit_run,
     od_jit_set_pc, od_jit_set_pstate, od_jit_set_reg, od_jit_set_sp, od_jit_set_vec,
@@ -114,6 +117,7 @@ use crate::thunk::{ThunkContext, ThunkFn, ThunkRegs};
 use crate::tls::{GuestTls, TlsArena};
 
 mod callbacks;
+pub mod census;
 mod inline_table;
 
 pub use callbacks::HINTS_OBSERVED;
@@ -253,7 +257,7 @@ pub struct DynarmicOptions {
     ///
     /// It was not free, though: upstream skips `GetSetElimination` entirely when this is set (the
     /// cost is in the Task 3 report). Patch 0037 runs a precise form of the pass instead, while
-    /// [`set_precise_get_set`] is on (the default on x64).
+    /// [`set_precise_get_set`] is on (the default; on arm64 too since patch 0110).
     pub check_halt_on_memory_access: bool,
     /// Whether to check, **per run slice**, that guest memory never went through a host callback
     /// unless the slice ended in a memory fault.
@@ -390,9 +394,9 @@ pub fn set_live_fp_optimizations(mask: u32) -> u32 {
 
 /// **Whether `GetSetElimination` runs, in its precise form, where
 /// [`check_halt_on_memory_access`](DynarmicOptions::check_halt_on_memory_access) is set** (patch
-/// 0037, x64): process-wide, for every block translated from now on; returns what is in force
-/// (`false` on arm64, where it does nothing). Blocks already translated keep what they were
-/// translated with -- [`DynarmicBackend::clear_code_cache`] has them translated again.
+/// 0037; both backends since 0110): process-wide, for every block translated from now on; returns
+/// what is in force. Blocks already translated keep what they were translated with --
+/// [`DynarmicBackend::clear_code_cache`] has them translated again.
 ///
 /// Upstream skips the pass under the memory-abort check, so every guest register read is a load
 /// from `JitState` and every write a store, because the pass erases a write that a later write to
@@ -596,7 +600,7 @@ pub fn scalar_fp_in_xmm() -> bool {
     unsafe { dynarmic_sys::od_scalar_fp_in_xmm() != 0 }
 }
 
-/// What [`set_precise_get_set`] last set (`false` on arm64).
+/// What [`set_precise_get_set`] last set.
 #[must_use]
 pub fn precise_get_set() -> bool {
     // SAFETY: loads one process-wide atomic.
@@ -667,6 +671,7 @@ impl DynarmicOptions {
     /// * `OMNI_JIT_FASTDISP=0|1` -- [`set_fast_dispatch_inline`] (process-wide);
     /// * `OMNI_JIT_TABLE_SHRINK=0|1` -- [`set_shrink_tables`] (process-wide);
     /// * `OMNI_JIT_RETRANSLATION=1` -- [`crate::stats::track_retranslation`];
+    /// * `OMNI_JIT_CENSUS=1` -- [`census::enable`] (process-wide; arm64);
     /// * `OMNI_JIT_CODE_CACHE_MB=<MiB>` -- [`code_cache_size`](Self::code_cache_size), per thread
     ///   where each thread has its own cache (arm64).
     ///
@@ -791,6 +796,13 @@ impl DynarmicOptions {
             };
             let kept = set_fastmem_mask_by_and(on);
             say(&format!("Top Byte Ignore's mask as one `and` {} (OMNI_JIT_TBI_AND)", if kept { "on" } else { "off" }));
+        }
+        if std::env::var("OMNI_JIT_CENSUS").as_deref().map(str::trim) == Ok("1") {
+            let on = census::enable();
+            say(&format!(
+                "the duplication census {} (OMNI_JIT_CENSUS): each thread's live blocks and every emission counted by location",
+                if on { "on" } else { "not on this host's backend (one shared cache)" }
+            ));
         }
         if std::env::var_os("OMNI_JIT_RETRANSLATION").is_some() {
             crate::stats::track_retranslation(true);
@@ -1136,6 +1148,9 @@ struct Shared {
     /// to every core of the inner-shareable domain; with a shared cache one invalidation of it is
     /// every context's already. See `callbacks::cb_icache_op`.
     peers: Arc<Peers>,
+    /// The duplication census's counts for this space (`OMNI_JIT_CENSUS=1`, arm64 per-thread
+    /// caches): every context's jit joins it. Boxed, so the address its jits hold stays put.
+    census: Option<Box<census::Group>>,
     /// Processor ids handed back by dropped contexts.
     ///
     /// Recycled rather than monotonic, because a `processor_id` indexes into the shared exclusive
@@ -1326,6 +1341,7 @@ impl DynarmicBackend {
                 _pager: pager,
                 owns_guest_paging,
                 peers: Arc::new(Peers::default()),
+                census: (census::on() && !has_code_cache).then(Box::default),
                 free_processors: parking_lot::Mutex::new(Vec::new()),
                 next_processor: AtomicU32::new(0),
                 ids_released_early: AtomicU64::new(0),
@@ -1507,9 +1523,9 @@ impl DynarmicBackend {
 
     /// **Give back the translations of threads parked in a system call** for at least `parked`
     /// (arm64, each thread's own cache; vendored patch 0104): each such thread's cache is cleared
-    /// when it next runs, its code pages given back now. What an idle thread -- a binder looper
-    /// waiting for work, a daemon in its event loop -- otherwise holds for good. The bytes given
-    /// back (0 without per-thread caches).
+    /// when it next runs, its code pages given back now -- and its per-block tables (patch 0107).
+    /// What an idle thread -- a binder looper waiting for work, a daemon in its event loop --
+    /// otherwise holds for good. The code bytes given back (0 without per-thread caches).
     pub fn discard_parked(&self, parked: std::time::Duration) -> u64 {
         if self.shared.code_cache.is_some() || !cfg!(target_arch = "aarch64") {
             return 0;
@@ -1523,6 +1539,90 @@ impl DynarmicBackend {
             // SAFETY: a peer is live while it is in the list; the call only reads atomics and takes
             // the jit's own invalidation lock.
             .map(|&jit| unsafe { od_jit_discard_parked(jit as *mut core::ffi::c_void, ns) })
+            .sum()
+    }
+
+    /// **Start a look of the duplication census** (`OMNI_JIT_CENSUS=1`; arm64, vendored patch
+    /// 0106): every context's jit is asked for its live blocks -- one parked in a system call is
+    /// read at once, a running one reads its own at the end of its run slice. False without a
+    /// census. [`census_end`](Self::census_end) takes what came in.
+    pub fn census_begin(&self) -> bool {
+        let Some(group) = self.shared.census.as_deref() else { return false };
+        group.begin();
+        for &jit in self.shared.peers.0.lock().iter() {
+            // SAFETY: a peer is live while it is in the list; the call reads an atomic or, for a
+            // parked thread, takes the jit's own invalidation lock.
+            unsafe { od_jit_block_census(jit as *mut c_void) };
+        }
+        true
+    }
+
+    /// End a look of the census: the live blocks the threads sent since
+    /// [`census_begin`](Self::census_begin) (a thread that did not run since and is not parked is
+    /// not in it), and what the space has emitted since its start. `None` without a census.
+    #[must_use]
+    pub fn census_end(&self) -> Option<census::Census> {
+        self.shared.census.as_deref().map(census::Group::end)
+    }
+
+    /// Each context's own cache (arm64, vendored patch 0102): its jit's address as a key, the code
+    /// bytes it holds now and has emitted in all. Empty without per-thread caches.
+    #[must_use]
+    pub fn thread_caches(&self) -> Vec<(usize, u64, u64)> {
+        if self.shared.code_cache.is_some() || !cfg!(target_arch = "aarch64") {
+            return Vec::new();
+        }
+        self.shared
+            .peers
+            .0
+            .lock()
+            .iter()
+            .map(|&jit| {
+                let (mut in_use, mut emitted) = (0u64, 0u64);
+                // SAFETY: a peer is live while it is in the list; the counters are atomics.
+                unsafe { od_jit_code_bytes(jit as *mut c_void, &mut in_use, &mut emitted) };
+                (jit, in_use, emitted)
+            })
+            .collect()
+    }
+
+    /// **Clear one context's own cache** (arm64), named as [`thread_caches`](Self::thread_caches)
+    /// names it. Parked in a system call, its code and tables are given back now (vendored patches
+    /// 0104, 0107) -- a clear asked of it would wait for it to wake -- and a later
+    /// [`discard_parked`](Self::discard_parked) finds nothing more of it (0108): the code bytes given
+    /// back. Otherwise at the edge of its next run, its pages given back then (0102), as
+    /// [`clear_code_cache`](Self::clear_code_cache) does to every one: 0. `None` when no context of
+    /// this backend has that jit now.
+    pub fn clear_thread_code(&self, key: usize) -> Option<u64> {
+        let peers = self.shared.peers.0.lock();
+        if self.shared.code_cache.is_some() || !peers.contains(&key) {
+            return None;
+        }
+        // SAFETY: a peer is live while it is in the list, held here; the give-back takes the jit's
+        // own lock, and `ClearCache` only records the request and halts the jit.
+        let given = unsafe { od_jit_discard_parked(key as *mut c_void, 0) };
+        if given == 0 {
+            // SAFETY: as above.
+            unsafe { od_jit_clear_cache(key as *mut c_void) };
+        }
+        Some(given)
+    }
+
+    /// The bytes every context's per-block tables hold (arm64, each thread's own cache; vendored
+    /// patch 0107): the block maps, records, link heads and guest-range indexes -- beside the code
+    /// [`code_cache_stats`](Self::code_cache_stats) counts. 0 without per-thread caches.
+    #[must_use]
+    pub fn table_bytes(&self) -> u64 {
+        if self.shared.code_cache.is_some() || !cfg!(target_arch = "aarch64") {
+            return 0;
+        }
+        self.shared
+            .peers
+            .0
+            .lock()
+            .iter()
+            // SAFETY: a peer is live while it is in the list; the count is an atomic.
+            .map(|&jit| unsafe { od_jit_table_bytes(jit as *mut c_void) })
             .sum()
     }
 
@@ -2212,7 +2312,8 @@ impl CpuCtx {
 pub struct DynarmicCpu {
     jit: *mut c_void,
     ctx: Box<UnsafeCell<CpuCtx>>,
-    /// dynarmic inlines this pointer into generated code, so the box must never move.
+    /// Generated code reaches the slot through this box's address (in the jit's state, or inlined
+    /// into an x64 cache of its own), so the box must never move.
     tpidr_el0: Box<u64>,
     tpidrro_el0: Box<u64>,
     shared: Arc<Shared>,
@@ -2375,6 +2476,12 @@ impl DynarmicCpu {
         }
 
         let armed = options.assert_callback_free_slices && shared.owns_guest_paging;
+        // Joined before it is a peer: `census_begin` reads the group the join writes (a plain
+        // field), and reaches the jit only through the peers' lock.
+        if let Some(group) = shared.census.as_deref() {
+            // SAFETY: the jit is live and has not run; the group is freed with `shared`, after it.
+            unsafe { od_jit_census_join(jit, (group as *const census::Group).cast_mut().cast()) };
+        }
         if shared.code_cache.is_none() {
             shared.peers.0.lock().push(jit as usize);
         }
@@ -2800,8 +2907,14 @@ impl GuestCpu for DynarmicCpu {
             }
 
             if halt_reason & HALT_OURS != 0 {
+                // `CacheInvalidation` stays: the generated code cleared the halt word as the run
+                // returned and `Run` made what was asked by then, so a bit here was raised since --
+                // by another thread's invalidation or clear, or the patch 0098 flush above -- with
+                // its request still queued. Cleared, that request would wait for some later halt
+                // while stale translations ran; left, the next `Run` makes it at entry (a lock and
+                // nothing more where the halt asked nothing: x64's region retirement).
                 // SAFETY: the jit is live and not executing.
-                unsafe { od_jit_clear_halt(self.jit, HALT_OURS) };
+                unsafe { od_jit_clear_halt(self.jit, HALT_OURS & !OD_HALT_CACHE_INVALIDATION) };
             }
 
             self.with_ctx(|ctx| ctx.suppressed_breakpoint = None);
@@ -2921,8 +3034,10 @@ impl GuestCpu for DynarmicCpu {
     }
 
     fn set_tpidr_el0(&mut self, value: GuestAddr) {
-        // The boxes are not reallocated, so the pointers dynarmic inlined into generated code stay
-        // valid. This is how a guest thread that calls `__set_tls` re-points itself.
+        // The boxes are not reallocated, so the pointers generated code reads them through stay
+        // valid (the jit's state holds them -- arm64, vendored patch 0112; x64's shared cache --
+        // or an x64 cache of its own inlined them), and nothing keeps a copy of the value. This is
+        // how a guest thread that calls `__set_tls` re-points itself.
         //
         // Both registers move together. On AArch64 bionic reads TLS through `TPIDR_EL0` and the
         // kernel keeps `TPIDRRO_EL0` in step; leaving the read-only alias behind would give guest

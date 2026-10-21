@@ -21,6 +21,8 @@
 #include "dynarmic/interface/exclusive_monitor.h"
 #include "dynarmic/interface/halt_reason.h"
 #include "dynarmic/interface/optimization_flags.h"
+/* Patch 0037's switch, both backends' since patch 0110 (`Dynarmic::Optimization`). */
+#include "dynarmic/ir/opt/passes.h"
 /* Internal to dynarmic's x64 backend, and read-only here: the addresses the
  * backend itself bakes into emitted exclusive-access code. */
 #include "dynarmic/backend/x64/exclusive_monitor_friend.h"
@@ -31,8 +33,6 @@
  * which pulls in the emitter's whole include set). */
 namespace Dynarmic::Backend::X64 {
 extern std::atomic<std::uint32_t> live_fp_optimizations;
-/* Patch 0037's switch, likewise. */
-extern std::atomic<std::uint32_t> live_precise_get_set;
 /* Patch 0098's switch, likewise. */
 extern std::atomic<std::uint32_t> live_batch_ic_ivau;
 /* Patch 0042's switch, likewise. */
@@ -272,6 +272,12 @@ struct OdJit {
     OdCodeCache* cache = nullptr;
     /* Patch 0041: Top Byte Ignore sites already invalidated, without a cache. */
     std::atomic<std::uint64_t> tbi_sites_seen{0};
+#if defined(__aarch64__)
+    /* Patch 0106: the embedder's census group this jit reports to (null: none), and whether its
+     * live blocks are wanted at the end of its next run. */
+    void* census_group = nullptr;
+    std::atomic<u32> census_wanted{0};
+#endif
 };
 
 #if !defined(__aarch64__) && !defined(_M_ARM64)
@@ -288,6 +294,48 @@ struct OdCodeCache {};
 #endif
 
 inline OdJit* as_jit(void* p) { return static_cast<OdJit*>(p); }
+
+#if defined(__aarch64__)
+/* Patch 0106: where the census's counts go (null: nowhere), and how a jit's blocks reach it. */
+std::atomic<od_census_sink> census_sink{nullptr};
+
+struct CensusBatch {
+    std::vector<u64> locations;
+    std::vector<u32> host_bytes;
+};
+
+void census_collect(void* ctx, u64 location, u32 host_bytes) {
+    auto* batch = static_cast<CensusBatch*>(ctx);
+    batch->locations.push_back(location);
+    batch->host_bytes.push_back(host_bytes);
+}
+
+/* The emission hook: one block, on the emitting thread. */
+void census_emitted(void* ctx, u64 location, u32 host_bytes) {
+    const od_census_sink sink = census_sink.load(std::memory_order_acquire);
+    if (sink != nullptr) {
+        sink(static_cast<OdJit*>(ctx)->census_group, OD_CENSUS_EMITTED, &location, &host_bytes, 1);
+    }
+}
+
+/* One jit's live blocks to its group, the sink called once the jit's lock is let go; `parked` as
+ * `Jit::OdForEachBlock`. False if it was not parked after all. Never throws. */
+bool census_read(OdJit* self, u64 resume, const std::atomic<u64>* parked) noexcept {
+    try {
+        CensusBatch batch;
+        if (!self->jit->OdForEachBlock(census_collect, &batch, resume, parked)) {
+            return false;
+        }
+        const od_census_sink sink = census_sink.load(std::memory_order_acquire);
+        if (sink != nullptr) {
+            sink(self->census_group, OD_CENSUS_LIVE, batch.locations.data(), batch.host_bytes.data(), batch.locations.size());
+        }
+    } catch (...) {
+        /* Out of memory for a measurement: the count is skipped, the guest goes on. */
+    }
+    return true;
+}
+#endif
 
 #if defined(__aarch64__) || defined(_M_ARM64)
 constexpr bool od_host_is_arm64 = true;
@@ -855,6 +903,14 @@ uint32_t od_jit_run(void* p) {
     }
     try {
         const auto halt = static_cast<uint32_t>(self->jit->Run());
+#if defined(__aarch64__)
+        /* Patch 0106: the census asked for this jit's blocks; read here, on its own thread,
+         * between runs. One relaxed load per run otherwise. */
+        if (self->census_wanted.load(std::memory_order_relaxed) != 0) {
+            self->census_wanted.store(0, std::memory_order_relaxed);
+            census_read(self, 0, nullptr);
+        }
+#endif
 #if !defined(__aarch64__) && !defined(_M_ARM64)
         /* Patch 0041: guest instructions that met a tagged address with Top Byte Ignore's mask off
          * are translated again (masked) -- their blocks dropped here, between runs, where
@@ -990,6 +1046,17 @@ void od_jit_invalidate_range(void* p, uint64_t addr, uint64_t len) {
 void od_jit_clear_cache(void* p) { as_jit(p)->jit->ClearCache(); }
 void od_jit_clear_exclusive(void* p) { as_jit(p)->jit->ClearExclusiveState(); }
 
+uint32_t od_jit_reset(void* p) {
+    OdJit* self = as_jit(p);
+    /* Inside a callback the state is the running guest's: a reset under it would send the run on
+     * from address 0 (and x64's `Reset` asserts against it). */
+    if (self->jit->IsExecuting()) {
+        return 0;
+    }
+    self->jit->Reset();
+    return 1;
+}
+
 void od_jit_effective_config(void* p, od_effective_config* out) {
     /* This reads the shim's saved `UserConfig`, not dynarmic's. They are the
      * same object by value and dynarmic's copy is `const` for its whole life on
@@ -1027,8 +1094,31 @@ void od_jit_effective_config(void* p, od_effective_config* out) {
 #else
     out->code_cache_w_xor_x = OD_CODE_CACHE_W_AND_X;
 #endif
+#if defined(__aarch64__)
+    /* Patch 0112: the slots generated code reads and writes, as the jit's state holds them -- not
+     * this copy of the config -- so a reset that lost them shows here. */
+    const A64::Jit::OdThreadValues values = self->jit->OdGetThreadValues();
+    out->tpidr_el0_ptr = values.tpidr_el0;
+    out->tpidrro_el0_ptr = values.tpidrro_el0;
+#else
     out->tpidr_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidr_el0);
     out->tpidrro_el0_ptr = reinterpret_cast<uint64_t>(uc.tpidrro_el0);
+#endif
+}
+
+uint32_t od_jit_thread_values(void* p, uint64_t* out, uint32_t n) {
+#if defined(__aarch64__)
+    const A64::Jit::OdThreadValues v = as_jit(p)->jit->OdGetThreadValues();
+    const uint64_t all[OD_THREAD_VALUES] = {v.callbacks, v.conf, v.tpidr_el0, v.tpidrro_el0, v.exclusive_address, v.exclusive_value};
+    const uint32_t count = n < OD_THREAD_VALUES ? n : OD_THREAD_VALUES;
+    std::memcpy(out, all, count * sizeof(uint64_t));
+    return count;
+#else
+    (void)p;
+    (void)out;
+    (void)n;
+    return 0;
+#endif
 }
 
 uint64_t od_jit_discard_parked(void* p, uint64_t parked_at_least_ns) {
@@ -1050,6 +1140,85 @@ uint64_t od_jit_discard_parked(void* p, uint64_t parked_at_least_ns) {
 #endif
 }
 
+void od_set_census_sink(od_census_sink sink) {
+#if defined(__aarch64__)
+    census_sink.store(sink, std::memory_order_release);
+#else
+    (void)sink;
+#endif
+}
+
+void od_jit_census_join(void* p, void* group) {
+#if defined(__aarch64__)
+    OdJit* self = as_jit(p);
+    self->census_group = group;
+    self->jit->OdSetEmitHook(group != nullptr ? census_emitted : nullptr, self);
+#else
+    (void)p;
+    (void)group;
+#endif
+}
+
+uint32_t od_jit_block_census(void* p) {
+#if defined(__aarch64__)
+    OdJit* self = as_jit(p);
+    if (self->census_group == nullptr) {
+        return 0;
+    }
+    /* Parked in an `SVC` callback: read now, as `od_jit_discard_parked` gives back (the halt that
+     * takes reaches a running thread only if it wakes as it is read). Otherwise the thread reads its
+     * own at the end of its next run: it is not stopped for the census. An ask an earlier look left
+     * (the thread parked before its run ended) is withdrawn before the read, or the woken thread
+     * would answer it too, at the end of the run that halt ends: its blocks twice in one look. */
+    const u64 resume = self->callbacks.parked_return.load(std::memory_order_seq_cst);
+    if (resume != 0) {
+        self->census_wanted.store(0, std::memory_order_relaxed);
+        if (census_read(self, resume, &self->callbacks.parked_return)) {
+            return 1;
+        }
+    }
+    self->census_wanted.store(1, std::memory_order_relaxed);
+    return 0;
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
+void od_jit_block_links(void* p, uint64_t location, od_block_links* out, uint32_t* offsets, uint32_t* kinds, uint32_t capacity) {
+    *out = od_block_links{};
+#if defined(__aarch64__)
+    struct Sites {
+        uint32_t* offsets;
+        uint32_t* kinds;
+        uint32_t capacity;
+        uint32_t count;
+    } sites{offsets, kinds, capacity, 0};
+    const auto info = as_jit(p)->jit->OdBlockLinks(
+        location,
+        [](void* ctx, std::uint32_t offset, std::uint32_t kind) {
+            auto& s = *static_cast<Sites*>(ctx);
+            if (s.count < s.capacity) {
+                s.offsets[s.count] = offset;
+                s.kinds[s.count] = kind;
+            }
+            s.count++;
+        },
+        &sites);
+    out->entry_point = info.entry_point;
+    out->host_bytes = info.host_bytes;
+    out->unlinked_slot = info.unlinked_slot;
+    out->relink_maintained = info.relink_maintained;
+    out->count = sites.count;
+#else
+    (void)p;
+    (void)location;
+    (void)offsets;
+    (void)kinds;
+    (void)capacity;
+#endif
+}
+
 void od_jit_code_bytes(void* p, uint64_t* in_use, uint64_t* emitted) {
 #if defined(__aarch64__)
     *in_use = static_cast<uint64_t>(as_jit(p)->jit->OdCodeBytesInUse());
@@ -1058,6 +1227,23 @@ void od_jit_code_bytes(void* p, uint64_t* in_use, uint64_t* emitted) {
     (void)p;
     *in_use = 0;
     *emitted = 0;
+#endif
+}
+
+uint64_t od_jit_table_bytes(void* p) {
+#if defined(__aarch64__)
+    return static_cast<uint64_t>(as_jit(p)->jit->OdTableBytes());
+#else
+    (void)p;
+    return 0;
+#endif
+}
+
+uint64_t od_lookups_after_give_back(void) {
+#if defined(__aarch64__)
+    return Dynarmic::Backend::Arm64::lookups_after_give_back.load(std::memory_order_relaxed);
+#else
+    return 0;
 #endif
 }
 
@@ -1107,13 +1293,8 @@ uint32_t od_set_live_fp_optimizations(uint32_t mask) {
 }
 
 uint32_t od_set_precise_get_set(uint32_t on) {
-#if !defined(__aarch64__) && !defined(_M_ARM64)
-    Dynarmic::Backend::X64::live_precise_get_set.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
+    Dynarmic::Optimization::live_precise_get_set.store(on != 0 ? 1u : 0u, std::memory_order_relaxed);
     return on != 0 ? 1u : 0u;
-#else
-    (void)on;
-    return 0;
-#endif
 }
 
 uint32_t od_set_batch_ic_ivau(uint32_t on) {
@@ -1127,11 +1308,7 @@ uint32_t od_set_batch_ic_ivau(uint32_t on) {
 }
 
 uint32_t od_precise_get_set(void) {
-#if !defined(__aarch64__) && !defined(_M_ARM64)
-    return Dynarmic::Backend::X64::live_precise_get_set.load(std::memory_order_relaxed);
-#else
-    return 0;
-#endif
+    return Dynarmic::Optimization::live_precise_get_set.load(std::memory_order_relaxed);
 }
 
 uint32_t od_set_scalar_fp_in_xmm(uint32_t on) {

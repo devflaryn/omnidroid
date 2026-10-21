@@ -103,6 +103,12 @@ pub(super) fn write(file: &File, buf: &[u8], _append: bool) -> std::io::Result<u
 /// Nothing to settle at `close`: the host shortened the file when it was asked.
 pub(super) fn settle(_file: &File) {}
 
+/// `fdatasync(2)` (`std`'s `sync_data` here) at either level: Linux has nothing past it for one
+/// file. macOS has its own ([`macos`](super::macos)).
+pub(super) fn sync_data(file: &File, _level: super::SyncLevel) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 /// Structural on macOS: Linux's is in [`linux`](super::linux), `fallocate(2)` mode 0 through
 /// `libc::posix_fallocate`, which macOS does not have.
 ///

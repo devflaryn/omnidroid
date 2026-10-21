@@ -1,0 +1,16 @@
+font.bin (../../card/font.bin) -- the crash card's font (`crate::card`): Droid Sans Mono, ASCII 32..126,
+4-bit coverage at 20 px (a 12x24 cell) and 40 px (a 24x48 cell). gen_font.py says the format.
+
+The font is the Android image's own /system/fonts/DroidSansMono.ttf (108128 bytes, sha256
+db19a1fdaba41cc4a2fec0330e5c15e71c6dd68a3ef074f4f28268828b45c862): "Digitized data copyright 2007,
+Google Corporation", licensed under the Apache License, Version 2.0
+(http://www.apache.org/licenses/LICENSE-2.0), as the font's own name table says. Made on macOS with
+Python 3.9.6, Pillow 11.3.0 and its FreeType 2.13.3, from this directory:
+
+    python3 gen_font.py <DroidSansMono.ttf> ../../card/font.bin
+
+The output: 28809 bytes, sha256 6547f98f8093128ad2fec93b4a1cc2d171c98f42310a8b576e32bf865cbf7b50.
+Another FreeType may hint a pixel differently; nothing depends on the exact bytes (card.rs's tests
+check the cells and that the glyphs draw).
+
+The file is committed so the build never needs Python or the font; card.rs embeds it (include_bytes!).

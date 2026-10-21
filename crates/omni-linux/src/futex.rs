@@ -14,6 +14,7 @@
 //! host thread's own token (`std::thread::park`), so a wake between dropping the lock and parking
 //! is not lost; a spurious return re-checks under the lock and parks again.
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::AtomicBool;
 use std::thread::Thread;
 use std::time::Instant;
 
@@ -44,8 +45,6 @@ struct State {
     /// thread to unpark when it is woken or interrupted.
     parked: HashMap<u64, Thread>,
     next_id: u64,
-    /// Set by `interrupt_all` (the process is ending): every wait answers `EINTR`.
-    interrupted: bool,
 }
 
 /// A waiting task's signals: its pending set and its mask. A wait ends with `EINTR` as soon as a
@@ -86,7 +85,20 @@ impl Unpark {
 }
 
 impl State {
-    fn remove(&mut self, id: u64) {
+    /// Take wait `id` out of `key`'s queue, where it waits -- or, moved by a requeue, out of
+    /// whichever queue holds it. Every queue was searched on every timeout and signal: 0.8% of an
+    /// app host's busy samples at Roblox's Home; 256 other waits added 2.8-4.9 us of CPU to a 1 ms
+    /// wait that timed out, under 1 us now (`tests/wait_cost.rs`, M4, 2026-10-20).
+    fn remove(&mut self, id: u64, key: u64) {
+        if let Some(q) = self.queues.get_mut(&key) {
+            if let Some(at) = q.iter().position(|w| w.id == id) {
+                q.remove(at);
+                if q.is_empty() {
+                    self.queues.remove(&key);
+                }
+                return;
+            }
+        }
         self.queues.retain(|_, q| {
             q.retain(|w| w.id != id);
             !q.is_empty()
@@ -156,27 +168,33 @@ fn read_u32(mem: &GuestMem, addr: u64) -> Result<u32, Errno> {
 #[derive(Default)]
 pub struct Futexes {
     state: Mutex<State>,
+    /// Set by `interrupt_all` (the process is ending), under `state`'s lock: every wait answers
+    /// `EINTR`. Atomic, so a poll-family wait's look at it before each sleep (`crate::poll`) takes
+    /// no lock.
+    interrupted: AtomicBool,
 }
 
 impl Futexes {
-    /// Drop the lock and park until unparked, `deadline`, or spuriously; then take the lock again.
-    /// The caller re-checks everything. True when the deadline has passed.
+    /// Park until unparked, `deadline`, or spuriously, the lock dropped meanwhile and taken again;
+    /// the caller re-checks everything. True, without parking or dropping the lock, when the
+    /// deadline has passed -- so a park reads the clock once, and a wake ends it without a read.
     fn park<'a>(&'a self, st: MutexGuard<'a, State>, deadline: Option<Instant>) -> (MutexGuard<'a, State>, bool) {
-        drop(st);
-        let late = match deadline {
+        let left = match deadline {
             Some(d) => {
                 let now = Instant::now();
-                if now < d {
-                    std::thread::park_timeout(d - now);
+                if now >= d {
+                    return (st, true);
                 }
-                Instant::now() >= d
+                Some(d - now)
             }
-            None => {
-                std::thread::park();
-                false
-            }
+            None => None,
         };
-        (self.state.lock(), late)
+        drop(st);
+        match left {
+            Some(left) => std::thread::park_timeout(left),
+            None => std::thread::park(),
+        }
+        (self.state.lock(), false)
     }
 
     /// `FUTEX_WAIT`/`FUTEX_WAIT_BITSET`: sleep while `*addr == expected`, until woken, the
@@ -187,7 +205,7 @@ impl Futexes {
         }
         let key = key(addr)?;
         let mut st = self.state.lock();
-        if st.interrupted || signals.is_some_and(Signals::deliverable) {
+        if self.interrupted() || signals.is_some_and(Signals::deliverable) {
             return Err(EINTR);
         }
         if read_u32(mem, addr)? != expected {
@@ -199,8 +217,8 @@ impl Futexes {
             if st.woken.remove(&id) {
                 break Ok(0);
             }
-            if st.interrupted || signals.is_some_and(Signals::deliverable) {
-                st.remove(id);
+            if self.interrupted() || signals.is_some_and(Signals::deliverable) {
+                st.remove(id, key);
                 break Err(EINTR);
             }
             let late;
@@ -209,7 +227,7 @@ impl Futexes {
                 if st.woken.remove(&id) {
                     break Ok(0);
                 }
-                st.remove(id);
+                st.remove(id, key);
                 break Err(ETIMEDOUT);
             }
         };
@@ -331,9 +349,9 @@ impl Futexes {
             if queued && st.woken.remove(&id) {
                 queued = false;
             }
-            if st.interrupted {
+            if self.interrupted() {
                 if queued {
-                    st.remove(id);
+                    st.remove(id, key);
                 }
                 break Err(EINTR);
             }
@@ -341,7 +359,7 @@ impl Futexes {
             let owner = v & FUTEX_TID_MASK;
             if owner == 0 {
                 if queued {
-                    st.remove(id);
+                    st.remove(id, key);
                     queued = false;
                 }
                 let others = st.queues.get(&key).map_or(0, VecDeque::len);
@@ -353,7 +371,7 @@ impl Futexes {
             }
             if owner == tid {
                 if queued {
-                    st.remove(id);
+                    st.remove(id, key);
                 }
                 break Err(EDEADLK);
             }
@@ -367,7 +385,7 @@ impl Futexes {
             let late;
             (st, late) = self.park(st, deadline);
             if late && !st.woken.remove(&id) {
-                st.remove(id);
+                st.remove(id, key);
                 break Err(ETIMEDOUT);
             }
             if late {
@@ -429,7 +447,7 @@ impl Futexes {
     /// `nanosleep` and `clock_nanosleep`. `Ok` when the time ran out, `EINTR` otherwise.
     pub fn sleep_until(&self, deadline: Option<Instant>, signals: Signals<'_>) -> Result<(), Errno> {
         let mut st = self.state.lock();
-        if st.interrupted || signals.deliverable() {
+        if self.interrupted() || signals.deliverable() {
             return Err(EINTR);
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -439,7 +457,7 @@ impl Futexes {
         let result = loop {
             let late;
             (st, late) = self.park(st, deadline);
-            if st.interrupted || signals.deliverable() {
+            if self.interrupted() || signals.deliverable() {
                 break Err(EINTR);
             }
             if late {
@@ -453,14 +471,14 @@ impl Futexes {
     /// Whether the process is ending (`interrupt_all`): every wait answers `EINTR` from now on.
     #[must_use]
     pub fn interrupted(&self) -> bool {
-        self.state.lock().interrupted
+        self.interrupted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// End every wait, now and later, with `EINTR`: the process is exiting.
     pub fn interrupt_all(&self) {
         let everyone = {
-            let mut st = self.state.lock();
-            st.interrupted = true;
+            let st = self.state.lock();
+            self.interrupted.store(true, std::sync::atomic::Ordering::SeqCst);
             st.everyone()
         };
         unpark_all(everyone);

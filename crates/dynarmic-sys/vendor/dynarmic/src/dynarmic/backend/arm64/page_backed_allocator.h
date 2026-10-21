@@ -38,6 +38,11 @@ inline std::atomic<std::uint64_t> invalidation_ranges_checked{0};
 /// the consequence: a fault through a tagged address reports it tagged (`od_set_fastmem_host_tbi`).
 inline std::atomic<std::uint32_t> live_fastmem_host_tbi{0};
 
+/// Omnidroid patch 0107: dispatcher lookups and fastmem faults made by a jit whose tables were given
+/// back while its thread was parked, before its clear, over every jit in the process. Always 0 (see
+/// `A64AddressSpace::OdGiveBackTables`); a test hook (`od_lookups_after_give_back`).
+inline std::atomic<std::uint64_t> lookups_after_give_back{0};
+
 /// An allocator for the address space's per-block bookkeeping that takes large arrays straight from
 /// the kernel and gives them straight back.
 ///

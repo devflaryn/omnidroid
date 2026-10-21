@@ -56,10 +56,26 @@
 //! Roblox's engine does over its surface), heard from its `setPointerIcon` to the input service
 //! ([`crate::inject::Injector::pointer_icon`]), and shown when it asks for a system pointer.
 //!
+//! **Over a card** ([`Options::card`]: the app the window showed is gone, `crate::card`) the window
+//! is the host's own: what the app held is let go at once -- the capture given back, keys and
+//! buttons released, the host's cursor shown -- and nothing reaches the devices until the card is
+//! taken away. Android's word goes on being the dead app's: the input dispatcher sends no end of
+//! the capture for a connection that is gone (a native crash), and nothing on the display asks for
+//! another pointer icon once its user is stopped -- so the card's window held the mouse, and took
+//! it again whenever it got the focus back.
+//!
+//! **Its clicks are the card's** ([`CardClick`]): a primary press and its release both on the
+//! card's restart block -- the window's pixels scaled to the display's as the pointer's are, and
+//! looked up in the card's own layout ([`Composer::card_restart_at`]) -- write
+//! [`Options::restart_marker`], and the host program starts the app again on the display. A press
+//! that slides off the block before its release is no click, as on a button. The pointer's
+//! position is looked at only on a press or a release, and only over a card.
+//!
 //! # Scripted resizes and input
 //!
 //! [`Options::control`] names a file of commands, one a line, read as it grows (every
-//! [`CONTROL_EVERY`]): `size <w>x<h>` resizes the **window** as a drag would -- the display then
+//! [`CONTROL_EVERY`]; an added display's window, `crate::displays::control_file`; display 0's,
+//! `OMNI_WINDOW_CONTROL`): `size <w>x<h>` resizes the **window** as a drag would -- the display then
 //! follows by the same path as a user's resize, which is what makes that path testable. `key
 //! <scancode> [down|up]` (a set-1 scancode, `0x`-hex or decimal, `0xE0..` for an extended key;
 //! both halves when neither is named), `click <x> <y> [primary|secondary|middle]` and `point <x>
@@ -68,7 +84,9 @@
 //! and `flood <hz> <seconds>` (window moves around a circle at that rate -- a mouse's report rate,
 //! through the same coalescing) drive the input devices as the window's own events would. `chrome show` / `chrome
 //! hide` present the system's bars and taskbar with the app, or the app alone (the default,
-//! [`Composer::set_show_chrome`]). Unknown lines are reported and skipped.
+//! [`Composer::set_show_chrome`]). Unknown lines are reported and skipped. Over a card a `click`
+//! is a click on the card -- the same hit test as the window's own, so a script can press its
+//! restart block -- and never reaches the devices.
 //!
 //! # What it says
 //!
@@ -77,7 +95,7 @@
 //! are coalesced to the newest (the window shows frames, not a queue of them), so the first count
 //! can trail the second by the frames skipped, never lead it. Closing the window ends the window,
 //! not the system: the display goes on, headless.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -154,6 +172,13 @@ pub struct Options {
     pub stop: Option<Arc<AtomicBool>>,
     /// Written when the person closes the window, so a host program can end what it showed.
     pub closed_marker: Option<PathBuf>,
+    /// Written (`restart`) when the person clicks the restart block of the card the window shows
+    /// (`crate::card::restart_rect`, [`Composer::card_restart_at`]): a primary press and its
+    /// release both inside it. A host program then starts the app again on the display.
+    pub restart_marker: Option<PathBuf>,
+    /// Set by the host while the display shows a card instead of its frames (`display card`): the
+    /// window's keyboard and mouse are no longer the app's (see this module's "Keyboard and mouse").
+    pub card: Option<Arc<AtomicBool>>,
 }
 
 /// The keyboard and the relative mouse, one pair for the device: whichever window has the focus
@@ -337,6 +362,64 @@ fn scale(window: &Window, composer: &Composer, display: i64) -> (f64, f64) {
     }
 }
 
+/// The display pixel under the window position `(x, y)`, `s` display pixels a window pixel
+/// ([`scale`]); `None` left of or above the window (a release dragged out of it).
+fn display_pixel((x, y): (i32, i32), s: (f64, f64)) -> Option<(u32, u32)> {
+    let (dx, dy) = (f64::from(x) * s.0, f64::from(y) * s.1);
+    (dx >= 0.0 && dy >= 0.0).then_some((dx as u32, dy as u32))
+}
+
+/// **A click on the restart block of the card a window shows**: a primary press on it, then its
+/// release on it too. Nothing is remembered but whether the press was on the block, so the card
+/// drawn again between the two (its countdown, every second) changes nothing.
+#[derive(Debug, Default)]
+struct CardClick {
+    pressed: bool,
+}
+
+impl CardClick {
+    /// One window event over a card, `inside` saying whether a window position is on the block:
+    /// true when it completes a click on it. The focus gone between the two ends the press.
+    fn event(&mut self, event: &WindowEvent, inside: impl Fn(i32, i32) -> bool) -> bool {
+        match *event {
+            WindowEvent::PointerDown { button: PointerButton::Primary, x, y } => {
+                self.pressed = inside(x, y);
+                false
+            }
+            WindowEvent::PointerUp { button: PointerButton::Primary, x, y } => std::mem::take(&mut self.pressed) && inside(x, y),
+            WindowEvent::FocusChanged { focused: false } => {
+                self.pressed = false;
+                false
+            }
+            _ => false,
+        }
+    }
+}
+
+/// `events` over the card the window shows -- the window's own, or a script's click: one completed
+/// on its restart block writes [`Options::restart_marker`] (`restart`), for the host program to
+/// start the app again. Without a marker nothing is asked.
+fn card_events(events: &[WindowEvent], click: &mut CardClick, window: &Window, composer: &Composer, options: &Options) {
+    let Some(marker) = &options.restart_marker else { return };
+    let shown = options.display;
+    let inside = |x, y| display_pixel((x, y), scale(window, composer, shown)).is_some_and(|(x, y)| composer.card_restart_at(shown, x, y));
+    let mut asked = false;
+    for event in events {
+        asked |= click.event(event, inside);
+    }
+    if asked {
+        ask_restart(marker, shown);
+    }
+}
+
+/// Ask the host program to start the app of the display `shown` again: `marker` written.
+fn ask_restart(marker: &Path, shown: i64) {
+    match std::fs::write(marker, b"restart") {
+        Ok(()) => eprintln!("[window] display {shown}: restart asked from its card"),
+        Err(e) => eprintln!("[window] display {shown}: restart asked from its card, but {} was not written: {e}", marker.display()),
+    }
+}
+
 /// The window thread: make the window, start the present thread, pump, run the control file.
 fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options, devices: Option<&Devices>) {
     let shown = options.display;
@@ -364,6 +447,10 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     }
     // The app's pointer capture as last seen (`input_channel::capture`'s counter).
     let mut capture_seen = u64::MAX;
+    // The display shows a card (`Options::card`), as of the last turn, and a press on its restart
+    // block waiting for its release.
+    let mut carded = false;
+    let mut card_click = CardClick::default();
     // A scripted flood: (until, interval, next, step).
     let mut flood: Option<(Instant, Duration, Instant, u32)> = None;
     let stop = Arc::new(AtomicBool::new(false));
@@ -386,9 +473,10 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
     // once) shows as thousands of turns a second instead of tens.
     let (mut turns, mut turns_since) = (0u64, Instant::now());
     loop {
-        // Woken by input, else when a coalesced move or a flood's next step is due.
+        // Woken by input, else when a coalesced move or a flood's next step is due (none over a
+        // card, where a move left waiting would be due at once on every turn).
         let mut wait = PUMP_WAIT;
-        for due in [input.due(), flood.map(|f| f.2)].into_iter().flatten() {
+        for due in [input.due(), flood.map(|f| f.2)].into_iter().flatten().filter(|_| !carded) {
             wait = wait.min(due.saturating_duration_since(Instant::now()));
         }
         window.wait(wait);
@@ -410,7 +498,41 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
             eprintln!("[window] display {shown} removed: closing its window");
             break;
         }
-        if let Some(devices) = devices {
+        let card = options.card.as_ref().is_some_and(|c| c.load(Ordering::Acquire));
+        if card != carded {
+            carded = card;
+            // A press from before the card came, or on a card now gone, is no click on one.
+            card_click = CardClick::default();
+            if let Some(devices) = devices {
+                let (now, s, display) = (Instant::now(), scale(&window, &composer, shown), composer.display_size_of(shown));
+                if card {
+                    eprintln!("[window] display {shown} shows a card: the app's keyboard, mouse and cursor let go");
+                    // The app's capture given back, and what it has down released as when the
+                    // window loses the focus.
+                    let mut outs = input.guest_capture(false);
+                    outs.extend(input.event(&WindowEvent::FocusChanged { focused: false }, now, s, display));
+                    perform(outs, &mut window, &mut input, devices);
+                    input.set_own_pointer(false);
+                    flood = None;
+                } else {
+                    eprintln!("[window] display {shown} shows its frames again: the keyboard and mouse the app's");
+                    let outs = input.event(&WindowEvent::FocusChanged { focused: window.has_focus() }, now, s, display);
+                    perform(outs, &mut window, &mut input, devices);
+                    // Android's word on the capture read again.
+                    capture_seen = u64::MAX;
+                }
+                // Shown over a card, whoever decides it otherwise (`OMNI_HOST_CURSOR`).
+                let hide = !card && cursor == HostCursor::Hide;
+                if hide != cursor_hidden {
+                    cursor_hidden = hide;
+                    let _ = window.set_cursor_hidden(hide);
+                }
+            }
+        }
+        if carded {
+            card_events(&events, &mut card_click, &window, &composer, options);
+        }
+        if let Some(devices) = devices.filter(|_| !carded) {
             let now = Instant::now();
             let s = scale(&window, &composer, shown);
             let display = composer.display_size_of(shown);
@@ -471,6 +593,11 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
                             Some(Command::Chrome(show)) => {
                                 eprintln!("[window] control: {line}");
                                 composer.set_show_chrome(show);
+                            }
+                            Some(Command::Click(x, y, button)) if carded => {
+                                eprintln!("[window] control: {line} (on the card)");
+                                let press = [WindowEvent::PointerDown { button, x, y }, WindowEvent::PointerUp { button, x, y }];
+                                card_events(&press, &mut CardClick::default(), &window, &composer, options);
                             }
                             Some(Command::Flood(hz, secs)) if devices.is_some() => {
                                 eprintln!("[window] control: {line}");
@@ -774,6 +901,31 @@ mod tests {
         for bad in ["chrome", "chrome on", "size","size 960", "size 960x", "size x600", "size 9x6 extra", "resize 1x1", "", "size -1x5", "key", "key zz", "key 1 sideways", "click 1", "click 1 2 left", "move 1", "flood 0 5", "point 1"] {
             assert_eq!(parse(bad), None, "{bad:?}");
         }
+    }
+
+    /// A click on a card's restart block is a primary press and its release both on it: one that
+    /// slides off it, starts beside it, is another button's or loses the focus between is not.
+    #[test]
+    fn a_click_on_a_card_is_a_press_and_its_release_on_the_block() {
+        let inside = |x: i32, y: i32| (100..200).contains(&x) && (50..80).contains(&y);
+        let down = |x, y| WindowEvent::PointerDown { button: PointerButton::Primary, x, y };
+        let up = |x, y| WindowEvent::PointerUp { button: PointerButton::Primary, x, y };
+        let clicks = |events: &[WindowEvent]| {
+            let mut click = CardClick::default();
+            events.iter().filter(|e| click.event(e, inside)).count()
+        };
+        assert_eq!(clicks(&[down(150, 60), up(160, 70)]), 1);
+        assert_eq!(clicks(&[down(150, 60), up(250, 70)]), 0, "released beside it");
+        assert_eq!(clicks(&[down(50, 60), up(150, 60)]), 0, "pressed beside it");
+        assert_eq!(clicks(&[up(150, 60)]), 0, "a release alone");
+        let secondary = |down| if down { WindowEvent::PointerDown { button: PointerButton::Secondary, x: 150, y: 60 } } else { WindowEvent::PointerUp { button: PointerButton::Secondary, x: 150, y: 60 } };
+        assert_eq!(clicks(&[secondary(true), secondary(false)]), 0, "another button");
+        assert_eq!(clicks(&[down(150, 60), WindowEvent::FocusChanged { focused: false }, up(150, 60)]), 0, "the focus gone between");
+        assert_eq!(clicks(&[down(150, 60), up(150, 60), up(150, 60), down(120, 55), up(130, 75)]), 2, "a press is one click at most");
+        // Window pixels to the display's: a display half the window's size each way is half a
+        // display pixel a window pixel.
+        assert_eq!(display_pixel((1001, 401), (0.5, 0.5)), Some((500, 200)));
+        assert_eq!(display_pixel((-3, 10), (1.0, 1.0)), None, "dragged out of the window");
     }
 
     /// Lines are taken once each, in order, and a line still being written (no newline yet) waits.

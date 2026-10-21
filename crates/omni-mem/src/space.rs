@@ -10,7 +10,7 @@ use crate::backing::Backing;
 use crate::cache::{self, Generation};
 use crate::entry::{Entry, EntryMap, Owner, OsState, ViewId};
 use crate::error::{platform, MemError, MemResult};
-use crate::region::RegionInfo;
+use crate::region::{RegionInfo, RegionKind};
 
 mod subpage_ops;
 pub use subpage_ops::{AccessPtr, SplitStats};
@@ -492,6 +492,17 @@ pub struct SpaceStats {
     pub entries: usize,
 }
 
+/// What a guest address space's mapped regions add up to ([`GuestSpace::usage`]): the figures
+/// `/proc/<pid>/stat`, `status` and `statm` report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpaceUsage {
+    /// Bytes of every mapped region: the sum of [`GuestSpace::mapped_regions`]' lengths.
+    pub mapped: usize,
+    /// Bytes of private committed memory in them, in the guest's view: a tracked page's 4 KiB
+    /// holes hold none. Never more than the regions' [`RegionInfo::committed`] sum.
+    pub committed: usize,
+}
+
 /// One instance's guest address space.
 ///
 /// # The model
@@ -528,6 +539,8 @@ pub struct GuestSpace {
     /// Bumped by every write section, under the lock and before the write; read without the lock
     /// by `crate::cache` to decide whether a remembered entry is still true.
     generation: Generation,
+    /// The last [`GuestSpace::usage`] and the generation it was read under the lock at.
+    usage: Mutex<Option<(u64, SpaceUsage)>>,
 }
 
 /// The map lock, held for reading only.
@@ -759,6 +772,7 @@ impl GuestSpace {
                 max_commit_request: config.max_commit_request,
             }),
             generation: Generation::new(),
+            usage: Mutex::new(None),
             sub: (config.guest_page.is_some() && page > crate::subpage::GUEST_PAGE && vm::supports_alias())
                 .then(|| crate::subpage::SubPagesHandle::new(page / crate::subpage::GUEST_PAGE)),
         })
@@ -1108,6 +1122,36 @@ impl GuestSpace {
             "mapped a file into guest memory"
         );
         Ok(address)
+    }
+
+    /// **A private file view at a 4 KiB-exact fixed range** (D42): `[address, address + len)` shows
+    /// the file from `file_offset`, which must agree with `address` modulo the host page. Its whole
+    /// host pages are a view as [`map_file`](Self::map_file) makes one, and so is a partial host
+    /// page at either end where its other parts let it be -- free; a never-touched `PROT_NONE`
+    /// reservation's (the dynamic linker's around a library), whose parts stay the reservation's
+    /// over the view and read zero once made accessible; or already a view of the same file at the
+    /// same offset (the library's neighbouring segment) -- with the 4 KiB overlay keeping each
+    /// part's protection. Such an edge page was a private copy: 42,061 of them, 696 MiB, in the
+    /// system's host process by the end of a boot and a launch (M4, `OMNI_MMAP_COPIES`, 2026-10-20).
+    ///
+    /// Returns the part made a view: the range, or less by an edge host page that could not be
+    /// (another mapping's, or one whose parts would trap), for the caller to copy -- possibly
+    /// nothing. Without the overlay the range is whole host pages, and this is `map_file` there.
+    ///
+    /// # Errors
+    ///
+    /// As [`map_file`](Self::map_file); [`MemError::AddressTaken`] when the range is not free in the
+    /// guest's view, [`MemError::Misaligned`] for a file offset that does not agree.
+    pub fn map_file_exact(&self, backing: &Arc<Backing>, file_offset: u64, address: GuestAddr, len: usize, protection: Protection) -> MemResult<(GuestAddr, usize)> {
+        const OP: &str = "map_file_exact";
+        if self.sub.is_none() || (address % self.page == 0 && len % self.page == 0) {
+            return self.map_file(backing, file_offset, Placement::Fixed(address), len, protection).map(|a| (a, len));
+        }
+        let len = self.check_guest_range(OP, address, len)?;
+        if (address as u64).wrapping_sub(file_offset) % self.page as u64 != 0 {
+            return Err(MemError::Misaligned { operation: OP, what: "file offset", value: file_offset, required: self.page as u64 });
+        }
+        self.map_file_edges(backing, file_offset, address, len, protection)
     }
 
     /// Commit the granules covering `[address, address + len)` that are not committed yet.
@@ -1739,6 +1783,33 @@ impl GuestSpace {
         self.guest_view_regions(inner.regions(false), false)
     }
 
+    /// What the mapped regions add up to, [`SpaceUsage`]: `mapped` is exactly the sum of
+    /// [`mapped_regions`](GuestSpace::mapped_regions)' lengths. One pass over the map's entries in
+    /// step with the tracked pages, allocating nothing, and remembered until the map next changes
+    /// -- a hit is one load of the generation, the same argument as `crate::cache`'s. MEASURED
+    /// (Roblox at Home, M4, 2026-10-20): `/proc/self/stat|status|statm` ~91 opens a second, each
+    /// building `mapped_regions` twice (~3,500 regions, ~1.5 MB of allocation an open), 1-4% of
+    /// the app host's busy time. Over 4,667 regions with 1,166 split pages
+    /// (`tests/subpage.rs` `what_a_usage_figure_costs`, M4, same day): two walks 573 us, this 34 us
+    /// after a change and 5 ns remembered.
+    #[must_use]
+    pub fn usage(&self) -> SpaceUsage {
+        if let Some((at, usage)) = *self.usage.lock() {
+            if at == self.generation.current() {
+                return usage;
+            }
+        }
+        let (at, usage) = {
+            let inner = self.read();
+            (self.generation.locked(), self.guest_usage(&inner))
+        };
+        let mut kept = self.usage.lock();
+        if kept.is_none_or(|(was, _)| was < at) {
+            *kept = Some((at, usage));
+        }
+        usage
+    }
+
     /// The [`mapped_regions`](GuestSpace::mapped_regions) that overlap `[address, address + len)`,
     /// found from the space's index rather than by building every region of the space -- what a
     /// `munmap` of a range needs. The parts inside the range are exactly those of
@@ -1752,9 +1823,10 @@ impl GuestSpace {
     }
 
     /// The parts of `[address, address + len)` that hold anything: committed private memory and
-    /// file views, in address order, clipped to the range. The rest is free space or a lazy
-    /// mapping's uncommitted granules, which read as zeros by construction -- what a copy of the
-    /// range (the guest's `mremap`) need not touch, and must not, or it commits them.
+    /// file views (a shared one to its file's end), in address order, clipped to the range. The
+    /// rest is free space or a lazy mapping's uncommitted granules, which read as zeros by
+    /// construction -- what a copy of the range (the guest's `mremap`) need not touch, and must
+    /// not, or it commits them.
     #[must_use]
     pub fn held_ranges(&self, address: GuestAddr, len: usize) -> Vec<(GuestAddr, usize)> {
         let inner = self.read();
@@ -1765,7 +1837,7 @@ impl GuestSpace {
             if !matches!(entry.os, OsState::Private { .. } | OsState::View { .. }) {
                 continue;
             }
-            let (s, e) = (start.max(address), (start + entry.len).min(end));
+            let (s, e) = (start.max(address), self.held_end(start, entry).min(end));
             if s >= e {
                 continue;
             }
@@ -1775,6 +1847,20 @@ impl GuestSpace {
             }
         }
         self.guest_held(out)
+    }
+
+    /// Where entry `entry` at `start` stops holding anything: at a shared view's first host page
+    /// wholly past its file's end as the file is now, which holds nothing and which the host
+    /// answers with `SIGBUS` (`clip_at_end_of_file`); else at its end.
+    fn held_end(&self, start: GuestAddr, entry: &Entry) -> GuestAddr {
+        let end = start + entry.len;
+        let Some(owner) = entry.owner.as_ref() else { return end };
+        let Some(backing) = owner.backing.as_ref().filter(|b| b.is_shared() && matches!(entry.os, OsState::View { .. })) else { return end };
+        let (page, offset) = (self.page as u64, owner.offset_at(start));
+        if offset + entry.len as u64 <= backing.len().div_ceil(page) * page {
+            return end;
+        }
+        start + ((backing.len_now().div_ceil(page) * page).saturating_sub(offset) as usize).min(entry.len)
     }
 
     /// Every mapped region, as [`mapped_regions`](GuestSpace::mapped_regions) gives them, each
@@ -1806,7 +1892,7 @@ impl GuestSpace {
 
     /// [`region_at`](GuestSpace::region_at) under the lock, remembering what it found.
     fn region_at_locked(&self, address: GuestAddr) -> Option<RegionInfo> {
-        let (at, region) = {
+        let (at, region, by_length_now) = {
             let inner = self.read();
             let start = inner.map.entry_start(address)?;
             let entry = inner.map.get(start)?;
@@ -1816,10 +1902,69 @@ impl GuestSpace {
             // Read under the same lock as the entry: the tag says which map this came from. With
             // the 4 KiB overlay, the guest's view of it (SUBPAGE-ORDER 4).
             let info = self.guest_view_of(RegionInfo::from_entry(start, entry), address)?;
-            (self.generation.locked(), info)
+            let (region, by_length_now) = self.clip_at_end_of_file(entry, info, address);
+            (self.generation.locked(), region, by_length_now)
         };
-        cache::remember(&self.generation, at, &region);
+        // Not one cut where the file ends now: its length changes with no change to the map (an
+        // `ftruncate`, another process's too), so no generation says it stopped being true --
+        // `admit` admitted from such a slot past the end of a file that had shrunk since, and the
+        // host's `SIGBUS` there would kill the host process.
+        if !by_length_now {
+            cache::remember(&self.generation, at, &region);
+        }
         Some(region)
+    }
+
+    /// `info`, the region at `address`, cut where a shared view runs past its file's end
+    /// (`vm::shared_view_may_pass_end_of_file`): its host pages wholly past the end as the file is
+    /// **now** are a region of their own, inaccessible, so that every check refuses an access there
+    /// -- which the host would answer with `SIGBUS` -- until the file grows over them. Only a view
+    /// reaching past what the file held when it was opened asks the file its length; whether it
+    /// did is the second value.
+    fn clip_at_end_of_file(&self, entry: &Entry, info: RegionInfo, address: GuestAddr) -> (RegionInfo, bool) {
+        let RegionKind::File { file_offset, .. } = info.kind else { return (info, false) };
+        let Some(backing) = entry.owner.as_ref().and_then(|o| o.backing.as_ref()).filter(|b| b.is_shared()) else { return (info, false) };
+        let page = self.page as u64;
+        if file_offset + info.len as u64 <= backing.len().div_ceil(page) * page {
+            return (info, false);
+        }
+        let cut = (info.start as u64 + (backing.len_now().div_ceil(page) * page).saturating_sub(file_offset)) as usize;
+        let info = if cut >= info.end() {
+            info
+        } else if address < cut {
+            RegionInfo { len: cut - info.start, ..info }
+        } else {
+            let start = cut.max(info.start);
+            let kind = match &info.kind {
+                RegionKind::File { backing: id, name, shared, guest_named, .. } => RegionKind::File {
+                    backing: *id,
+                    name: Arc::clone(name),
+                    file_offset: file_offset + (start - info.start) as u64,
+                    shared: *shared,
+                    guest_named: *guest_named,
+                },
+                other => other.clone(),
+            };
+            RegionInfo { start, len: info.end() - start, protection: Protection::None, kind, ..info }
+        };
+        (info, true)
+    }
+
+    /// Whether `access` at `address` is the guest's `SIGBUS`, as on Linux: the address is in a
+    /// shared view's host page wholly past its file's end, as the file is now
+    /// ([`region_at`](Self::region_at) refuses it), and the guest's view maps it with a protection
+    /// that permits the access. Linux checks the mapping before it faults the page in: an address
+    /// in a hole of the page, or an access the protection forbids, is its `SIGSEGV`.
+    #[must_use]
+    pub fn past_end_of_file(&self, address: GuestAddr, access: crate::FaultAccess) -> bool {
+        let inner = self.read();
+        let Some(start) = inner.map.entry_start(address) else { return false };
+        let Some(entry) = inner.map.get(start) else { return false };
+        let Some(owner) = entry.owner.as_ref() else { return false };
+        let shared = owner.backing.as_ref().filter(|b| b.is_shared() && matches!(entry.os, OsState::View { .. }));
+        let page = self.page as u64;
+        shared.is_some_and(|b| owner.offset_at(address & !(self.page - 1)) >= b.len_now().div_ceil(page) * page)
+            && self.guest_view_of(RegionInfo::from_entry(start, entry), address).is_some_and(|r| crate::access::permits(r.protection, access))
     }
 
     /// The entry covering `address`, if this thread remembers it and the map has not changed since.

@@ -205,12 +205,10 @@ pub(super) fn kind_from_raw(code: i32) -> NetErrorKind {
 /// Build a [`NetError::Io`] from the thread's last Winsock error.
 fn wsa_error(operation: &'static str, endpoint: impl Into<String>, api: &str) -> NetError {
     let code = last_error();
-    NetError::kinded(
-        operation,
-        endpoint,
-        kind_from_wsa(code),
-        format!("{api} failed with WSAGetLastError {code}"),
-    )
+    match kind_from_wsa(code) {
+        NetErrorKind::WouldBlock => NetError::would_block(operation),
+        kind => NetError::kinded(operation, endpoint, kind, format!("{api} failed with WSAGetLastError {code}")),
+    }
 }
 
 /// A `sockaddr` of the right family, and how many of its bytes are meaningful.

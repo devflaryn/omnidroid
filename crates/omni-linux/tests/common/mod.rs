@@ -9,7 +9,17 @@ use std::sync::Arc;
 use omni_linux::fd::Output;
 use omni_linux::{ExitStatus, Process, SpawnConfig};
 
+/// The pinned sysroot, for a gate: its runs' shifted files (`mm`'s `OMNI_SHIFTED_DIR`) go in the
+/// target directory, not in the cache the user's own pool keeps in their temp.
 pub fn sysroot() -> Option<PathBuf> {
+    static SHIFTED: std::sync::Once = std::sync::Once::new();
+    SHIFTED.call_once(|| std::env::set_var("OMNI_SHIFTED_DIR", PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("omni-shifted")));
+    device_sysroot()
+}
+
+/// The pinned sysroot, for a device session (`r_app`'s, the pool's): its shifted files in the
+/// temp's cache, with every other session's.
+pub fn device_sysroot() -> Option<PathBuf> {
     let dir = std::env::var_os("OMNI_SYSROOT").map_or_else(
         || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35"),
         PathBuf::from,

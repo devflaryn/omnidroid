@@ -122,8 +122,9 @@ impl Generation {
         self.value.load(Ordering::Relaxed)
     }
 
-    /// The counter, read **without** the lock, to decide whether a slot is still true.
-    fn current(&self) -> u64 {
+    /// The counter, read **without** the lock, to decide whether a slot (or
+    /// [`GuestSpace::usage`](crate::GuestSpace::usage)'s figure) is still true.
+    pub(crate) fn current(&self) -> u64 {
         self.value.load(Ordering::Acquire)
     }
 }

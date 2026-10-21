@@ -71,6 +71,8 @@ pub struct Sysroot {
     backings: Mutex<HashMap<Vec<u8>, Arc<Backing>>>,
     /// Each image path's owner, mode, label and capability (`sysroot.meta`; empty without one).
     meta: HashMap<Vec<u8>, ImageMeta>,
+    /// Where `mm`'s shifted files of this sysroot's files are ([`shifted_dir`](Self::shifted_dir)).
+    shifted: PathBuf,
 }
 
 impl Sysroot {
@@ -160,6 +162,10 @@ impl Sysroot {
             manifest.entries.retain(|p, _| p.as_slice() != path && !p.starts_with(&under));
         }
         let mut sysroot = Self::build(dir, manifest, overlay);
+        // The host's cache, kept across boots and shared by every host process (`OMNI_SHIFTED_DIR`:
+        // elsewhere -- the gates put theirs in the target directory, not the user's pool's cache).
+        Arc::get_mut(&mut sysroot).expect("a new sysroot").shifted =
+            std::env::var_os("OMNI_SHIFTED_DIR").map_or_else(|| std::env::temp_dir().join("omni-shifted"), PathBuf::from);
         let meta_path = dir.join("sysroot.meta");
         if let Ok(bytes) = std::fs::read(&meta_path) {
             let digest = format!("{:x}", Sha256::digest(&bytes));
@@ -193,7 +199,9 @@ impl Sysroot {
             let parent = if cut == 0 { b"/".to_vec() } else { path[..cut].to_vec() };
             children.entry(parent).or_default().push(path[cut + 1..].to_vec());
         }
-        Arc::new(Self { objects: dir.join("objects"), overlay, manifest, children, backings: Mutex::default(), meta: HashMap::new() })
+        // A made-up sysroot's (a test's) beside its objects, gone with them -- never the host's cache,
+        // which its sweep (`mm`) would judge by a manifest that is not the cache's.
+        Arc::new(Self { objects: dir.join("objects"), overlay, manifest, children, backings: Mutex::default(), meta: HashMap::new(), shifted: dir.join("omni-shifted") })
     }
 
     /// The names in a sysroot directory.
@@ -221,6 +229,30 @@ impl Sysroot {
             Entry::File { sha256, .. } => Some(self.overlay.get(sha256).cloned().unwrap_or_else(|| object_path(&self.objects, sha256))),
             _ => None,
         }
+    }
+
+    /// What names a regular file's content: its sha256 (`mm`'s shifted views are made once per it).
+    #[must_use]
+    pub fn content_key(&self, guest: &[u8]) -> Option<String> {
+        match self.entry(guest)? {
+            Entry::File { sha256, .. } => Some(sha256.clone()),
+            _ => None,
+        }
+    }
+
+    /// Where `mm`'s shifted files of this sysroot's files are made and kept: `<temp>/omni-shifted`
+    /// (or `OMNI_SHIFTED_DIR`) for one [`open`](Self::open)ed, a directory of its own beside the
+    /// objects for one made [`from_manifest`](Self::from_manifest).
+    #[must_use]
+    pub fn shifted_dir(&self) -> &Path {
+        &self.shifted
+    }
+
+    /// Every regular file's [`content_key`](Self::content_key): what `mm`'s shifted files of this
+    /// sysroot are named by (the others are swept when unused).
+    #[must_use]
+    pub fn content_keys(&self) -> std::collections::HashSet<&str> {
+        self.manifest.entries.values().filter_map(|e| if let Entry::File { sha256, .. } = e { Some(sha256.as_str()) } else { None }).collect()
     }
 
     fn entry(&self, guest: &[u8]) -> Option<&Entry> {

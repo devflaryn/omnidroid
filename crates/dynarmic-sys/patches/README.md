@@ -1174,3 +1174,216 @@ the window's host address with the tag on top. One instruction, and one cycle of
 fewer per access. The embedder vouches for its fault path: XNU reports a fault through a tagged
 address tagged, so `omni-platform`'s macOS fault layer clears bits 56-63 before its handlers see it
 (`fault::reports_untagged_addresses`); `omni-linux` turns the switch on only where both hold.
+
+### 0106 — arm64: a census of the translated blocks
+
+arm64, each thread's own cache; a measurement, off unless asked for. Whether one cache shared by a
+process's threads is worth building depends on how many of them translate the same code, which
+nothing counted: a cache's commit says how much it holds, not what. `Jit::OdForEachBlock` reports
+each block a cache holds now (its location and host bytes) -- on the jit's own thread outside a run,
+or from another thread while it is parked in an `SVC` callback, under its invalidation lock with
+0104's halt-then-look (it leaves its run on waking; nothing else changes); `Jit::OdSetEmitHook` is
+called at the end of `AddressSpace::Emit` for each block emitted, when set (a null test otherwise).
+Shim `od_set_census_sink`, `od_jit_census_join` (a jit's group: one per guest process) and
+`od_jit_block_census` (read at once if parked, else at the end of the thread's next run -- a running
+thread is not stopped for it; a parked read withdraws an ask an earlier look left, which the woken
+thread would otherwise answer too); `omni-cpu`'s `DynarmicBackend::census_begin`/`census_end` and
+`omni-linux`'s `[jit-census]` lines under `OMNI_JIT_CENSUS=1`. Verified: `tests/census.rs`,
+`omni-cpu/tests/census.rs`.
+
+### 0107 — arm64: a parked thread's tables given back with its code
+
+arm64, each thread's own cache. 0104 gave back a parked thread's code but kept its per-block tables
+-- block map, block, fastmem and link records, link heads, the guest-range index -- about as large as
+the code again (M4, 2026-10-19: the system's host process 252 MiB of code and 239 of tables at 16
+minutes). `OdDiscardParked` now gives them back too (`A64AddressSpace::OdGiveBackTables`, what a clear
+does to them), under the same lock and after the same halt-then-look. Nothing reads a table before
+the clear the discard asked for: the woken thread runs only the rest of its `SVC` block -- with cycle
+counting a `GetTicksRemaining` call, then `CheckHalt` -- no guest access, so no fastmem fault; and
+`CheckHalt` goes to `return_to_dispatcher`, which tests the halt before it calls the lookup. A test
+hook counts dispatcher lookups and fastmem faults made in that state (`od_lookups_after_give_back`,
+always 0; with the discard's halt removed by hand it counts 1). `Jit::OdTableBytes` (an atomic each
+thread stores as its tables change; shim `od_jit_table_bytes`) says what a cache's tables hold.
+Verified: `tests/parked_tables.rs`, `omni-cpu/tests/cache_trim.rs`.
+
+### 0108 — arm64: a parked thread given back once
+
+arm64. A thread given back by 0104 and still parked was given back again at every pass of
+`omni-linux`'s parked trim -- the same pages counted each minute, so the `[code] ... given back` lines
+overstated it. `OdDiscardParked` returns 0 while its tables are given back and its clear is still to
+come (it has not run since); the clear ends that state, so a thread that has run since counts again.
+Verified: `tests/parked_tables.rs` (`a_thread_still_parked_gives_its_code_back_once`, and both tests
+park the thread a second time after it ran and give it back again; they take turns at the hook's
+process-wide count, so a lookup after the clear is not hidden by, or blamed on, the other test).
+
+### 0109 — arm64: the block map and link heads at three quarters full
+
+arm64. tsl's `robin_map` doubles at half full; the block map and the link heads now at 0.75 (as x64's
+link heads, 0064), starting at 4 buckets: tsl computes each size limit as `size_t(float(buckets) *
+factor)` on the emitting thread under the guest's FPCR, and 0.75 x 2^k is exact from 4 buckets up --
+the same in every rounding mode, no flag raised. MEASURED (`tests/bookkeeping.rs`, 32,769 blocks):
+381 -> 284 bytes of bookkeeping per block, each map a doubling smaller there.
+
+### 0110 — arm64: `GetSetElimination` under the memory-abort check, precise at every access
+
+arm64, what 0037 and 0081 did for x64's `TranslateBlock`, in `A64AddressSpace::GenerateIR`. The
+pass skipped every block (Omnidroid always sets `check_halt_on_memory_access`), so every guest
+register read was a load from `JitState` and every write a store; now it runs in its precise form
+while `live_precise_get_set` is on, with 0081's width forwarding (`OMNI_JIT_GETSET_WIDTH=0` turns
+that off, as on x64). The switch moved from `Backend::X64` to `Optimization` (declared in
+`passes.h`, defined next to the pass), so `od_set_precise_get_set` works on both backends and
+`omni-linux`'s `jit_getset=` lever is a real A/B on arm64 hosts; default 1, as on x64. Both DCE
+calls keep memory reads under the check (0037's `keep_memory_reads`): arm64 had the bug 0037 fixed
+on x64 -- `LDR WZR, [Xn]`, ART's stack-overflow probe, was dropped by the DCE after `ConstProp` and
+never faulted (`precise_getset.rs`'s unread-load test failed on the M4 before this, with the switch
+off as well as on).
+
+New, arm64 only: `DeadCodeEliminationOptions::forward_identities`. Every Get the pass forwards
+becomes an `Identity` that stays in the block, and the arm64 allocator takes each as an alias of its
+value (a `push_back` onto the location's value list, and a walk of each in the emit loop): about
+80 ns apiece, so the pass made translation 29% dearer. DCE now rewrites every argument that is an
+`Identity` to what it stands for in its reverse walk, so the `Identity` has no uses left when the
+walk reaches it, and erases what is dead instead of leaving it `Void`. Upstream's
+`IdentityRemovalPass` does the same in a separate walk (measured +16% instead of +12%). Only while
+the pass runs: with the switch off the pipeline is the one before this patch but for the kept loads,
+so `jit_getset=0` is the whole way back. A pseudo-operation keeps its argument, `Identity` or not: it reads what its instruction did, and
+`ConstantPropagation` folds an `ANDS` whose operand the pass made all ones into an `Identity` of the
+other operand with its flags still read. Rewritten, `Inst::Use` refused the move ("This value
+doesn't support the GetNZCVFromOp pseduo-op") and Roblox's host process aborted ten seconds into
+its launch (pool on the M4, 2026-10-20); `precise_getset.rs`'s `an_ands_folded_away_keeps_its_flags`
+aborts the same way without the exception.
+
+MEASURED (M4, macOS 27, a shared machine at load 15-35, so CPU time per phase rather than wall
+time: `CLOCK_THREAD_CPUTIME_ID` around `GenerateIR` and `Emit` in a scratch build;
+`omni-cpu/tests/translate_bench.rs`, 20,000 blocks of 41 instructions, 3 interleaved runs each):
+
+| | IR us/block | emit us/block | IR insts/block | code bytes/block |
+|---|---|---|---|---|
+| switch off | 14.9 | 16.5 | 191.9 | 1,080.6 |
+| on, without `forward_identities` | 18.7 | 21.7 | 183.8 | 782.3 |
+| on (this patch) | 21.7 | 13.9 | 88.3 | 782.3 |
+
+Translation +12%, code -28% (not measured yet: fewer clears where a cache churns, as the system's
+host process's 8 MiB ones do). The generated code (`omni-cpu/tests/bench.rs::the_precise_get_set_elimination`,
+ns/iteration, the fastest of 5 x 31 per configuration: medians were bimodal, P- and E-cores),
+check off (the bound) / switch off / switch on: register-bound 1.214 / 1.664 / 1.214, memory-heavy
+1.276 / 1.708 / 1.276, mixed 3.114 / 4.796 / 3.610. `translate_bench` whole-process user CPU, 6
+interleaved pairs: 0.603 -> 0.678 s (+12%; +28% before `forward_identities`). On a pool device
+(two ABBA pairs, `OMNI_JIT_PRECISE_GETSET=0` against the default, 2026-10-20): Roblox's host 29.1
+and 30.4% of a core at its Home with the switch off, 25.0 and 27.1% on; boot seconds, the system
+host's CPU to ready and the launch milestones the same.
+Verified: `omni-cpu/tests/precise_getset.rs` now runs on arm64 (`the_switch_changes_what_this_hosts_backend_emits`:
+336 -> 144 bytes for a constant and sixteen `ADD X0, X0, #1`; the 4,000-block differential, 2,665
+faulting mid-block, identical; all three state tests fail on arm64 with the precision removed, and
+the unread-load test with `keep_memory_reads` removed); `dynarmic-sys/tests/differential.rs` over
+bionic's `libc.so`, `libart.so`, `libhwui.so` and `libandroid_runtime.so` (14,245 runs) hashes the
+same with the switch on and off (`OD_PRECISE_GETSET=0|1`) and with `OMNI_JIT_VERIFY=1`.
+
+### 0111 — arm64: `AssertNoMoreUses` with the other allocator checks
+
+arm64. `EmitArm64` called `RegAlloc::AssertNoMoreUses` after every block: a walk of all 129
+locations that asserts and changes nothing, 0.85% of an app host's busy samples while Roblox
+launched (M4, 2026-10-20). It now returns at once unless `OMNI_JIT_VERIFY=1`, as 0103 made
+`AssertAllUnlocked`. With `OMNI_JIT_VERIFY=1` it holds on `precise_getset.rs`, `hostile.rs` and the
+real-code differential. MEASURED (as 0110, emit thread CPU over 8 interleaved runs of
+`translate_bench`): 13.74 -> 13.58 us/block, about 1% of emission, at the noise level of the run.
+
+### 0112 — arm64: a thread's own values read from its state, not baked into its code
+
+arm64, each thread's own cache; the first change a cache shared by a process's threads needs (the
+plan's P5). Generated code held as immediates what is one thread's: the callbacks object every
+prelude trampoline passed as `this` (and the config the monitor's exclusives were passed), the
+addresses of the `TPIDR_EL0`/`TPIDRRO_EL0` slots (a `MOV` of up to four instructions before each
+`MRS`/`MSR`), and this processor's reservation-address and reserved-value slots in the monitor (the
+inline exclusives). A block shared by several threads would have carried the thread that translated
+it. `A64JitState` now holds them -- `od_callbacks`, `od_conf`, `od_tpidr_el0`, `od_tpidrro_el0`,
+`od_exclusive_address`, `od_exclusive_value`, and `od_thread`, reserved for the shared cache -- after
+`fpcr`, so that no offset moves; `Jit::Impl` fills them when made and `Reset` fills them again (it
+zeroed the whole state, which would now be a callback on a null object). The trampolines load `X0`
+from `[Xstate, #od_callbacks]` (`#od_conf` for the exclusives through the monitor), the function's
+address resolved once from the callbacks' class with a zero `this` adjustment asserted (x64's
+`DevirtualizeFromJitState`, 0022); `TPIDR` is `LDR Xscratch0, [Xstate, #od_tpidr*]` and then the load
+or store; the reservation slots are loaded the same way. The monitor's lock and the scan of every
+slot are the same for every processor and stay immediates. `EmitConfig` loses `tpidr_el0`,
+`tpidrro_el0` and `processor_id`, so nothing in it is one thread's. Always on: no switch, one path.
+`Jit::OdGetThreadValues` (shim `od_jit_thread_values`; `od_jit_effective_config` reports the
+thread-pointer slots from it, what the code uses) and shim `od_jit_reset`. Every run-time writer
+already went through what the state points at: the guest's `MSR TPIDR_EL0` and `omni-cpu`'s
+`set_tpidr_el0` write the slot, `od_jit_clear_exclusive` the state's `exclusive_state`, the monitor
+the slots. MEASURED (M4, 2026-10-20, under load 6-16): code 369.81 -> 368.40 bytes a block
+(`tests/code_size.rs` `the_bytes_of_a_block_on_arm64`, the first blocks of libc, libart, libhwui and
+libandroid_runtime: 11,007 blocks, 4,070,548 -> 4,054,972 bytes); `codegen_bench`, ns an iteration
+of 4 (6 runs each): `MRS TPIDR_EL0` 0.79-0.80 -> 0.99-1.02, `MRS`+`LDR` of a TLS slot 1.53-1.56 ->
+1.75-1.80, `MSR TPIDR_EL0` 0.79-0.80 -> 1.04-1.08, `LDXR`+`ADD`+`STXR` 16.8-17.0 -> 17.9-18.3 (about
+a cycle a pair: the slot pointers are loads now, two of them on the `STXR`'s dependent path); every
+other construct unchanged within the runs' spread, and `translate_bench`'s first run 299.5-305.6 ms
+before, 295.1-301.7 after. Verified: `tests/thread_values.rs`
+(`reset_keeps_the_thread_s_own_values`: the values a jit is made with, kept by a reset that zeroes
+the guest's registers, and the same translated code reaching each of them after it, for both kinds
+of exclusive; with `Reset`'s refill removed it fails, and run anyway the code dies on a null slot),
+`thread_pointer_host.rs`, `exclusive.rs`.
+
+### 0113 — arm64: translation reads through the translating thread; a failed code mapping fails
+
+arm64; two small corrections a cache shared by a process's threads needs (the plan's P7).
+`A64AddressSpace::GenerateIR(descriptor, translator)`: the frontend reads the guest's code, and
+`A64MergeInterpretBlocksPass` the instructions after an interpreted one, through `translator`'s
+callbacks -- the thread that missed -- while everything that shapes the block comes from the address
+space's own config; the dispatcher passes that same config (one jit per address space), so nothing
+changes yet. And oaknut's `CodeBlock` tested `mmap` for null, which it never returns: a code cache
+that could not be mapped (`MAP_FAILED`, all ones) was taken for one at the top of the address space,
+and the prelude written there. It throws `std::bad_alloc` now, which `od_jit_new` turns into a null
+return; Windows' `VirtualAlloc` does return null and keeps the test. Not exercised by a test: no
+mapping fails on demand here.
+
+### 0114 — arm64: a link rewrites one word -- the return-stack slot is data, a relink maintains the words it wrote
+
+arm64, each thread's own cache; the shared cache's P6, landed in per-thread mode. A block's links
+are the only bytes of it that change after emission. A direct link is one word (`B`, or `NOP`
+unlinked). The return-stack push loaded its prediction with `ADRL`, two instruction words rewritten
+one at a time -- harmless while only the cache's own thread runs its code, but a thread running the
+block while another relinks it (a shared cache) can execute an old `ADRP` with a new `ADD` (the
+design study's probe: 2,169 and 3,254 torn in about 1.15 billion calls) -- and `RelinkForDescriptor`
+ran `sys_icache_invalidate` over each linking block whole. Now `PushRSB` is one `LDR Xscratch1` from
+an 8-byte, 8-aligned slot placed after the block's deferred code and final `BRK` (never executed;
+counted in the block's size); `LinkBlockLink` writes it with one 64-bit release store -- the
+predicted block's entry, or `return_to_dispatcher` unlinked -- and, the slot being data, no
+instruction-cache maintenance. A relink maintains only the `B`/`NOP` words it rewrote, each by its
+address: `DC CVAU` and `IC IVAU` act on the line holding the address and an aligned word lies in one
+line, so no line size is read or assumed (`CTR_EL0` traps at EL0 on macOS). On macOS arm64 up to 32
+words a batch -- every `DC CVAU`, `DSB ISH`, every `IC IVAU`, `DSB ISH`, `ISB`; on Linux and Windows
+arm64, where batching is not verified, oaknut's `invalidate` of each word (the `CTR_EL0` loop,
+`FlushInstructionCache`). Links are written inside the callers' W^X windows, as before. A block
+grows 4 bytes a push (`LDR` and slot for `ADRL`), plus at most 4 of alignment. Test hook
+`Jit::OdBlockLinks` (shim `od_jit_block_links`): a block's link sites, what an unlinked slot holds,
+and the bytes relinks have handed to maintenance. MEASURED (M4, 2026-10-20, the machine shared: base
+and after binaries interleaved, load average 3): `libc.so`'s first blocks (`tests/code_size.rs`, now
+reporting arm64 from 0106's census) **325.20 -> 327.09 B/block (+0.58%)**; `translate_bench` 303.5 ->
+301.8 ms; `codegen_bench` within 2% but calls and returns 12.89 -> 13.33 ns an iteration of eight
+(+3.4%, nine alternations; loading the slot first changed nothing) and two calls to a 3-insn leaf
+3.01 -> 2.79 ns (-7%); maintenance per relinked link, a probe of scattered words with the W^X toggle:
+one link to a target about 150 ns either way (the fences), four 47 against 140 ns, 32 10.5 against
+132. Verified: `tests/link_words.rs` -- `a_link_rewrites_one_word_and_nothing_else` (a block hashes
+the same outside its link word and slot linked, unlinked and linked to new translations; the word is
+`B` to the target or `NOP`, the slot the return site's entry or the dispatcher, 8-aligned after the
+last `BRK`; a relink hands 4 bytes to maintenance; fails with `ADRL` put back, and with whole-block
+maintenance put back: 240 bytes, not 4), `a_relinked_branch_never_runs_the_code_it_named_before`
+(2,000 relinks to a rewritten target; on the M4 it fails at round 2 with the maintenance left out or
+aimed a line off, and passes with the `IC IVAU`s alone -- the clean stays, for the architecture).
+
+The plan's gate G1 for 0112-0114 together, on top of 0110-0111 (M4, 2026-10-20, a shared machine;
+base and Stage 2 builds interleaved A B B A, six rounds, load 4-24): code 352.06 -> 352.54 B/block
+(+0.14%; `code_size.rs`'s arm64 corpus, 11,007 blocks); translation per block -0.2% (`translate_bench`'s
+first run) and +2.0% (`code_size`'s wall per block), the medians of each round's Stage 2/base ratio
+(rounds ran -4 to +15%: one pair was disturbed); `codegen_bench` calls and returns -0.2% and +0.3%
+(shared handler, 0042's inline one), loads and stores unchanged, `LDXR`+`ADD`+`STXR` +6.5%,
+`MRS TPIDR_EL0`+`LDR` of a TLS slot +14% and `MSR TPIDR_EL0` +7% (0112's loads from the state, a
+third dependent load before the TLS slot's). On an isolated pool (fresh caches, boot, 3 min idle,
+TalkingTomCamp launched, a 140 s window; three runs of each, A B B A then A B, load 2-18): boot 20-22 s
+in both; the system host's CPU to ready 41.3-48.7 s base, 43.3-44.4 Stage 2, over the 3 idle minutes
+33.2-36.8 against 31.1-36.3 s, over the window 55.9-60.0 against 53.4-59.5 s, the app host's
+26.6-32.7 against 30.9-34.9 s; launch 5.6-6.5 s in both; the pool's footprint at the window's end
+3,083-3,330 against 2,991-3,527 MiB; the same crash signatures in every log (none a signal, an ANR
+or a host's death). A 55-minute Stage 2 soak (the APK launched, a second instance of it, the first
+stopped and the APK launched again) ended with both instances running, never restarted, and
+nothing in the device's log or the pool's a 25-minute base soak of the same steps did not show.

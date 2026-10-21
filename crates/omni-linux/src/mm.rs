@@ -78,6 +78,45 @@ fn strict_gap_prefixes() -> &'static [Vec<u8>] {
     })
 }
 
+/// Why a file mapping is a private copy and not a view of the host file (`OMNI_MMAP_COPIES`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyWhy {
+    /// A fixed address that does not agree with its file offset modulo the host page.
+    FixedIncongruent,
+    /// A fixed mapping's first or last host page holds another of the guest's mappings.
+    Neighbours,
+    /// Not an image file (sysroot) nor an installed library.
+    NotImage,
+    /// A read-only `MAP_SHARED` of an instance file the host does not share (an idmap).
+    SharedReadOnly,
+    /// The file's last, partial host page.
+    Tail,
+    /// An in-memory file (`/dev/__properties__`).
+    Synth,
+    /// The host refused the view.
+    Refused,
+}
+
+impl CopyWhy {
+    const fn says(self) -> &'static str {
+        match self {
+            Self::FixedIncongruent => "fixed address incongruent with the offset",
+            Self::Neighbours => "an edge host page holds another mapping",
+            Self::NotImage => "not a sysroot or installed file",
+            Self::SharedReadOnly => "a read-only MAP_SHARED",
+            Self::Tail => "the tail page",
+            Self::Synth => "in-memory file",
+            Self::Refused => "view refused",
+        }
+    }
+}
+
+/// `OMNI_MMAP_COPIES=<KiB>` in bytes, if set.
+fn copies_threshold() -> Option<u64> {
+    static T: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("OMNI_MMAP_COPIES").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|kib| kib << 10))
+}
+
 fn protection(prot: u32) -> Result<Protection, Errno> {
     Ok(match (prot & PROT_READ != 0, prot & PROT_WRITE != 0, prot & PROT_EXEC != 0) {
         // Write and execute together -- ART's JIT code cache when it has no dual view. A device
@@ -114,14 +153,6 @@ impl Mm {
         (v + self.host_page - 1) & !(self.host_page - 1)
     }
 
-    /// Whether a file at `offset` can be a view here: a view is whole host pages at a host-page
-    /// file offset, so the offset -- and, for a fixed address, the address -- must be host-page
-    /// aligned. A 4 KiB-aligned one on a larger host page (a library linked for 4 KiB pages) is a
-    /// private copy instead (D42).
-    fn viewable(&self, offset: u64, addr: u64, fixed: bool) -> bool {
-        offset % self.host_page == 0 && (!fixed || addr % self.host_page == 0)
-    }
-
     /// A shared mapping a host view cannot honour: a *fixed* address that does not agree with its
     /// file offset modulo the host page (a placement we choose is made to agree,
     /// `map_shared_view`). Refused, as sharing a copy would silently not be sharing (D42).
@@ -133,12 +164,37 @@ impl Mm {
         Err(EINVAL)
     }
 
+    /// A view of `viewed` bytes of `backing` from `file_offset`, for a mapping whose host pages come
+    /// to `extent`: placed where all of them are free, so what follows the view -- anonymous past the
+    /// file's end, a copied last page -- has its room. A placement we choose is found by mapping the
+    /// whole extent and giving it back (the layout lock is held, so nothing takes it meanwhile); a
+    /// fixed one's room is the guest's to have made. A view put in a hole that held it and not the
+    /// rest left the rest refused ("already a mapped 4 KiB page") and `dlopen` failing with ENOMEM
+    /// ("shdr mmap failed: Out of memory", M4, 2026-10-20).
+    fn place_view(&self, backing: &Arc<omni_mem::Backing>, file_offset: u64, placement: Placement, viewed: u64, extent: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
+        let placement = match placement {
+            Placement::Fixed(_) => placement,
+            _ if extent <= viewed => placement,
+            _ => {
+                let room = self.space.map_anonymous(placement, extent as usize, Protection::None, CommitPolicy::Lazy)?;
+                self.space.unmap(room, extent as usize)?;
+                Placement::Fixed(room)
+            }
+        };
+        self.space.map_file(backing, file_offset, placement, viewed as usize, prot).map(|a| a as u64)
+    }
+
     /// Map `backed` bytes of `backing` from `req.offset` for a shared mapping of `len` bytes. A view
     /// is whole host pages at a host-page file offset, so the view starts at the host page below the
     /// offset and is placed so the guest's address agrees with the offset modulo the host page (an
     /// FMQ ring, a plane of a graphics buffer, at a 4 KiB offset: D42). The view's parts before the
     /// address and past `len` are given back as 4 KiB holes; anything of `len` past the view is
-    /// anonymous.
+    /// anonymous (where a view cannot run past its file's end, Windows and Linux, and a fixed
+    /// mapping's last host page that another mapping holds). Not placed with room for that part,
+    /// as `place_view` places a private view: it does not follow the file as the file grows, and
+    /// AppSearch's icing, which maps its files larger and grows them, then found its data gone
+    /// ("Array storage bad crc") where the mapping, refused for want of room, had been an error it
+    /// handles ("Could not mmap file for reading: Out of memory", M4, 2026-10-20).
     fn map_shared_view(&self, backing: &Arc<omni_mem::Backing>, req: &MapRequest, placement: Placement, backed: u64, len: u64, prot: Protection) -> Result<u64, omni_mem::MemError> {
         let host = self.host_page;
         let head = req.offset % host;
@@ -150,16 +206,214 @@ impl Mm {
         };
         let base = self.space.map_file(backing, req.offset - head, placement, viewed as usize, prot)? as u64;
         let at = base + head;
-        if head > 0 {
-            self.space.unmap(base as usize, head as usize)?;
-        }
         let from_at = viewed - head;
-        if from_at > len {
-            self.space.unmap((at + len) as usize, (from_at - len) as usize)?;
-        } else if len > from_at {
-            self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), (len - from_at) as usize, prot, CommitPolicy::Lazy)?;
+        let finish = || -> Result<(), omni_mem::MemError> {
+            if head > 0 {
+                self.space.unmap(base as usize, head as usize)?;
+            }
+            if from_at > len {
+                self.space.unmap((at + len) as usize, (from_at - len) as usize)?;
+            } else if len > from_at {
+                self.space.map_anonymous(Placement::Fixed((at + from_at) as usize), (len - from_at) as usize, prot, CommitPolicy::Lazy)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = finish() {
+            // Only what this call mapped: the view's host pages were free (a `MAP_FIXED_NOREPLACE`
+            // whose anonymous rest is taken).
+            let _ = self.space.unmap(base as usize, viewed as usize);
+            return Err(e);
         }
         Ok(at)
+    }
+
+    /// **A private file mapping as a view of the host file**, not a private copy (D42): whole host
+    /// pages from the one below the offset, placed so that the guest's address agrees with the
+    /// offset modulo the host page -- as `map_shared_view` places a shared one -- and the view's
+    /// parts before the address and past `len` given back as 4 KiB holes. Only a host-page offset
+    /// was a view, and framework.jar's dex files sit at 4-byte zip offsets (ART maps each from the
+    /// 4 KiB page below), as does framework-res.apk's resources.arsc: copies of 43 and 17 MiB in
+    /// every Java process (M4, 2026-10-19).
+    ///
+    /// The view reaches the host page holding the mapping's last file byte where the host lets a
+    /// private view end inside a file's last page (`vm::private_view_may_end_in_last_page`); else
+    /// that page is a copy -- before, every view's last partial host page was. Past the file's end
+    /// the mapping is anonymous. A fixed address must agree with the offset already; its first and
+    /// last host pages are the view too where their other parts are free, a never-touched
+    /// `PROT_NONE` reservation's or this file's view at the same offset
+    /// (`GuestSpace::map_file_exact`), and else have their part copied.
+    ///
+    /// `backing` holds the file's byte `x` at `x + shift` (`shifted_backing`; 0 for the file itself).
+    /// `Ok(None)`, nothing changed, when no view can be made: `why` says why. `refused` is the answer
+    /// when a copied edge's memory is refused (`MAP_FIXED_NOREPLACE` over another mapping); what was
+    /// mapped then goes, and nothing that was there before.
+    #[allow(clippy::too_many_arguments)]
+    fn map_private_view(
+        &self,
+        p: &Process,
+        t: &Task,
+        file: &crate::fd::OpenFile,
+        backing: &Arc<omni_mem::Backing>,
+        shift: u64,
+        req: &MapRequest,
+        guest: &[u8],
+        placement: Placement,
+        len: u64,
+        file_len: u64,
+        prot: Protection,
+        why: &mut CopyWhy,
+        refused: Errno,
+    ) -> Result<Option<u64>, Errno> {
+        let host = self.host_page;
+        let head = (req.offset + shift) % host;
+        let avail = file_len.saturating_sub(req.offset);
+        let viewed = if omni_platform::vm::private_view_may_end_in_last_page() {
+            self.round_up_host(head + avail.min(len))
+        } else {
+            ((head + avail) / host * host).min(self.round_up_host(head + len))
+        };
+        if viewed == 0 {
+            *why = CopyWhy::Tail;
+            return Ok(None);
+        }
+        let (base, at, view_len) = match placement {
+            Placement::Fixed(a) => {
+                // Exactly the mapping's part the view covers: its edge host pages are the view too
+                // where they are free, the linker's reservation or this file's neighbouring segment
+                // (`GuestSpace::map_file_exact`); an edge that cannot be is copied below.
+                let a = a as u64;
+                let want = (a - head + viewed).min(a + len) - a;
+                match self.space.map_file_exact(backing, req.offset + shift, a as usize, want as usize, prot) {
+                    Ok((from, n)) if n > 0 => (from as u64, a, n as u64),
+                    Ok(_) => {
+                        *why = CopyWhy::Neighbours;
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
+                        return Ok(None);
+                    }
+                }
+            }
+            placed => {
+                // The hint's own host page: a hint that agrees with the offset is the address got,
+                // and the view never starts below the hint (below 4 GiB for the 4 GiB one, `map`).
+                let placed = match placed {
+                    Placement::Hint { address, align } => Placement::Hint { address: address & !(host as usize - 1), align },
+                    anywhere => anywhere,
+                };
+                match self.place_view(backing, req.offset + shift - head, placed, viewed, self.round_up_host(head + len), prot) {
+                    Ok(base) => (base, base + head, viewed),
+                    Err(e) => {
+                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
+                        return Ok(None);
+                    }
+                }
+            }
+        };
+        let (view_end, end) = (base + view_len, at + len);
+        let mut head_copied = false;
+        let mut finish = || -> Result<(), Errno> {
+            if base < at {
+                self.space.unmap(base as usize, (at - base) as usize).map_err(|_| ENOMEM)?;
+            }
+            if view_end > end {
+                self.space.unmap(end as usize, (view_end - end) as usize).map_err(|_| ENOMEM)?;
+            }
+            if at < base {
+                self.copy_in(p, t, file, req, guest, Placement::Fixed(at as usize), base - at, req.offset, file_len, prot, CopyWhy::Neighbours, refused)?;
+                head_copied = true;
+            }
+            if view_end < end {
+                let why = if view_end < at - head + viewed { CopyWhy::Neighbours } else { CopyWhy::Tail };
+                self.copy_in(p, t, file, req, guest, Placement::Fixed(view_end as usize), end - view_end, req.offset + (view_end - at), file_len, prot, why, refused)?;
+            }
+            Ok(())
+        };
+        if let Err(e) = finish() {
+            // Only what this call mapped: the view's host pages were free, a copied edge is its own.
+            let _ = self.space.unmap(base as usize, view_len as usize);
+            if head_copied {
+                let _ = self.space.unmap(at as usize, (base - at) as usize);
+            }
+            return Err(e);
+        }
+        Ok(Some(at))
+    }
+
+    /// `n` bytes of a file mapping at `placement` as a private copy: anonymous memory, the file's
+    /// bytes from `offset` (to its end) written in, then given the mapping's protection; past the
+    /// file's end, anonymous memory alone. `refused` is the answer when the memory is refused.
+    #[allow(clippy::too_many_arguments)]
+    fn copy_in(
+        &self,
+        p: &Process,
+        t: &Task,
+        file: &crate::fd::OpenFile,
+        req: &MapRequest,
+        guest: &[u8],
+        placement: Placement,
+        n: u64,
+        offset: u64,
+        file_len: u64,
+        prot: Protection,
+        why: CopyWhy,
+        refused: Errno,
+    ) -> Result<u64, Errno> {
+        let bytes = file_len.saturating_sub(offset).min(n);
+        if bytes == 0 {
+            return self.space.map_anonymous(placement, n as usize, prot, CommitPolicy::Lazy).map(|a| a as u64).map_err(|_| refused);
+        }
+        let a = self.space.map_anonymous(placement, n as usize, Protection::ReadWrite, CommitPolicy::Lazy).map_err(|_| refused)? as u64;
+        let filled = (|| {
+            let mut buf = vec![0u8; bytes as usize];
+            let got = crate::fd::pread_all(file, &mut buf, offset)?;
+            p.mem.write_holding_layout(a, &buf[..got])?;
+            self.log_copy(p, t, req, guest, a, got as u64, why);
+            if prot != Protection::ReadWrite {
+                self.space.protect(a as usize, n as usize, prot).map_err(|_| ENOMEM)?;
+            }
+            Ok(())
+        })();
+        if let Err(e) = filled {
+            let _ = self.space.unmap(a as usize, n as usize);
+            return Err(e);
+        }
+        Ok(a)
+    }
+
+    /// **Diagnostic** (`OMNI_MMAP_COPIES=<KiB>`, off by default): a private copy of `copied` file
+    /// bytes at `at` for a file mapping, logged when the host pages it fills come to that much --
+    /// path, offset, length, placement, protection and why it is not a view. Lines start
+    /// `[mm-copy]`; the host pid tells the system's host process from an app's.
+    #[allow(clippy::too_many_arguments)]
+    fn log_copy(&self, p: &Process, t: &Task, req: &MapRequest, guest: &[u8], at: u64, copied: u64, why: CopyWhy) {
+        let Some(threshold) = copies_threshold() else { return };
+        if copied == 0 {
+            return;
+        }
+        let cost = self.round_up_host(at + copied) - (at & !(self.host_page - 1));
+        if cost < threshold {
+            return;
+        }
+        let fixed = req.flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+        // One write: the device's host processes share one log, and a line written in pieces
+        // interleaves with theirs.
+        let line = format!(
+            "[mm-copy] host {} pid {} ({}) {} off {:#x} len {:#x} copied {copied:#x} host {} KiB {} at {at:#x} prot {} flags {:#x}: {}\n",
+            std::process::id(),
+            p.sys.pid,
+            String::from_utf8_lossy(&t.name),
+            String::from_utf8_lossy(guest),
+            req.offset,
+            req.len,
+            cost >> 10,
+            if fixed { "fixed" } else { "placed" },
+            req.prot,
+            req.flags,
+            why.says()
+        );
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
     }
 
     /// `len` rounded up to pages, if `[addr, addr + len)` fits in the 56-bit user address range.
@@ -445,6 +699,12 @@ impl Mm {
                 }
                 _ => copy(data)?,
             }
+            if copies_threshold().is_some() {
+                let from = (req.offset as usize).min(data.len());
+                let bytes = &data[from..from + (len as usize).min(data.len() - from)];
+                let copied = if full_prop_copy() { bytes.len() } else { nonzero_prefix(bytes).len() };
+                self.log_copy(p, t, &req, guest, at, copied as u64, CopyWhy::Synth);
+            }
             if prot != Protection::ReadWrite {
                 self.space.protect(at as usize, len as usize, prot).map_err(|_| ENOMEM)?;
             }
@@ -463,9 +723,21 @@ impl Mm {
         };
         if let Some((host, guest, file_len)) = shared {
             self.refuse_unshareable(p, t, &req, fixed)?;
-            let in_file = self.round_up(file_len.saturating_sub(req.offset)).min(len);
-            // Past the file's end the mapping is anonymous memory, private commit, and stays so when
-            // the file grows (a pool mapped first and grown with ftruncate) -- said, for a large one.
+            // **Past the file's end the view goes on** where the host lets it follow the file as it
+            // grows (`vm::shared_view_may_pass_end_of_file`): a page wholly past the end is the
+            // guest's SIGBUS until the file reaches it (`GuestSpace::past_end_of_file`), then the
+            // file's, as on Linux. AppSearch's icing maps its files at their largest and grows them
+            // with ftruncate: anonymous past the end, what it wrote there never reached the file
+            // ("Array storage bad crc"), and placed for the view alone the rest found no room
+            // ("Could not mmap file for reading: Out of memory", M4, 2026-10-20). An empty file
+            // too: a new trie's array files are mapped while still 0 bytes, and were anonymous for
+            // the whole boot -- the next boot found them all zeros ("bad crc 0 vs 2042943926").
+            let follows = omni_platform::vm::shared_view_may_pass_end_of_file();
+            let to_end = self.round_up(file_len.saturating_sub(req.offset)).min(len);
+            let in_file = if follows { len } else { to_end };
+            // Else past the file's end the mapping is anonymous memory, private commit, and stays so
+            // when the file grows (a pool mapped first and grown with ftruncate) -- said, for a large
+            // one.
             if len - in_file >= 16 << 20 {
                 eprintln!(
                     "[mm] shared {} +{} MiB at offset {:#x}: {} MiB of it past the file's end ({} bytes), anonymous",
@@ -481,7 +753,24 @@ impl Mm {
                     p.refusals.record("mmap: MAP_SHARED of a file the host cannot share".into(), t.pc, t.lr);
                     ENODEV
                 })?;
-                self.map_shared_view(&backing, &req, placement, in_file, len, prot).map_err(|_| refused_fixed(ENOMEM))?
+                match self.map_shared_view(&backing, &req, placement, in_file, len, prot) {
+                    // A fixed one ending inside a host page another mapping holds (a reservation
+                    // around it): a view of that host page is refused, so the view ends at the
+                    // mapping's last whole host page (or the file's last, as before) and the rest
+                    // is anonymous, as where the view does not follow the file. It was EEXIST, an
+                    // answer Linux never gives MAP_FIXED.
+                    Err(omni_mem::MemError::AddressTaken { .. }) if follows && fixed => {
+                        let head = req.offset % self.host_page;
+                        let whole = ((head + len) & !(self.host_page - 1)).saturating_sub(head).max(to_end);
+                        if whole > 0 {
+                            self.map_shared_view(&backing, &req, placement, whole, len, prot)
+                        } else {
+                            self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map(|a| a as u64)
+                        }
+                    }
+                    placed => placed,
+                }
+                .map_err(|_| refused_fixed(ENOMEM))?
             } else {
                 self.space.map_anonymous(placement, len as usize, prot, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64
             };
@@ -512,91 +801,50 @@ impl Mm {
                 req.prot
             );
         }
-        let backing = if in_file == 0 || !self.viewable(req.offset, req.addr, fixed) {
-            None
-        } else if sysroot {
-            Some(p.vfs.sysroot().backing(&guest)?)
-        } else {
-            installed.and_then(|(path, len, modified)| installed_backing(&path, len, modified, &guest))
-        };
-        // **The view covers the file's whole pages only.** A read-only view may not run past the
-        // file's last byte, and a file's size is rarely a whole number of pages: the rounded-up
-        // request was refused, and every such mapping -- ICU's data, fonts, APKs, vdex files, in
-        // every process -- fell back to a private copy of all of it (26 MiB of ICU data twice in
-        // each app process, run 2026-09-29). Now the whole pages are the view and only the last,
-        // partial page is a private copy (below).
-        // Whole *host* pages: what a view can be (D42).
-        let whole = (file_len.saturating_sub(req.offset) / self.host_page * self.host_page).min(len / self.host_page * self.host_page);
-        let at = if let (Some(backing), true) = (backing, whole > 0) {
-            if whole == in_file {
-                match self.space.map_file(&backing, req.offset, placement, in_file as usize, prot) {
-                    Ok(a) => Some(a as u64),
-                    Err(e) => {
-                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
-                        None
-                    }
-                }
+        // A view starts at the host page below the offset: a placement we choose is made to agree
+        // with the offset modulo the host page (`map_private_view`), a fixed one must already -- or
+        // is a view of the file moved on by the difference (`shifted_backing`).
+        let shift = if fixed { req.addr.wrapping_sub(req.offset) % self.host_page } else { 0 };
+        let (backing, mut why) = if in_file == 0 {
+            (None, CopyWhy::Tail)
+        } else if shift != 0 {
+            // An installed package's libraries, not its APK: a whole APK moved on for one library in
+            // it would be hundreds of MiB written for a few.
+            let source = if sysroot {
+                p.vfs.sysroot().host_path(&guest).zip(p.vfs.sysroot().content_key(&guest))
             } else {
-                // Room for all of it, the tail filled from the file, then the view over the head.
-                let a = self.space.map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy).map_err(|_| refused_fixed(ENOMEM))? as u64;
-                let tail = in_file.min(file_len.saturating_sub(req.offset)).saturating_sub(whole);
-                let mut buf = vec![0u8; tail as usize];
-                let n = crate::fd::pread_all(&file, &mut buf, req.offset + whole)?;
-                p.mem.write_holding_layout(a + whole, &buf[..n])?;
-                // `Fixed` does not replace: the head's anonymous pages go first (the layout lock is
-                // held, so nothing else takes the hole).
-                self.space.unmap(a as usize, whole as usize).map_err(|_| ENOMEM)?;
-                match self.space.map_file(&backing, req.offset, Placement::Fixed(a as usize), whole as usize, prot) {
-                    Ok(_) => {
-                        if prot != Protection::ReadWrite {
-                            self.space.protect((a + whole) as usize, (len - whole) as usize, prot).map_err(|_| ENOMEM)?;
-                        }
-                        self.forget(a, len);
-                        self.files.lock().insert(a, FileMapping { len, guest: guest.clone(), offset: req.offset });
-                        return Ok(a);
-                    }
-                    Err(e) => {
-                        tracing::debug!(%e, "a file view could not be made; mapping a private copy");
-                        let _ = self.space.unmap(a as usize, len as usize);
-                        None
-                    }
-                }
+                installed.as_ref().filter(|_| guest.ends_with(b".so")).map(|(path, len, modified)| (path.clone(), installed_key(path, *len, *modified)))
+            };
+            match source.and_then(|(path, key)| shifted_backing(&path, &key, shift, &guest, p.vfs.sysroot())) {
+                Some(b) => (Some(b), CopyWhy::Refused),
+                None => (None, CopyWhy::FixedIncongruent),
             }
+        } else if sysroot {
+            (Some(p.vfs.sysroot().backing(&guest)?), CopyWhy::Refused)
+        } else if let Some((path, len, modified)) = installed {
+            (installed_backing(&path, len, modified, &guest), CopyWhy::Refused)
         } else {
-            None
+            (None, if req.flags & MAP_SHARED != 0 { CopyWhy::SharedReadOnly } else { CopyWhy::NotImage })
         };
-        let label = |at: u64| {
-            self.forget(at, len);
-            self.files.lock().insert(at, FileMapping { len, guest: guest.clone(), offset: req.offset });
+        // **The view runs to the file's last byte** where the host allows it. A read-only view could
+        // not run past it, and a file's size is rarely a whole number of pages: every such mapping
+        // -- ICU's data, fonts, APKs, vdex files, in every process -- was once a private copy of all
+        // of it (26 MiB of ICU data twice in each app process, run 2026-09-29), then a view of its
+        // whole host pages and a copy of the last, partial one (`map_private_view`).
+        let at = match backing {
+            Some(backing) => self.map_private_view(p, t, &file, &backing, shift, &req, &guest, placement, len, file_len, prot, &mut why, refused_fixed(ENOMEM))?,
+            None => None,
         };
         if crate::boot_image::enabled() && crate::boot_image::is_boot_art(&guest) {
             report_boot_image(p, &file, &guest, at.is_some(), at.unwrap_or(0), len, req.offset);
         }
         let at = match at {
-            Some(a) => {
-                if len > in_file {
-                    self.space
-                        .map_anonymous(Placement::Fixed((a + in_file) as usize), (len - in_file) as usize, prot, CommitPolicy::Lazy)
-                        .map_err(|_| ENOMEM)?;
-                }
-                a
-            }
-            None => {
-                // A private copy: anonymous read-write, filled from the file, then protected.
-                let a = self
-                    .space
-                    .map_anonymous(placement, len as usize, Protection::ReadWrite, CommitPolicy::Lazy)
-                    .map_err(|_| refused_fixed(ENOMEM))? as u64;
-                let mut buf = vec![0u8; in_file.min(file_len - req.offset.min(file_len)) as usize];
-                let n = crate::fd::pread_all(&file, &mut buf, req.offset)?;
-                p.mem.write_holding_layout(a, &buf[..n])?;
-                if prot != Protection::ReadWrite {
-                    self.space.protect(a as usize, len as usize, prot).map_err(|_| ENOMEM)?;
-                }
-                a
-            }
+            Some(a) => a,
+            // A private copy: anonymous read-write, filled from the file, then protected.
+            None => self.copy_in(p, t, &file, &req, &guest, placement, len, req.offset, file_len, prot, why, refused_fixed(ENOMEM))?,
         };
-        label(at);
+        self.forget(at, len);
+        self.files.lock().insert(at, FileMapping { len, guest, offset: req.offset });
         Ok(at)
     }
 }
@@ -608,14 +856,20 @@ impl Mm {
 /// app's host process, run 2026-09-28). A write to such a mapping is copy-on-write, as a private
 /// mapping's is.
 ///
-/// Only those: a host file with a live view cannot be renamed or deleted on Windows, and installd
+/// Only those where a host file with a live view cannot be renamed or deleted (Windows): installd
 /// renames an install's staging directory (`vmdl*.tmp`) after PackageManager has parsed the APK in
 /// it (`INSTALL_FAILED_INSUFFICIENT_STORAGE: Failed to rename`, run 2026-09-29, when every
 /// `/data/app` file was a view). A library is mapped by its app alone, which is gone before its
-/// package is.
+/// package is. Where a view does not pin its file (`vm::mapped_file_may_be_renamed`: Linux,
+/// macOS), every file of an installed package is one -- its APK above all, which the app's
+/// AssetManager maps an asset at a time: TalkingTomCamp's base.apk 2190 times in 3 minutes, 807 MiB
+/// of private copies (M4, `OMNI_MMAP_COPIES`, 2026-10-20).
 fn is_installed(guest: &[u8]) -> bool {
     let path = String::from_utf8_lossy(guest);
-    path.starts_with("/data/app/") && path.contains("/lib/") && path.ends_with(".so") && !path.contains(".tmp/")
+    if !path.starts_with("/data/app/") {
+        return false;
+    }
+    omni_platform::vm::mapped_file_may_be_renamed() || (path.contains("/lib/") && path.ends_with(".so") && !path.contains(".tmp/"))
 }
 
 /// `[bootimage]`: how a boot image file was mapped (`OMNI_BOOT_IMAGE_UNCOMPRESSED`) -- a view
@@ -686,8 +940,229 @@ fn installed_backing(path: &std::path::Path, len: u64, modified: Option<std::tim
         }
     }
     let backing = omni_mem::Backing::open_named(path, omni_mem::MapExecutability::Executable, &String::from_utf8_lossy(guest)).ok()?;
+    // Opened by name: the file there now must be the one the guest holds (same size and time), not
+    // another put in its place since -- else a copy of the guest's.
+    let meta = std::fs::metadata(path).ok()?;
+    if backing.len() != len || meta.len() != len || meta.modified().ok() != modified {
+        return None;
+    }
     cache.insert(path.to_path_buf(), (len, modified, Arc::downgrade(&backing)));
     Some(backing)
+}
+
+/// **A file moved on by `shift` bytes** -- `shift` zero bytes, then the file -- for a mapping the
+/// guest fixes at an address that does not agree with its file offset modulo the host page: in this
+/// file the offset agrees, so its whole host pages are a view (D42) instead of a private copy.
+/// bionic's dynamic linker starts each library at a random multiple of the guest's 4 KiB page in
+/// its reservation (`ReserveWithAlignmentPadding`'s `start_align` is `page_size()`), so on a 16 KiB
+/// host three loads in four disagree: their segments were copies, 1.9 GiB of them in the system's
+/// host process and 4.7 GiB in its app hosts by the end of a boot and a launch, the system host's
+/// 229 MiB of private `r-x` among them (M4, `OMNI_MMAP_COPIES`, 2026-10-19).
+///
+/// The file moved on is made once per host and shift, beside the decompressed APEXes
+/// (`<temp>/omni-shifted/<key>-<shift>`, `Sysroot::shifted_dir`; written aside and put in place,
+/// `publish_aside`), and shared by every process mapping it there -- at most three per file on a
+/// 16 KiB host: 1337 files, 473 MiB, after a boot and a launch (2026-10-20). Each host process's
+/// first use touches it, and the first use of these in a host process sweeps what nothing will open
+/// again ([`sweep`]). `key` names the content: an image file's sha256; an installed library's path,
+/// size and time, which every Android user's instance of the app shares (one `/data/app` path per
+/// device) and a reinstall changes. An installed one was written by each app host for itself and
+/// unlinked once open: TalkingTomCamp's 16 MiB library again at every launch of each instance, a
+/// page-cache copy no other host shared (M4, 2026-10-20).
+fn shifted_backing(source: &std::path::Path, key: &str, shift: u64, guest: &[u8], sysroot: &crate::vfs::Sysroot) -> Option<Arc<omni_mem::Backing>> {
+    type Cache = std::collections::HashMap<(String, u64), Arc<omni_mem::Backing>>;
+    static CACHE: std::sync::OnceLock<Mutex<Cache>> = std::sync::OnceLock::new();
+    let dir = sysroot.shifted_dir().to_path_buf();
+    let mut cache = CACHE
+        .get_or_init(|| {
+            let current = sysroot.content_keys();
+            sweep(&dir, |key| current.contains(key), STALE);
+            Mutex::default()
+        })
+        .lock();
+    if let Some(b) = cache.get(&(key.to_string(), shift)) {
+        return Some(Arc::clone(b));
+    }
+    let path = dir.join(format!("{key}-{shift:x}"));
+    let want = std::fs::metadata(source).ok()?.len() + shift;
+    let named = |at: &std::path::Path| omni_mem::Backing::open_named(at, omni_mem::MapExecutability::Executable, &String::from_utf8_lossy(guest)).ok();
+    // A whole one there -- another host process's, or an earlier boot's -- touched for `sweep`; one
+    // swept away meanwhile is written again.
+    let there = std::fs::metadata(&path).map(|m| m.len()).ok() == Some(want);
+    let backing = match there.then(|| touch(&path)).and_then(|()| named(&path)) {
+        Some(b) => b,
+        None => {
+            std::fs::create_dir_all(&dir).ok()?;
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+            let aside = dir.join(format!("{key}-{shift:x}.{}-{nanos}.tmp", std::process::id()));
+            let written = (|| -> std::io::Result<()> {
+                let mut out = std::fs::File::create(&aside)?;
+                std::io::Write::write_all(&mut out, &vec![0u8; shift as usize])?;
+                std::io::copy(&mut std::fs::File::open(source)?, &mut out)?;
+                publish_aside(&aside, &path, want)
+            })();
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&aside);
+                tracing::debug!(%e, "a shifted file could not be made; mapping a private copy");
+                return None;
+            }
+            named(&path)?
+        }
+    };
+    cache.insert((key.to_string(), shift), Arc::clone(&backing));
+    Some(backing)
+}
+
+/// How long a shifted file no host process has opened may stay when its content is in no file of
+/// the sysroot this one runs ([`sweep`]).
+const STALE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Mark a shifted file used now: what [`sweep`] reads its age from. Opened for writing, the access
+/// that carries the right to change its times on Windows as on POSIX.
+fn touch(path: &std::path::Path) {
+    let _ = std::fs::OpenOptions::new().write(true).open(path).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+}
+
+/// The file written at `aside` put at `path` only if no file of `want` bytes is there: linked, then
+/// the aside name removed. Host processes that start together on a cold cache race for the same
+/// files, and each opens the one that got there first -- renamed into place, a process's own file
+/// was replaced under it by a later one's and held unlinked for its whole life: a page-cache copy
+/// no later process shared, its disk space kept. One there of another length, or a file system
+/// with no links: replaced.
+fn publish_aside(aside: &std::path::Path, path: &std::path::Path, want: u64) -> std::io::Result<()> {
+    match std::fs::hard_link(aside, path) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists || std::fs::metadata(path).map(|m| m.len()).ok() != Some(want) => std::fs::rename(aside, path),
+        _ => {
+            let _ = std::fs::remove_file(aside);
+            Ok(())
+        }
+    }
+}
+
+/// **What `dir` holds that nothing will open by name again**, removed by each host process before
+/// its first shifted file ([`shifted_backing`]):
+/// * an aside file (`<key>-<shift>.<pid>-<nanos>.tmp`) whose writer is no longer alive -- a live
+///   one's is being written. Its name is new each time and nothing else would remove it;
+/// * a shifted file (`<key>-<shift>`) whose content (`key`) is in no file of the sysroot this
+///   process runs (`current`), and that no host process has opened for `stale` ([`touch`]). A new
+///   sysroot left the old one's for good (~470 MiB a sysroot on a 16 KiB host, 2026-10-20), and an
+///   installed library's key is never a sysroot's: it goes once its app has not run for `stale`.
+///
+/// That cannot take a file a live process opens by name next: a host process of this sysroot opens
+/// only `current` keys, and one of another sysroot still in use touches each file it opens, so what
+/// goes is what nothing opened for `stale` -- and one opening such a file just as it goes writes it
+/// again. Removing a file a live view maps is safe where this runs (a view holds the file, not its
+/// name: Linux, macOS; on Windows the host page is 4 KiB and nothing is shifted).
+fn sweep(dir: &std::path::Path, current: impl Fn(&str) -> bool, stale: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let now = std::time::SystemTime::now();
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let gone = match name.strip_suffix(".tmp") {
+            Some(aside) => aside
+                .rsplit_once('.')
+                .and_then(|(_, n)| n.split('-').next()?.parse::<u32>().ok())
+                .is_some_and(|pid| !omni_platform::process::is_alive(pid)),
+            None => {
+                name.rsplit_once('-').is_some_and(|(key, _)| !current(key))
+                    && e.metadata().and_then(|m| m.modified()).ok().and_then(|m| now.duration_since(m).ok()).is_some_and(|age| age > stale)
+            }
+        };
+        if gone {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod shifted_tests {
+    use super::{publish_aside, sweep, STALE};
+
+    /// A scratch directory, removed however the test ends.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn scratch(name: &str) -> Scratch {
+        let dir = std::env::temp_dir().join(format!("omni-shifted-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Scratch(dir)
+    }
+
+    /// Put in place where nothing is; a whole one already there (another host process's, which it
+    /// maps) kept; one of another length replaced. The aside name goes each time.
+    #[test]
+    fn an_aside_file_replaces_no_whole_one() {
+        let scratch = scratch("publish");
+        let dir = &scratch.0;
+        let (aside, path) = (dir.join("k-1000.1-2.tmp"), dir.join("k-1000"));
+        std::fs::write(&aside, b"first").unwrap();
+        publish_aside(&aside, &path, 5).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        assert!(!aside.exists());
+        std::fs::write(&aside, b"later").unwrap();
+        publish_aside(&aside, &path, 5).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first", "the one there first stays");
+        assert!(!aside.exists());
+        std::fs::write(&path, b"torn").unwrap();
+        std::fs::write(&aside, b"whole").unwrap();
+        publish_aside(&aside, &path, 5).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"whole", "another length is replaced");
+        assert!(!aside.exists());
+    }
+
+    /// A dead writer's aside file goes (no host gives out pid 2^31 - 1); a live one's, a published
+    /// file and any other name stay.
+    #[test]
+    fn a_dead_writers_aside_file_is_swept() {
+        let scratch = scratch("sweep");
+        let dir = &scratch.0;
+        let dead = format!("k-1000.{}-7.tmp", i32::MAX);
+        let live = format!("k-1000.{}-8.tmp", std::process::id());
+        let kept = [live.as_str(), "k-1000", "k-2000.x-1.tmp", "k-3000.tmp"];
+        for n in kept.iter().copied().chain([dead.as_str()]) {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        sweep(dir, |_| false, STALE);
+        assert!(!dir.join(&dead).exists());
+        for n in kept {
+            assert!(dir.join(n).exists(), "{n}");
+        }
+    }
+
+    /// A shifted file of content no file of this sysroot has goes once nothing has opened it for
+    /// the stale time; the current sysroot's stay however old, and so does a recent one of another.
+    #[test]
+    fn another_sysroots_unused_shifted_files_are_swept() {
+        let scratch = scratch("stale");
+        let dir = &scratch.0;
+        for n in ["cur-1000", "old-2000", "new-3000"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - 2 * STALE;
+        for n in ["cur-1000", "old-2000"] {
+            std::fs::OpenOptions::new().write(true).open(dir.join(n)).unwrap().set_modified(long_ago).unwrap();
+        }
+        sweep(dir, |key| key == "cur", STALE);
+        assert!(dir.join("cur-1000").exists(), "this sysroot's, however old");
+        assert!(!dir.join("old-2000").exists(), "another's, unused for the stale time");
+        assert!(dir.join("new-3000").exists(), "another's, used lately");
+        super::touch(&dir.join("cur-1000"));
+        let age = std::fs::metadata(dir.join("cur-1000")).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        assert!(age < STALE, "touched: used now");
+    }
+}
+
+/// [`shifted_backing`]'s key for an installed library: its host path, size and time, hashed.
+fn installed_key(path: &std::path::Path, len: u64, modified: Option<std::time::SystemTime>) -> String {
+    use sha2::Digest;
+    let stamp = modified.and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    format!("{:x}", sha2::Sha256::digest(format!("{}\0{len}\0{stamp}", path.display()).as_bytes()))
 }
 
 fn sys_mmap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
@@ -960,7 +1435,7 @@ fn mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
     // In pieces: a committed run may be a GC space of hundreds of MiB.
     const PIECE: u64 = 16 << 20;
     let held: Vec<(u64, u64)> = space.held_ranges(old as usize, keep as usize).into_iter().map(|(s, n)| (s as u64, (s + n) as u64)).collect();
-    for (start, end) in held {
+    let copied = held.into_iter().try_for_each(|(start, end)| {
         let mut done = start;
         while done < end {
             let n = (end - done).min(PIECE);
@@ -968,6 +1443,15 @@ fn mremap(p: &Process, t: &mut Task, a: [u64; 6]) -> SysResult {
             p.mem.write(at + (done - old), &bytes)?;
             done += n;
         }
+        Ok::<(), Errno>(())
+    });
+    if let Err(e) = copied {
+        // The new range goes with the call, and the old one gets its protection back.
+        let _ = p.mm.unmap(at, new_len);
+        if prot == Protection::None || prot == Protection::ReadExecute {
+            let _ = p.mm.protect(old, keep, prot_bits(prot));
+        }
+        return Err(e);
     }
     if prot != Protection::ReadWrite {
         p.mm.protect(at, new_len, prot_bits(prot))?;

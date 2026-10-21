@@ -23,10 +23,16 @@ public:
     explicit A64AddressSpace(const A64::UserConfig& conf);
 
     IR::Block GenerateIR(IR::LocationDescriptor) const override;
+    // Omnidroid patch 0113: translated on the thread whose config `translator` is, whose callbacks
+    // read the guest's code; see the definition.
+    IR::Block GenerateIR(IR::LocationDescriptor descriptor, const A64::UserConfig& translator) const;
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 
     void ClearCache() override;
+
+    // Omnidroid patch 0107: see the definition.
+    void OdGiveBackTables();
 
 protected:
     friend class A64Core;
@@ -64,6 +70,12 @@ protected:
     // one lookup per 4 KiB page, on every guest thread it is broadcast to.
     static constexpr unsigned guest_chunk_bits = 21;
     tsl::robin_set<u64> guest_range_chunks;
+
+    // Omnidroid patch 0107: the guest-range index given back (`ClearCache`, `OdGiveBackTables`); the
+    // indices in its page lists, counted for `OdNoteTableBytes`, which stores what every table holds.
+    void OdDropGuestRanges();
+    u64 od_guest_page_indices = 0;
+    void OdNoteTableBytes();
 };
 
 }  // namespace Dynarmic::Backend::Arm64

@@ -64,14 +64,34 @@ fn device_state(s: &DeviceState) -> (String, Color) {
     }
 }
 
-fn instance_state(s: &InstanceState) -> (String, Color) {
-    match s {
+/// A restart's countdown as its row says it, as the card counts (`omni_pool`'s `countdown_line`):
+/// whole seconds rounded up (5, 4, 3, 2, 1), then `now` -- its relaunch waiting for the stop of its
+/// app or the device's turn, which `0 s` said for as long as that took.
+fn restart_text(left: Option<Duration>) -> String {
+    match left {
+        None => "restarting".into(),
+        Some(t) if t.is_zero() => "restarting now".into(),
+        Some(t) => format!("restarting in {} s", t.as_secs_f64().ceil() as u64),
+    }
+}
+
+/// An instance's state as its row says it: a restart's countdown, and -- unless it ended -- `auto`
+/// when its app starts again after a crash, and how many restarts so far.
+fn instance_state(i: &InstanceInfo) -> (String, Color) {
+    let (state, color) = match &i.state {
         InstanceState::Waiting => ("waiting for its Android".into(), Color::Yellow),
         InstanceState::Installing => ("installing".into(), Color::Yellow),
         InstanceState::Starting => ("starting".into(), Color::Yellow),
         InstanceState::Running => ("running".into(), Color::Green),
         InstanceState::Closing => ("closing".into(), Color::DarkGray),
-        InstanceState::Ended(why) => (format!("ended: {why}"), Color::DarkGray),
+        InstanceState::Restarting => (restart_text(i.restart_in), Color::Yellow),
+        InstanceState::Ended(why) => return (format!("ended: {why}"), Color::DarkGray),
+    };
+    let tags: Vec<String> = i.auto_restart.then(|| "auto".to_string()).into_iter().chain((i.restarts > 0).then(|| format!("{} restart{}", i.restarts, if i.restarts == 1 { "" } else { "s" }))).collect();
+    if tags.is_empty() {
+        (state, color)
+    } else {
+        (format!("{state} ({})", tags.join(", ")), color)
     }
 }
 
@@ -267,7 +287,7 @@ impl App {
         let shown = log.height.saturating_sub(2) as usize;
         let text: Vec<Line> = lines[lines.len().saturating_sub(shown)..].iter().map(|l| Line::raw(l.clone())).collect();
         f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL).title(" Log ")).wrap(Wrap { trim: false }), log);
-        let hint = if self.quit_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) { " quit again to stop everything " } else { " run <apk> [xN] | close #id | warm | kill D# | plugins | settings | mcp | help " };
+        let hint = if self.quit_asked.is_some_and(|t| t.elapsed() < Duration::from_secs(10)) { " quit again to stop everything " } else { " run <apk> [xN] | close #id | restart #id | warm | kill D# | plugins | settings | mcp | help " };
         f.render_widget(Paragraph::new(format!("> {}", self.input)).block(Block::default().borders(Borders::ALL).title(hint)), input);
         f.set_cursor_position((input.x + 3 + self.input.chars().count() as u16, input.y + 1));
     }
@@ -299,7 +319,7 @@ impl App {
 
     fn draw_instances(&mut self, f: &mut Frame, area: Rect, instances: &[InstanceInfo]) {
         let rows = instances.iter().map(|i| {
-            let (state, color) = instance_state(&i.state);
+            let (state, color) = instance_state(i);
             Row::new(vec![
                 Cell::from(format!("#{}", i.id)),
                 Cell::from(i.package.clone()),
@@ -352,7 +372,8 @@ mod tests {
     fn the_screen_shows_the_panels_the_log_and_the_prompt() {
         let mut config = omni_pool::Config::default();
         config.warm_on_start = false;
-        let pool = omni_pool::Pool::start(config, None, std::path::PathBuf::from("omnidroid"));
+        // Adopting none: the person's own pool keeps its devices and windows.
+        let pool = omni_pool::Pool::start_alone(config, None, std::path::PathBuf::from("omnidroid"));
         pool.say("hello from the pool");
         let host = super::super::host::Host::new(std::sync::Arc::clone(&pool));
         let control = omni_mcp::http::serve(0, std::sync::Arc::clone(&host)).unwrap();
@@ -373,6 +394,33 @@ mod tests {
         assert!(app.client.log.last().unwrap().contains("unknown command"));
         control.stop();
         pool.shutdown(false);
+    }
+
+    #[test]
+    fn a_restart_counts_down_and_auto_restart_is_marked() {
+        let i = InstanceInfo {
+            id: 3,
+            device: 1,
+            package: "p".into(),
+            sha256: "s".into(),
+            apk: std::path::PathBuf::from("/a.apk"),
+            user: Some(10),
+            display: Some(2),
+            screenshot: None,
+            state: InstanceState::Restarting,
+            up_for: Duration::from_secs(9),
+            details: Vec::new(),
+            auto_restart: true,
+            restarts: 1,
+            restart_in: Some(Duration::from_millis(2300)),
+        };
+        assert_eq!(instance_state(&i).0, "restarting in 3 s (auto, 1 restart)");
+        let done = InstanceInfo { restart_in: Some(Duration::ZERO), ..i.clone() };
+        assert_eq!(instance_state(&done).0, "restarting now (auto, 1 restart)", "its countdown done, its relaunch waiting: never 0 s");
+        let i = InstanceInfo { state: InstanceState::Running, auto_restart: false, restarts: 0, restart_in: None, ..i };
+        assert_eq!(instance_state(&i).0, "running");
+        let i = InstanceInfo { state: InstanceState::Ended("closed".into()), auto_restart: true, ..i };
+        assert_eq!(instance_state(&i).0, "ended: closed", "an ended one's setting is no matter");
     }
 
     #[test]

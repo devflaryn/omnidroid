@@ -1,0 +1,310 @@
+diff -ru a/src/dynarmic/backend/arm64/address_space.cpp b/src/dynarmic/backend/arm64/address_space.cpp
+--- a/src/dynarmic/backend/arm64/address_space.cpp
++++ b/src/dynarmic/backend/arm64/address_space.cpp
+@@ -4,6 +4,8 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
++#include <atomic>
+ #include <cstdio>
+ #include <limits>
+ 
+@@ -531,38 +533,121 @@
+             c.NOP();
+         }
+         break;
+-    case BlockRelocationType::MoveToScratch1:
+-        if (target_ptr) {
+-            c.ADRL(Xscratch1, (void*)target_ptr);
+-        } else {
+-            c.ADRL(Xscratch1, prelude_info.return_to_dispatcher);
+-        }
++    case BlockRelocationType::MoveToScratch1: {
++        // Omnidroid patch 0114: the return-stack slot `PushRSB` loads -- data after the block's
++        // deferred code, never executed -- in one aligned 64-bit store, which a load sees whole: the
++        // old value or the new. No instruction changes, so nothing to make visible to instruction
++        // fetch. Unlinked, it holds the dispatcher, as the pin's `ADRL` did.
++        auto* const slot = reinterpret_cast<u64*>(entry_point + ptr_offset);
++        ASSERT(reinterpret_cast<std::uintptr_t>(slot) % 8 == 0);
++        const u64 value = target_ptr ? mcl::bit_cast<u64>(target_ptr) : mcl::bit_cast<u64>(prelude_info.return_to_dispatcher);
++        std::atomic_ref<u64>{*slot}.store(value, std::memory_order_release);
+         break;
++    }
+     default:
+         ASSERT_FALSE("Invalid BlockRelocationType");
+     }
+ }
+ 
++namespace {
++
++// Omnidroid patch 0114: the branch words a relink rewrote, made visible to instruction fetch a
++// batch at a time. Each word is maintained by its own address: `DC CVAU` and `IC IVAU` act on the
++// whole cache line holding the address, and an aligned 4-byte word never straddles a line, so no
++// line size is read or assumed -- `CTR_EL0` traps at EL0 on macOS (oaknut's `invalidate` reads it
++// on other systems). The architecture's order: every clean, `DSB ISH` (the cleans reach the point of
++// unification before any invalidate can let a refetch in), every invalidate, `DSB ISH`, then `ISB`
++// for this thread's own pipeline -- the thread that runs the cache's code next. Batched where it was
++// measured, macOS on Apple silicon (M4, 2026-10-20, a probe of scattered words with the W^X toggle:
++// one link to a target ~150 ns either way, the fences dominating; 4 links 47 against 140 ns a link,
++// 32 links 10.5 against 132, against `sys_icache_invalidate` of 325-byte blocks); elsewhere
++// oaknut's `invalidate` (the `CTR_EL0` loop on Linux, `FlushInstructionCache` on Windows) of each
++// word, as the tree maintained whole blocks.
++class OdLinkWords {
++public:
++    OdLinkWords(oaknut::CodeBlock& mem, u64& maintained)
++            : mem{mem}, maintained{maintained} {}
++
++    void Add(CodePtr word) {
++        if (count == words.size()) {
++            Sync();
++        }
++        words[count++] = word;
++    }
++
++    void Sync() {
++        if (count == 0) {
++            return;
++        }
++#if defined(__APPLE__) && defined(__aarch64__)
++        for (std::size_t i = 0; i < count; i++) {
++            asm volatile("dc cvau, %0" : : "r"(words[i]) : "memory");
++        }
++        asm volatile("dsb ish" : : : "memory");
++        for (std::size_t i = 0; i < count; i++) {
++            asm volatile("ic ivau, %0" : : "r"(words[i]) : "memory");
++        }
++        asm volatile("dsb ish\n\tisb" : : : "memory");
++#else
++        for (std::size_t i = 0; i < count; i++) {
++            mem.invalidate(reinterpret_cast<u32*>(words[i]), sizeof(u32));
++        }
++#endif
++        maintained += count * sizeof(u32);
++        count = 0;
++    }
++
++private:
++    [[maybe_unused]] oaknut::CodeBlock& mem;  // the fallback's (not the batched path's)
++    u64& maintained;
++    std::array<CodePtr, 32> words;
++    std::size_t count = 0;
++};
++
++}  // namespace
++
+ void AddressSpace::RelinkForDescriptor(IR::LocationDescriptor target_descriptor, CodePtr target_ptr) {
+-    // Omnidroid patch 0010: every block that links to `target_descriptor` -- the pin's
+-    // `block_references[target_descriptor]` -- relinks its links to it and is invalidated once.
++    // Omnidroid patch 0010: every link to `target_descriptor` -- the pin's
++    // `block_references[target_descriptor]` -- relinked.
++    // Omnidroid patch 0114: and only the words rewritten are maintained -- each `B`/`NOP` word, not
++    // the linking block whole (`sys_icache_invalidate` of every block, a line at a time); a slot is
++    // data and needs none. Nothing else in a block changes when it is linked or unlinked.
+     const auto head = link_heads.find(target_descriptor);
+     if (head == link_heads.end()) {
+         return;
+     }
+-    u32 index = head->second;
+-    while (index != no_link) {
+-        const u32 block_index = link_records[index].block;
+-        const BlockRecord& block = block_records[block_index];
+-        do {
+-            const LinkRecord& link = link_records[index];
+-            ASSERT(link.target == target_descriptor);
+-            LinkBlockLink(block.entry_point, target_ptr, BlockRelocation{link.offset, link.type});
+-            index = link.next;
+-        } while (index != no_link && link_records[index].block == block_index);
++    OdLinkWords words{mem, od_relink_maintained};
++    for (u32 index = head->second; index != no_link;) {
++        const LinkRecord& link = link_records[index];
++        ASSERT(link.target == target_descriptor);
++        const CodePtr entry_point = block_records[link.block].entry_point;
++        LinkBlockLink(entry_point, target_ptr, BlockRelocation{link.offset, link.type});
++        if (link.type == BlockRelocationType::Branch) {
++            words.Add(entry_point + link.offset);
++        }
++        index = link.next;
++    }
++    words.Sync();
++}
+ 
+-        mem.invalidate(reinterpret_cast<u32*>(block.entry_point), block.size);
++// Omnidroid patch 0114: see `Jit::OdBlockLinks`. A test hook: the walk over every link record is
++// linear.
++CodePtr AddressSpace::OdBlockLinks(IR::LocationDescriptor location, u32& host_bytes, OdLinkVisitor fn, void* ctx) const {
++    host_bytes = 0;
++    const auto iter = block_entries.find(location);
++    if (iter == block_entries.end()) {
++        return nullptr;
+     }
++    const BlockRecord* record = FindBlockRecord(iter->second);
++    ASSERT(record && record->entry_point == iter->second);
++    const auto block_index = static_cast<u32>(record - block_records.data());
++    host_bytes = record->size;
++    for (const LinkRecord& link : link_records) {
++        if (link.block == block_index) {
++            fn(ctx, link.offset, link.type == BlockRelocationType::Branch ? 0 : 1);
++        }
++    }
++    return record->entry_point;
+ }
+ 
+ FakeCall AddressSpace::FastmemCallback(u64 host_pc) {
+diff -ru a/src/dynarmic/backend/arm64/address_space.h b/src/dynarmic/backend/arm64/address_space.h
+--- a/src/dynarmic/backend/arm64/address_space.h
++++ b/src/dynarmic/backend/arm64/address_space.h
+@@ -148,10 +148,20 @@
+         od_emit_hook_ctx = ctx;
+         od_emit_hook = fn;
+     }
++
++    // Omnidroid patch 0114, a test hook (`Jit::OdBlockLinks`): the block held for `location` (null
++    // if none) and its size, and each of its link sites, `fn(ctx, offset, kind)` -- kind 0 a branch
++    // word, 1 a return-stack slot; what an unlinked slot holds; and the bytes of code relinks have
++    // handed to instruction-cache maintenance. On the owning thread, outside a run.
++    using OdLinkVisitor = void (*)(void* ctx, std::uint32_t offset, std::uint32_t kind);
++    CodePtr OdBlockLinks(IR::LocationDescriptor location, u32& host_bytes, OdLinkVisitor fn, void* ctx) const;
++    void* OdUnlinkedSlot() const { return prelude_info.return_to_dispatcher; }
++    u64 OdRelinkMaintained() const { return od_relink_maintained; }
+ 
+ protected:
+     OdBlockVisitor od_emit_hook = nullptr;
+     void* od_emit_hook_ctx = nullptr;
++    u64 od_relink_maintained = 0;  // patch 0114
+ 
+     oaknut::CodeBlock mem;
+     oaknut::CodeGenerator code;
+diff -ru a/src/dynarmic/backend/arm64/emit_arm64.cpp b/src/dynarmic/backend/arm64/emit_arm64.cpp
+--- a/src/dynarmic/backend/arm64/emit_arm64.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64.cpp
+@@ -200,7 +200,7 @@
+ 
+     FpsrManager fpsr_manager{code, conf.state_fpsr_offset};
+     RegAlloc reg_alloc{code, fpsr_manager, std::span<const int>{GPR_ORDER.begin(), GPR_ORDER.size()}, std::span<const int>{FPR_ORDER.begin(), FPR_ORDER.size()}};
+-    EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}};
++    EmitContext ctx{block, reg_alloc, conf, ebi, fpsr_manager, fastmem_manager, {}, {}};
+ 
+     ebi.entry_point = code.xptr<CodePtr>();
+ 
+@@ -263,6 +263,20 @@
+     }
+     code.BRK(0);
+ 
++    // Omnidroid patch 0114: the return-stack slots, after everything that executes, 8-aligned (an
++    // aligned 64-bit load and store are single-copy atomic). Each starts at 0; `AddressSpace::Link`
++    // fills it -- the predicted block, or the dispatcher -- before the block is first entered.
++    if (!ctx.rsb_slots.empty()) {
++        while (code.xptr<std::uintptr_t>() % 8 != 0) {
++            code.BRK(0);
++        }
++        for (EmitContext::RSBSlot& slot : ctx.rsb_slots) {
++            code.l(slot.label);
++            ebi.block_relocations[slot.target].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ebi.entry_point, BlockRelocationType::MoveToScratch1});
++            code.dx(0);
++        }
++    }
++
+     ebi.size = code.xptr<CodePtr>() - ebi.entry_point;
+     return ebi;
+ }
+@@ -273,14 +287,19 @@
+ }
+ 
+ void EmitBlockLinkRelocation(oaknut::CodeGenerator& code, EmitContext& ctx, const IR::LocationDescriptor& descriptor, BlockRelocationType type) {
+-    ctx.ebi.block_relocations[descriptor].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ctx.ebi.entry_point, type});
+     switch (type) {
+     case BlockRelocationType::Branch:
++        ctx.ebi.block_relocations[descriptor].emplace_back(BlockRelocation{code.xptr<CodePtr>() - ctx.ebi.entry_point, type});
+         code.NOP();
+         break;
+     case BlockRelocationType::MoveToScratch1:
+-        code.BRK(0);
+-        code.NOP();
++        // Omnidroid patch 0114: one load from a data slot placed after the block's deferred code
++        // (`EmitArm64`), where the relocation points; linking rewrites the slot, never this word.
++        // The pin's `ADRL` was two instruction words rewritten one at a time: harmless while only
++        // the cache's own thread runs its code, but a thread running the block while another
++        // relinks it could execute an old `ADRP` with a new `ADD`.
++        ctx.rsb_slots.emplace_back(EmitContext::RSBSlot{descriptor, {}});
++        code.LDR(Xscratch1, ctx.rsb_slots.back().label);
+         break;
+     default:
+         UNREACHABLE();
+diff -ru a/src/dynarmic/backend/arm64/emit_context.h b/src/dynarmic/backend/arm64/emit_context.h
+--- a/src/dynarmic/backend/arm64/emit_context.h
++++ b/src/dynarmic/backend/arm64/emit_context.h
+@@ -42,6 +42,14 @@
+ 
+     std::vector<std::function<void()>> deferred_emits;
+ 
++    // Omnidroid patch 0114: the return-stack slots this block's `PushRSB`s load, each with the
++    // location it predicts; placed after the deferred code (`EmitArm64`).
++    struct RSBSlot {
++        IR::LocationDescriptor target;
++        oaknut::Label label;
++    };
++    std::vector<RSBSlot> rsb_slots;
++
+     FP::FPCR FPCR(bool fpcr_controlled = true) const {
+         const FP::FPCR fpcr = conf.descriptor_to_fpcr(block.Location());
+         return fpcr_controlled ? fpcr : fpcr.ASIMDStandardValue();
+diff -ru a/src/dynarmic/backend/arm64/a64_interface.cpp b/src/dynarmic/backend/arm64/a64_interface.cpp
+--- a/src/dynarmic/backend/arm64/a64_interface.cpp
++++ b/src/dynarmic/backend/arm64/a64_interface.cpp
+@@ -8,6 +8,7 @@
+ 
+ #include <boost/icl/interval_set.hpp>
+ #include <mcl/assert.hpp>
++#include <mcl/bit_cast.hpp>
+ #include <mcl/scope_exit.hpp>
+ #include <mcl/stdint.hpp>
+ 
+@@ -226,6 +227,14 @@
+         };
+     }
+ 
++    Jit::OdBlockLinkInfo OdBlockLinks(std::uint64_t location, Jit::OdLinkVisitor fn, void* ctx) const {
++        Jit::OdBlockLinkInfo info{};
++        info.entry_point = mcl::bit_cast<u64>(current_address_space.OdBlockLinks(IR::LocationDescriptor{location}, info.host_bytes, fn, ctx));
++        info.unlinked_slot = mcl::bit_cast<u64>(current_address_space.OdUnlinkedSlot());
++        info.relink_maintained = current_address_space.OdRelinkMaintained();
++        return info;
++    }
++
+     std::vector<std::string> Disassemble() const {
+         ASSERT_FALSE("Unimplemented");
+     }
+@@ -440,4 +449,8 @@
+     return impl->OdGetThreadValues();
+ }
+ 
++Jit::OdBlockLinkInfo Jit::OdBlockLinks(std::uint64_t location, OdLinkVisitor fn, void* ctx) const {
++    return impl->OdBlockLinks(location, fn, ctx);
++}
++
+ }  // namespace Dynarmic::A64
+diff -ru a/src/dynarmic/interface/A64/a64.h b/src/dynarmic/interface/A64/a64.h
+--- a/src/dynarmic/interface/A64/a64.h
++++ b/src/dynarmic/interface/A64/a64.h
+@@ -177,6 +177,20 @@
+         std::uint64_t exclusive_value;
+     };
+     OdThreadValues OdGetThreadValues() const;
++
++    /// Omnidroid patch 0114 (arm64 backend only), a test hook: the block this jit's cache holds for
++    /// `location` (a LocationDescriptor's value), and each of its link sites, `fn(ctx, offset, kind)`
++    /// with `offset` from its entry point -- kind 0 a branch word (one instruction, `B` or `NOP`),
++    /// kind 1 a return-stack slot (8 aligned bytes of data, never executed). On the jit's own thread
++    /// outside Run.
++    struct OdBlockLinkInfo {
++        std::uint64_t entry_point;        ///< 0: the cache holds no block for `location`.
++        std::uint32_t host_bytes;
++        std::uint64_t unlinked_slot;      ///< What an unlinked slot holds (the dispatcher's entry).
++        std::uint64_t relink_maintained;  ///< Bytes of code this cache's relinks have handed to instruction-cache maintenance.
++    };
++    using OdLinkVisitor = void (*)(void* ctx, std::uint32_t offset, std::uint32_t kind);
++    OdBlockLinkInfo OdBlockLinks(std::uint64_t location, OdLinkVisitor fn, void* ctx) const;
+ 
+ private:
+     struct Impl;

@@ -40,7 +40,6 @@ namespace Dynarmic::Backend::X64 {
 using namespace Xbyak::util;
 
 std::atomic<std::uint32_t> live_fp_optimizations{0};
-std::atomic<std::uint32_t> live_precise_get_set{1};
 std::atomic<std::uint32_t> live_batch_ic_ivau{0};  // patch 0098
 std::atomic<std::uint32_t> live_fast_dispatch_inline{0};
 std::atomic<std::uint32_t> live_shrink_tables{0};

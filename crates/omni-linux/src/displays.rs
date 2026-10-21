@@ -1,10 +1,11 @@
 //! **The device's displays beyond its own**, added and removed while it runs: each one a composer
 //! display ([`Composer::add_display`]) shown in a host window of its own once something draws on
 //! it, resized on its own, its pointer going to its own Android display, and kept as a PNG beside
-//! the device's own screenshot. A host program asks for them through the device's control channel
-//! (`#host` commands, [`Displays::handle`]): one display per app instance, so many apps -- or many
-//! instances of one app, each an Android user of its own -- run side by side on one Android, each
-//! in its window.
+//! the device's own screenshot -- or showing a card instead of its frames (`crate::card`: what
+//! happened to the app it ran) until the card is taken away. A host program asks for them through
+//! the device's control channel (`#host` commands, [`Displays::handle`]): one display per app
+//! instance, so many apps -- or many instances of one app, each an Android user of its own -- run
+//! side by side on one Android, each in its window.
 //!
 //! | command | answer |
 //! |---|---|
@@ -12,6 +13,9 @@
 //! | `display remove <id>` | -- (its window closes) |
 //! | `display bind <id> <android id>` | -- (the window's pointer goes to that Android display) |
 //! | `display size <id> <w>x<h>` | its size now, as a window resized to it would make it |
+//! | `display card <id> <hex>` | -- (its window shows the card whose text is `<hex>`, [`crate::card::from_hex`], instead of its frames) |
+//! | `display show <id>` | -- (its window shows its frames again) |
+//! | `display owners <id>` | a line `<pid> <uid>` per process whose buffers a layer of the display holds ([`Composer::owners`]: which app draws there) |
 //! | `display list` | a line `<id> <w>x<h> <android id>` per display beyond display 0 |
 //! | `apps` | a line `<pid> <uid> <process name>` per app process running ([`crate::zygote::apps`]) |
 //!
@@ -25,6 +29,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use crate::card::Card;
 use crate::display_window::{Options, SharedInput};
 use crate::hal::composer::Composer;
 
@@ -38,7 +43,8 @@ pub struct Displays {
     /// The device's own screenshot (`OMNI_SCREENSHOT`); an extra display's is beside it.
     screenshot: Option<PathBuf>,
     screenshot_every: Duration,
-    /// Where a window the person closed is said (`display-<id>.closed`).
+    /// Where a window says the person closed it ([`closed_marker`]) or clicked its card's restart
+    /// block ([`restart_marker`]), and reads a script's commands ([`control_file`]).
     closed_dir: Option<PathBuf>,
     extra: Mutex<BTreeMap<i64, Extra>>,
 }
@@ -46,6 +52,8 @@ pub struct Displays {
 struct Extra {
     stop: Arc<AtomicBool>,
     android: Arc<AtomicI32>,
+    /// Set while the display shows a card: its window lets go of the app's keyboard and mouse.
+    card: Arc<AtomicBool>,
 }
 
 /// An extra display's screenshot: `<base stem>.d<id>.png` beside the device's `<base>`.
@@ -98,6 +106,23 @@ pub fn closed_marker(dir: &Path, id: i64) -> PathBuf {
     dir.join(format!("display-{id}.closed"))
 }
 
+/// The marker a window leaves when the person clicks its card's restart block:
+/// `<dir>/display-<id>.restart`, beside [`closed_marker`]. The host program polls it, removes it,
+/// and starts the app again on the display.
+#[must_use]
+pub fn restart_marker(dir: &Path, id: i64) -> PathBuf {
+    dir.join(format!("display-{id}.restart"))
+}
+
+/// The file of commands a display's window reads (`display_window::Options::control`: a resize,
+/// input, a click -- on its card's restart block when it shows one): `<dir>/display-<id>.control`,
+/// beside [`closed_marker`]. Display 0's window alone had one (`OMNI_WINDOW_CONTROL`), and it never
+/// shows a card: no script could press a restart block.
+#[must_use]
+pub fn control_file(dir: &Path, id: i64) -> PathBuf {
+    dir.join(format!("display-{id}.control"))
+}
+
 /// `<w>x<h>`.
 fn size(text: &str) -> Option<(u32, u32)> {
     let (w, h) = text.split_once('x')?;
@@ -117,23 +142,29 @@ impl Displays {
     /// The composer's.
     pub fn add(&self, w: u32, h: u32) -> Result<i64, String> {
         let (id, framebuffer) = self.composer.add_display(w, h)?;
-        let (stop, android) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicI32::new(0)));
-        self.extra.lock().insert(id, Extra { stop: Arc::clone(&stop), android: Arc::clone(&android) });
+        let (stop, android, card) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicI32::new(0)), Arc::new(AtomicBool::new(false)));
+        self.extra.lock().insert(id, Extra { stop: Arc::clone(&stop), android: Arc::clone(&android), card: Arc::clone(&card) });
+        // A removed display's id is the next one's: what its window said, or was told, is not this
+        // one's.
         if let Some(dir) = &self.closed_dir {
             let _ = std::fs::remove_file(closed_marker(dir, id));
+            let _ = std::fs::remove_file(restart_marker(dir, id));
+            let _ = std::fs::remove_file(control_file(dir, id));
         }
         if self.windows {
             let composer = Arc::clone(&self.composer);
             let fb = Arc::clone(&framebuffer);
             let options = Options {
                 title: "Omnidroid".into(),
-                control: None,
+                control: self.closed_dir.as_deref().map(|d| control_file(d, id)),
                 input: self.input.is_some(),
                 display: id,
                 android_display: Some(Arc::clone(&android)),
                 shared_input: self.input.clone(),
                 stop: Some(Arc::clone(&stop)),
                 closed_marker: self.closed_dir.as_deref().map(|d| closed_marker(d, id)),
+                restart_marker: self.closed_dir.as_deref().map(|d| restart_marker(d, id)),
+                card: Some(card),
             };
             let stop = Arc::clone(&stop);
             // **Its window opens when it first draws**: a display nothing is on yet has nothing to
@@ -182,6 +213,39 @@ impl Displays {
         Ok(())
     }
 
+    /// **Show a card on the display `id` instead of its frames** ([`Composer::set_card`]): `text`'s
+    /// first line its title, every other line one of its lines. A window not open yet opens on it,
+    /// and its window lets go of the app's keyboard and mouse (`display_window::Options::card`):
+    /// the app it showed is gone, and Android's word on the pointer capture and icon stays the dead
+    /// app's.
+    ///
+    /// # Errors
+    /// Not one of the displays added here, or the composer's.
+    pub fn card(&self, id: i64, text: &str) -> Result<(), String> {
+        let flag = self.card_flag(id)?;
+        self.composer.set_card(id, Some(Card::parse(text)))?;
+        flag.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// The display `id`'s frames in its window again, its card taken away, and its keyboard and
+    /// mouse the app's.
+    ///
+    /// # Errors
+    /// Not one of the displays added here, or the composer's.
+    pub fn show(&self, id: i64) -> Result<(), String> {
+        let flag = self.card_flag(id)?;
+        self.composer.set_card(id, None)?;
+        flag.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// The flag the window of the display `id` reads for a card, if `id` is one of the displays
+    /// added here.
+    fn card_flag(&self, id: i64) -> Result<Arc<AtomicBool>, String> {
+        self.extra.lock().get(&id).map(|e| Arc::clone(&e.card)).ok_or_else(|| format!("no display {id} was added"))
+    }
+
     /// A line per added display: `<id> <w>x<h> <android id>`.
     #[must_use]
     pub fn list(&self) -> String {
@@ -210,9 +274,20 @@ impl Displays {
                 (Ok(id), Some(_)) => Err(format!("no display {id} was added")),
                 _ => Err(format!("not <id> <w>x<h>: {id} {wh}")),
             },
+            ["display", "card", id, hex] => match (id.parse(), crate::card::from_hex(hex)) {
+                (Ok(id), Some(text)) => self.card(id, &text).map(|()| String::new()),
+                (Ok(_), None) => Err(format!("not the hex of UTF-8 text: {}", hex.get(..32).unwrap_or(hex))),
+                (Err(_), _) => Err(format!("not a display id: {id}")),
+            },
+            ["display", "show", id] => id.parse().map_err(|_| format!("not a display id: {id}")).and_then(|id| self.show(id)).map(|()| String::new()),
+            ["display", "owners", id] => id
+                .parse()
+                .map_err(|_| format!("not a display id: {id}"))
+                .and_then(|id| self.composer.owners(id).ok_or_else(|| format!("no display {id}")))
+                .map(|owners| owners.into_iter().map(|(pid, uid)| format!("{pid} {uid}\n")).collect()),
             ["display", "list"] => Ok(self.list()),
             ["apps"] => Ok(crate::zygote::apps().into_iter().map(|(pid, uid, name)| format!("{pid} {uid} {name}\n")).collect()),
-            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | size <id> <w>x<h> | list; apps)")),
+            _ => Err(format!("unknown host command: {command:?} (display add <w>x<h> | remove <id> | bind <id> <android id> | size <id> <w>x<h> | card <id> <hex> | show <id> | owners <id> | list; apps)")),
         };
         match answer {
             Ok(out) => (0, out),
@@ -229,7 +304,54 @@ mod tests {
     fn an_extra_display_s_files_are_beside_the_device_s() {
         assert_eq!(screenshot_path(Path::new("/t/omni-warm-1.png"), 3), PathBuf::from("/t/omni-warm-1.d3.png"));
         assert_eq!(closed_marker(Path::new("/t/omni-warm-1.ctl"), 3), PathBuf::from("/t/omni-warm-1.ctl/display-3.closed"));
+        assert_eq!(restart_marker(Path::new("/t/omni-warm-1.ctl"), 3), PathBuf::from("/t/omni-warm-1.ctl/display-3.restart"));
+        assert_eq!(control_file(Path::new("/t/omni-warm-1.ctl"), 3), PathBuf::from("/t/omni-warm-1.ctl/display-3.control"));
         assert_eq!(size("1280x720"), Some((1280, 720)));
         assert_eq!(size("1280"), None);
+    }
+
+    /// `display card` puts the card in the display's framebuffer, `display show` takes it away; a
+    /// payload that is not hex, an id that is not a number or a display that was not added is
+    /// refused, and the help names both.
+    #[test]
+    fn a_card_is_set_and_taken_away_by_its_commands() {
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::new(crate::hal::framebuffer::Framebuffer::new(64, 32)));
+        let displays = Displays::new(Arc::clone(&composer), false, None, None, Duration::from_secs(5), None);
+        let (id, fb) = composer.add_display(400, 330).unwrap();
+        let card = Arc::new(AtomicBool::new(false));
+        displays.extra.lock().insert(id, Extra { stop: Arc::default(), android: Arc::default(), card: Arc::clone(&card) });
+        let text = "Talking Tom stopped\nJava exception: java.lang.IllegalStateException: boom";
+        let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
+
+        assert_eq!(displays.handle(&format!("display card {id} {hex}")), (0, String::new()));
+        assert_eq!(fb.pixels(), crate::card::render(&Card::parse(text), 400, 330), "the card");
+        assert!(card.load(Ordering::Acquire), "its window told: the app's input let go");
+        assert_eq!(displays.handle(&format!("display show {id}")), (0, String::new()));
+        assert!(!card.load(Ordering::Acquire), "and the app's again");
+        assert_eq!(displays.handle(&format!("display show {id}")), (0, String::new()), "no card: nothing to take away");
+
+        assert_eq!(displays.handle(&format!("display card {id} 4g")).0, 1, "not hex");
+        assert_eq!(displays.handle(&format!("display card {id} ff")).0, 1, "not UTF-8");
+        assert_eq!(displays.handle(&format!("display card x {hex}")), (1, "not a display id: x\n".to_string()));
+        let other = id + 1;
+        assert_eq!(displays.handle(&format!("display card {other} {hex}")), (1, format!("no display {other} was added\n")));
+        assert_eq!(displays.handle(&format!("display show {other}")), (1, format!("no display {other} was added\n")));
+        let (status, help) = displays.handle("display card");
+        assert!(status == 1 && help.contains("card <id> <hex>") && help.contains("show <id>"), "{help}");
+    }
+
+    /// `display owners` answers who draws on a display -- nobody on one with no layer yet -- and
+    /// refuses a display there is not; the help names it.
+    #[test]
+    fn a_display_s_owners_are_asked_by_their_command() {
+        let composer = Composer::new(crate::binder::broker(crate::binder::Context::Binder), Arc::new(crate::hal::framebuffer::Framebuffer::new(64, 32)));
+        let displays = Displays::new(Arc::clone(&composer), false, None, None, Duration::from_secs(5), None);
+        let (id, _) = composer.add_display(400, 330).unwrap();
+        assert_eq!(displays.handle(&format!("display owners {id}")), (0, String::new()), "no layer: nobody");
+        let other = id + 1;
+        assert_eq!(displays.handle(&format!("display owners {other}")), (1, format!("no display {other}\n")));
+        assert_eq!(displays.handle("display owners x"), (1, "not a display id: x\n".to_string()));
+        let (status, help) = displays.handle("display owners");
+        assert!(status == 1 && help.contains("owners <id>"), "{help}");
     }
 }

@@ -96,7 +96,8 @@ impl Backing {
     /// # Errors
     ///
     /// [`MemError::Platform`](crate::MemError::Platform) wrapping
-    /// [`VmError::EmptyFile`](omni_platform::vm::VmError::EmptyFile) for a zero-length file, or
+    /// [`VmError::EmptyFile`](omni_platform::vm::VmError::EmptyFile) for a zero-length file where a
+    /// view may not pass its end (`vm::shared_view_may_pass_end_of_file`), or
     /// [`VmError::SectionCreate`](omni_platform::vm::VmError::SectionCreate) for a handle without
     /// write access.
     pub fn share(file: std::fs::File, name: &str) -> MemResult<Arc<Self>> {
@@ -136,13 +137,21 @@ impl Backing {
         self.guest_named
     }
 
-    /// Length of the file in bytes.
+    /// Length of the file in bytes, when it was opened.
     #[must_use]
     pub fn len(&self) -> u64 {
         self.file.len()
     }
 
-    /// Whether the file is empty. Always false: a zero-length file cannot be opened for mapping.
+    /// Length of the file in bytes now: a [`share`](Backing::share)d file grows under its views.
+    #[must_use]
+    pub fn len_now(&self) -> u64 {
+        self.file.len_now()
+    }
+
+    /// Whether the file was empty when it was opened. False but for a [`share`](Backing::share)d
+    /// file where its views may pass its end (`vm::shared_view_may_pass_end_of_file`): any other
+    /// zero-length file cannot be opened for mapping.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.file.len() == 0

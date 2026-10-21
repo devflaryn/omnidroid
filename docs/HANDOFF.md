@@ -1,5 +1,117 @@
 # Handoff
 
+## LIGHTER POOL, CRASH CARD, RESTART (2026-10-19/20, macOS M4; `main`, uncommitted)
+
+- **Guest file data as host views on 16 KiB pages** (`omni-linux/src/mm.rs`, `vfs.rs`, `fork.rs`;
+  `omni-platform` vm capabilities `private_view_may_end_in_last_page`, `mapped_file_may_be_renamed`):
+  a private mapping at an offset that is not host-page aligned is a view from the host page below,
+  placed congruent; a MAP_FIXED at an incongruent address (bionic starts every library at a random
+  4 KiB multiple) is a view of a "shifted file" (`<TMPDIR>/omni-shifted`, made once per content sha
+  and shift); the last partial page and `/data/app` files are views where the platform allows.
+  Measured (TalkingTomCamp pool): 4924 -> 3676 MiB footprint (-25%), system host -423 MiB, every
+  idle app -100..-130 MiB; r-x private copies 220 -> 0 MiB. `OMNI_MMAP_COPIES=<KiB>` logs each copy
+  still made and why (`[mm-copy]`). Windows and 4 KiB hosts: unchanged except the tail page on Linux.
+- **Views, second part** (`omni-mem` `GuestSpace::map_file_exact`, `Split::foreign`; D42 amended
+  2026-10-20): a segment's partial edge host pages are views too (a free page, the linker's
+  never-touched reservation page, or a neighbouring view of the same file); a page that would trap
+  is still copied. **A writable MAP_SHARED of an instance file follows the file as it grows**
+  (capability `vm::shared_view_may_pass_end_of_file`, macOS only: Linux needs dynarmic to take
+  SIGBUS first): host pages past the file's current end are refused, and a guest touching them gets
+  SIGBUS `BUS_ADRERR`. This was AppSearch's lost data: icing maps its empty trie arrays at full size
+  and grows them with ftruncate, so every write went to anonymous memory and the next boot read
+  zeros ("Array storage bad crc 0 vs ..", "Trie mmap node failed"); fixture `sharedgrow`. The
+  shifted files' directory belongs to the sysroot (`OMNI_SHIFTED_DIR`, else `<temp>/omni-shifted`;
+  made-up test sysroots use their own) and is swept once per host: dead writers' `.tmp` files, and
+  files of another sysroot nobody opened for 24 h.
+- **arm64 translation memory** (vendored 0106-0109, `omni-cpu` census, `omni-linux` code_trim): a
+  thread parked over 120 s gives back its tables as well as its code (0107), once (0108: the `[code]`
+  lines no longer re-count it); the block map and link heads run at load factor 0.75 (0109, 381 ->
+  284 B a block); each look drops the largest quiet thread of a busy process
+  (`OMNI_CODE_QUIET_THREADS=0` turns it off). `OMNI_JIT_CENSUS=1` prints `[jit-census]`: how many
+  times each process's threads translated the same code (system host D_mem ~2.8, D_emit ~7-19 --
+  the case for one shared cache per process on arm64, D38's x64 design, which is next).
+  Measured (TalkingTomCamp pool, before the views change): 5065 -> 3823 MiB at 30 min. Also fixed:
+  the run loop cleared a CacheInvalidation halt raised after `Run` returned, so its queued
+  invalidation waited for another halt.
+- **arm64 translation, Stage 2 of the shared cache** (vendored 0112-0114, per-thread mode; the
+  shared cache itself is Stage 3, begun and stopped, see below): 0112 reads a thread's own values from its JitState
+  (callbacks, config, TPIDR slots, exclusive monitor slots; `od_jit_thread_values`, `od_jit_reset`
+  keeps them) instead of baking them into the code; 0113 translates through the translating
+  thread's config and checks oaknut's mmap for MAP_FAILED; 0114 makes the return-stack link one
+  data word written with a release store and maintains each rewritten `B`/`NOP` word alone
+  (batched DC CVAU/IC IVAU on macOS arm64, oaknut's invalidate per word elsewhere). Gate G1 on
+  the M4: code per block +0.14%, translation within noise, live pool A/B equal, 55-min soak clean.
+  Cost in microbenchmarks (one more dependent load): TPIDR + TLS slot load +12-14%, LDXR/STXR
+  pairs +4-7%. Not run: x64 (no Rosetta, and the x86_64 dynarmic build fails with clang 21 in
+  mcl's lift_sequence), the roblox.rs bench (its APK is absent), Linux/Windows arm64 hosts.
+- **Speed levers, batch 1** (each a live lever in `omni-linux/src/lever.rs` with an `OMNI_*` start
+  value; measured on Roblox at Home, ABBA x5, M4): pool tree at Home 48.6 -> 25.3% of a core,
+  system CPU in the minute after ready -15%, signed-in ~2 s sooner.
+  - `disk_sync=off|os|full` (`OMNI_DISK_SYNC`): engine default `full` as before; pool devices boot
+    with `off` (`omni_pool::device::boot`, D43: a pool device's disk is thrown away). F_FULLFSYNC
+    was 3.9 ms a call against fsync's 23 us, ~3.7 s of guest threads blocked per launch.
+  - `wake_dedupe`, `waiter_park` (`omni-linux/src/poll.rs`, futex): a waiter on k keys is signalled
+    once per change; system host at Home about -36%.
+  - `statsd_sink`: an app host's datagram connect to `/dev/socket/statsdw` goes to a sink (statsd
+    lives in the system host; uid 1000's libstatssocket retried a failed write every 5 ms forever).
+  - `procfs_usage` (`GuestSpace::usage`, one pass, cached by generation), `recv_scratch` (a
+    per-thread 256 KiB receive buffer; would-block errors no longer name the socket).
+  - `jit_getset` on arm64 (vendored 0110: GetSet elimination precise at memory aborts, port of the
+    x64 pass; 0111: AssertNoMoreUses only under verification): Roblox's host at Home about -12%.
+    A flags pseudo-op's argument is never rewritten (Roblox aborted in `Inst::Use` before that).
+  - `shm_sweep`: an ended app host's gate goes when it is reaped; at a system host's start (and in
+    the launcher, `remove_gone_host_files`) ended processes' gates go, and their regions only once
+    no host process of any device lives -- a crossed region is opened by path again.
+- **App crashes reach ActivityManager** (`omni-linux/device/src/spare/.../App.java`, `zygote.rs`):
+  every app process starts as `com.omnidroid.spare.App` (CLASSPATH `omni-spare.jar`), which runs
+  WrapperInit and hands an uncaught main-thread exception to the thread's handlers while binder is
+  still open -- before, every crash logged "Error reporting crash ... Bad file descriptor" and AMS
+  only saw the death. Now: DropBox `data_app_crash`, exit-info APP CRASH, the pool's card in ~6 s
+  (was ~17 s; ~5 s of it is the app host waiting for halted tasks). `OMNI_APP_CRASH_ENTRY=0` is
+  the old entry. Processes hidden from root (denylist, Shamiko whitelist) start unguarded.
+  warm.rs/r_app.rs count a user-0 app's death once whoever logs it (`app_session::AppDeaths`), so
+  an app AMS kills after its repeat-crash dialog is restarted too.
+- **Pool**: no minute `dumpsys` in the guest (the host says who draws on a display); a start
+  skips the grants once they ran for that user (`grants skipped` in the per-step start line); no
+  spare user is made while a launch is starting, ending or restarting, nor within 60 s of Running.
+  Not done: signals to an app in another host process (`kill -3/-10/-11` still return 0 and do
+  nothing; `zygote::signal` acts on 9/15 only).
+  Measured against main just before (TalkingTomCamp, +10 min after the launch, 2 pairs at load
+  5-42): system host CPU 24 vs 28%, pool tree CPU 34-37 vs 46%; system host footprint 873/924 vs
+  700/765 MiB -- higher, cause not found (a third pair at load 100-300 came out equal, 1004 vs
+  1001; the translation trims gave back the same).
+- **Black start, crash card, restart** (`omni-linux/src/card.rs`, `omni-pool/src/crash.rs`,
+  `pool.rs`): an instance's window is black until the app draws; when the app ends on its own the
+  window keeps a card saying what happened (exception and frames, native signal, killed, force
+  stop...), with "Click here to restart". `restart <#id>` / `omnidroid restart <id>` / MCP
+  `restart_instance {delay}` show "Restarting in N seconds" + "Click here to restart now";
+  `autorestart on|off [#id]` / MCP `auto_restart` / setting `auto_restart` restart a crash after
+  "Automatically restarting in N seconds" (3 ends within a minute of starting stop it). Ends on
+  purpose (stop_instance, the window closed, force-stop, the app finishing itself) close the window:
+  no card, no restart. Live-tested on an isolated pool (TalkingTomCamp, Roblox).
+- **Users**: a new pool user mirrors user 0's disabled packages; users made ahead are started once
+  and stopped (first launch 12.9 -> 8.9 s); the saved warm device waits for package-restrictions to
+  be written (r_app `WARM_SETUP=3`).
+- **Temp files**: a stopped pool's `omni-shm-*` and `omni-remote-gate-*` files are removed when the
+  session ends (`omnidroid aosp`), not at the next boot; an app host removes its own gate file.
+- **Build**: the vendored fmt 10.1 does not compile with Apple clang 21 (`consteval`); `dynarmic-sys`
+  `build.rs` now configures CMake with `-DFMT_CONSTEVAL=` (not on MSVC).
+- **Roblox**: its server answers "Upgrade required" for every APK on this Mac (2.740/2.741): it
+  signs in and shows Home, but no game starts. A newer APK is needed for in-game benchmarks.
+- **Stopped by the owner on 2026-10-20, nothing of it in `main`:**
+  - Speed levers batch 2. Each lane was built and tested on its own; none was integrated or A/B'd.
+    - 16 KiB-host faults: classify the fault, lenient read-only parts, commit ahead.
+    - Zero pages.
+    - The macOS fault server's fast path.
+    - Signals to an app in another host process.
+    - Review state at the stop: signals and fault server were being verified; zero pages was in review.
+  - arm64 shared cache **Stage 3**: one translation cache per process, one generation at a time, off by default.
+    - Code: vendored 0115 "one translation cache for a process's threads", plus shim and omni changes and `shared_generation` tests.
+    - It reached the second gate. The mutation rows were caught, and the plain suites pass.
+    - With `OD_TEST_SHARED_CACHE=1`, one run of two failed `a_generation_switch_while_eight_threads_run_loses_no_result` and `an_invalidator_is_not_starved_by_eight_lookup_threads`. That is a race still open.
+    - Not reviewed; not run live.
+  - Next after Stage 3: punch compressed JIT pages, the emitter's per-block cost and fast dispatch. Still unresolved: the compat system-host footprint above, and SIGBUS on Linux for the shared view.
+
 ## PLUGIN OPTIONS ON THE POOL'S LAUNCHES (2026-10-13, macOS; branch `omnidroid-app`, uncommitted)
 
 - **What**: `omnidroid <apk> [xN] --cookie <c> --place <id>`, `run <apk> ... --cookie ...` at the

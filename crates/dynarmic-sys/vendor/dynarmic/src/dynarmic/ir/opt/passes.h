@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+
 namespace Dynarmic::A32 {
 struct UserCallbacks;
 }
@@ -37,6 +40,11 @@ struct DeadCodeEliminationOptions {
     /// Keep every guest memory read, used or not: under `check_halt_on_memory_access` a read that
     /// faults must stop the guest whether or not anything reads its value.
     bool keep_memory_reads = false;
+    /// Omnidroid patch 0110: rewrite every argument that is an `Identity` to the value it stands
+    /// for, and take what is dead out of the block rather than leave it `Void`. `GetSetElimination`
+    /// turns every Get it forwards into an `Identity`, which the emitter otherwise allocates as an
+    /// alias of its value.
+    bool forward_identities = false;
 };
 
 /// Omnidroid patch 0037.
@@ -51,6 +59,12 @@ struct A64GetSetEliminationOptions {
     /// an X write takes the X value's low word. Instead of storing the register and loading it back.
     bool forward_width_changes = false;
 };
+
+/// Omnidroid patch 0037, shared by both backends since patch 0110: non-zero runs
+/// `A64GetSetElimination` in its precise form for every block translated from now on whose config
+/// sets `check_halt_on_memory_access` (which otherwise skips the pass). Process-wide, read at
+/// translation: a block translated before the switch keeps what it was translated with.
+extern std::atomic<std::uint32_t> live_precise_get_set;
 
 void PolyfillPass(IR::Block& block, const PolyfillOptions& opt);
 void A32ConstantMemoryReads(IR::Block& block, A32::UserCallbacks* cb);

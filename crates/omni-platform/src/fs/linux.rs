@@ -38,7 +38,7 @@ use std::os::fd::AsRawFd;
 use super::error::{FsError, FsResult};
 
 pub(super) use super::unix::{
-    logical_len, logical_len_at, open, pread, pwrite, settle, truncate, volume_stats, write,
+    logical_len, logical_len_at, open, pread, pwrite, settle, sync_data, truncate, volume_stats, write,
 };
 
 /// `posix_fallocate(fd, 0, end)`: the bytes `0..end` of the file allocated, so that no write

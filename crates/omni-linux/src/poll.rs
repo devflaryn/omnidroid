@@ -76,23 +76,188 @@ pub type Key = usize;
 /// A key for what never changes by itself (always ready, or never): nobody notifies it.
 pub const INERT: Key = 1;
 
-/// One thread's place in the queues.
-#[derive(Default)]
+/// One thread's place in the queues: whether a change has woken it since it registered, and what
+/// its sleep waits on -- its host thread's park token or a condition variable (`waiter_park`).
 struct Waiter {
-    woken: Mutex<bool>,
+    woken: std::sync::atomic::AtomicBool,
+    /// This wait sleeps parked ([`PARK`] when it registered); a waker wakes it the same way.
+    parks: std::sync::atomic::AtomicBool,
+    thread: std::thread::Thread,
+    lock: Mutex<()>,
     cv: Condvar,
+    /// Times [`signal`](Self::signal)led, for the tests.
+    #[cfg(test)]
+    signals: std::sync::atomic::AtomicU32,
 }
 
 impl Waiter {
+    fn new() -> Self {
+        Self {
+            woken: std::sync::atomic::AtomicBool::new(false),
+            parks: std::sync::atomic::AtomicBool::new(false),
+            thread: std::thread::current(),
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+            #[cfg(test)]
+            signals: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    /// Mark it woken: true when it was not, and the caller then [`signal`](Self::signal)s it.
+    fn mark(&self) -> bool {
+        !self.woken.swap(true, Ordering::AcqRel)
+    }
+
+    /// End its sleep, `woken` being set. On the condition variable, the lock taken between keeps
+    /// the signal from falling between the sleeper's look at `woken` and its wait.
+    fn signal(&self) {
+        #[cfg(test)]
+        self.signals.fetch_add(1, Ordering::Relaxed);
+        if self.parks.load(Ordering::Relaxed) {
+            self.thread.unpark();
+        } else {
+            drop(self.lock.lock());
+            self.cv.notify_one();
+        }
+    }
+
+    /// Mark and signal it, woken already or not: once for each of its keys a change names
+    /// (`wake_dedupe=0`).
     fn wake(&self) {
-        *self.woken.lock() = true;
-        self.cv.notify_one();
+        self.woken.store(true, Ordering::Release);
+        self.signal();
     }
 }
 
 thread_local! {
-    static ME: Arc<Waiter> = Arc::new(Waiter::default());
+    static ME: Arc<Waiter> = Arc::new(Waiter::new());
 }
+
+/// **`wake_dedupe`** (lever; on by default): a change marks each of its waiters woken under the
+/// queue locks -- once, however many of the waiter's keys it names -- and signals them after
+/// dropping the locks, as `crate::futex` unparks; and it finds no waiter on anything without taking
+/// that list's lock (`ANYTHING_COUNT`; the list is empty nearly always since `poll_keyed`).
+/// `wake_dedupe=0` (`OMNI_WAKE_DEDUPE=0`) wakes each key's waiters under its lock, as before. Herds
+/// ([`wake_everyone`], [`notify`]) are where it shows: a looper waits on every key of its epoll set
+/// and was signalled once a key, each under a shard lock its woken threads then queued on to
+/// unregister -- and, registered again before the walk reached their other keys, woken again (the
+/// system host at launch: 3.7% of busy samples in `__psynch_cvsignal`, most of it from
+/// `wake_everyone`). Measured, a herd of 256 waiters on 6 keys each (`tests/wait_cost.rs`, M4 under
+/// load, 2026-10-20): 400-1,210 waits ended and 7-44 ms of CPU before, 256 and 5-6.5 ms with this,
+/// 256 and 2.7-3.7 ms with `waiter_park` too. Both levers, a pool device at Roblox's Home (two
+/// ABBA pairs, M4, 2026-10-20): the system host 18.0-18.9% of a core with both off, 10.2-13.4% with
+/// both on; boot and launch the same.
+pub static DEDUPE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// **`waiter_park`** (lever; on by default): a wait sleeps on its host thread's park token
+/// (`std::thread::park_timeout`, a relative timeout) and a waker `unpark`s it -- not on a
+/// `parking_lot` condition variable, whose timed wait takes an absolute deadline (on macOS a
+/// `gettimeofday` each sleep) and a pthread mutex and condition behind parking_lot's bucket lock.
+/// `waiter_park=0` (`OMNI_WAITER_PARK=0`) is the condition variable. The token is the thread's own,
+/// shared with `crate::futex`'s park: a token one leaves ends the other's park early, and both look
+/// again (`woken` and the clock here, the futex queue under its lock) before parking again.
+/// Measured, a `ppoll` or `epoll_pwait` that sleeps out a 1 ms timeout (an HttpClient's, a
+/// looper's): -17% of its CPU (the median of 14 pairs, each taken in one run), mostly 17-19 us on
+/// the condition variable against 13-16 us parked under load (`tests/wait_cost.rs`, M4, 2026-10-20).
+pub static PARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// One test at a time switches [`DEDUPE`] and [`PARK`] (they are the host process's).
+#[cfg(test)]
+pub(crate) static LEVERS_IN_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn dedupe() -> bool {
+    DEDUPE.load(Ordering::Relaxed)
+}
+
+/// Waiters marked woken under a queue's lock, to signal once it is dropped (`wake_dedupe`), as
+/// `crate::futex`'s `Unpark`. The usual one without allocating.
+#[derive(Default)]
+struct Wakes {
+    one: Option<Arc<Waiter>>,
+    more: Vec<Arc<Waiter>>,
+}
+
+impl Wakes {
+    /// Mark `w` woken, kept to signal unless it was woken already; whether it was kept.
+    fn mark(&mut self, w: &Arc<Waiter>) -> bool {
+        if !w.mark() {
+            return false;
+        }
+        if self.one.is_none() {
+            self.one = Some(Arc::clone(w));
+        } else {
+            self.more.push(Arc::clone(w));
+        }
+        true
+    }
+
+    /// Signal them, the locks dropped; how many.
+    fn signal(self) -> usize {
+        let n = usize::from(self.one.is_some()) + self.more.len();
+        for w in self.one.into_iter().chain(self.more) {
+            w.signal();
+        }
+        n
+    }
+}
+
+/// The keys a watch is in: up to four in place -- a binder read's two, an eventfd's one -- more on
+/// the heap. A watch given an array allocates nothing for them.
+pub(crate) enum Keys {
+    Few(u8, [Key; 4]),
+    Many(Vec<Key>),
+}
+
+impl std::ops::Deref for Keys {
+    type Target = [Key];
+
+    fn deref(&self) -> &[Key] {
+        match self {
+            Self::Few(n, keys) => &keys[..usize::from(*n)],
+            Self::Many(keys) => keys,
+        }
+    }
+}
+
+impl From<Vec<Key>> for Keys {
+    fn from(keys: Vec<Key>) -> Self {
+        Self::Many(keys)
+    }
+}
+
+impl<const N: usize> From<[Key; N]> for Keys {
+    fn from(keys: [Key; N]) -> Self {
+        if N > 4 {
+            return Self::Many(keys.to_vec());
+        }
+        let mut few = [0; 4];
+        few[..N].copy_from_slice(&keys);
+        Self::Few(N as u8, few)
+    }
+}
+
+/// Keys are addresses: hashed by one multiplication rather than SipHash, rotated so a shard's map
+/// does not take its buckets from the bits [`shard`] chose the shard by.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl std::hash::Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0 = n as u64;
+    }
+}
+
+type KeyMap<V> = HashMap<Key, V, std::hash::BuildHasherDefault<KeyHasher>>;
 
 /// **The queues**, split so that waiters on different things do not wait for one another's lock:
 /// the change counter (for the callers that still compare it), the waiters on anything, and the
@@ -103,15 +268,20 @@ thread_local! {
 /// none is missed (as with one lock).
 static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ANYTHING: crate::oslock::OsMutex<Vec<Arc<Waiter>>> = crate::oslock::OsMutex::new(Vec::new());
+/// [`ANYTHING`]'s length, stored under its lock: a change that reads 0 skips that lock
+/// (`wake_dedupe`). A waiter on anything stores it, fences, then looks; a change is made, fenced,
+/// then the count read -- of two `SeqCst` fences one is first, so either the change sees the
+/// waiter or the waiter's look sees the change.
+static ANYTHING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 const SHARDS: usize = 64;
-static KEYED_QUEUES: LazyLock<Vec<crate::oslock::OsMutex<HashMap<Key, Vec<Arc<Waiter>>>>>> = LazyLock::new(|| (0..SHARDS).map(|_| crate::oslock::OsMutex::default()).collect());
+static KEYED_QUEUES: LazyLock<Vec<crate::oslock::OsMutex<KeyMap<Vec<Arc<Waiter>>>>>> = LazyLock::new(|| (0..SHARDS).map(|_| crate::oslock::OsMutex::default()).collect());
 
 /// The list of waiters `key` is in.
-fn shard(key: Key) -> &'static crate::oslock::OsMutex<HashMap<Key, Vec<Arc<Waiter>>>> {
+fn shard(key: Key) -> &'static crate::oslock::OsMutex<KeyMap<Vec<Arc<Waiter>>>> {
     &KEYED_QUEUES[((key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize % SHARDS]
 }
 
-/// Wake every waiter on anything; how many.
+/// Wake every waiter on anything, under the lock; how many (`wake_dedupe=0`).
 fn wake_anything() -> usize {
     let anything = ANYTHING.lock();
     for w in anything.iter() {
@@ -120,16 +290,7 @@ fn wake_anything() -> usize {
     anything.len()
 }
 
-/// Wake every waiter on a key.
-fn wake_keyed() {
-    for shard in KEYED_QUEUES.iter() {
-        for w in shard.lock().values().flatten() {
-            w.wake();
-        }
-    }
-}
-
-/// Wake `key`'s waiters.
+/// Wake `key`'s waiters under the lock (`wake_dedupe=0`).
 fn wake_key(key: Key) {
     if let Some(list) = shard(key).lock().get(&key) {
         for w in list {
@@ -138,15 +299,57 @@ fn wake_key(key: Key) {
     }
 }
 
+/// Mark the waiters on anything into `wakes`; how many were marked.
+fn mark_anything(wakes: &mut Wakes) -> usize {
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if ANYTHING_COUNT.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    ANYTHING.lock().iter().filter(|w| wakes.mark(w)).count()
+}
+
+/// Mark `key`'s waiters into `wakes`.
+fn mark_key(key: Key, wakes: &mut Wakes) {
+    if let Some(list) = shard(key).lock().get(&key) {
+        for w in list {
+            wakes.mark(w);
+        }
+    }
+}
+
+/// Wake every waiter of this host process, on anything and on every key; how many wake-ups were
+/// sent.
+fn wake_all() -> usize {
+    if dedupe() {
+        let mut wakes = Wakes::default();
+        mark_anything(&mut wakes);
+        for shard in KEYED_QUEUES.iter() {
+            for w in shard.lock().values().flatten() {
+                wakes.mark(w);
+            }
+        }
+        wakes.signal()
+    } else {
+        let mut n = wake_anything();
+        for shard in KEYED_QUEUES.iter() {
+            for w in shard.lock().values().flatten() {
+                w.wake();
+                n += 1;
+            }
+        }
+        n
+    }
+}
+
 /// Something changed that no key names (a descriptor closed, an `epoll` set edited): wake every
 /// waiter to look again.
 pub fn notify() {
     EDGE_ALL.fetch_add(1, Ordering::AcqRel);
     GENERATION.fetch_add(1, Ordering::SeqCst);
-    wake_anything();
-    wake_keyed();
+    let woken = wake_all();
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
     STATS.unkeyed.fetch_add(1, Ordering::Relaxed);
+    STATS.herd_woken.fetch_add(woken as u64, Ordering::Relaxed);
 }
 
 /// What `key` names changed, for **one** of its waiters to act on: wake the first of them not woken
@@ -156,20 +359,34 @@ pub fn notify() {
 pub fn notify_key_one(key: Key) {
     edge(key);
     GENERATION.fetch_add(1, Ordering::SeqCst);
-    let anything = wake_anything();
+    let mut wakes = dedupe().then(Wakes::default);
+    let anything = match &mut wakes {
+        Some(wakes) => mark_anything(wakes),
+        None => wake_anything(),
+    };
     if let Some(list) = shard(key).lock().get(&key) {
         // The most recent waiter first, as the kernel's binder picks the thread that went idle
         // last (`binder_select_thread_ilocked`, a list it adds to at the head): the work stays on
         // a few threads whose translations are warm, instead of going round every idle looper --
         // on arm64 each thread translates what it runs into a cache of its own.
         for w in list.iter().rev() {
-            let mut woken = w.woken.lock();
-            if !*woken {
-                *woken = true;
-                w.cv.notify_one();
+            let taken = match &mut wakes {
+                Some(wakes) => wakes.mark(w),
+                None => {
+                    let woken = w.mark();
+                    if woken {
+                        w.signal();
+                    }
+                    woken
+                }
+            };
+            if taken {
                 break;
             }
         }
+    }
+    if let Some(wakes) = wakes {
+        wakes.signal();
     }
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
     STATS.anything_woken.fetch_add(anything as u64, Ordering::Relaxed);
@@ -177,12 +394,7 @@ pub fn notify_key_one(key: Key) {
 
 /// What `key` names changed: wake its waiters, and those waiting on anything.
 pub fn notify_key(key: Key) {
-    edge(key);
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-    let anything = wake_anything();
-    wake_key(key);
-    STATS.notifies.fetch_add(1, Ordering::Relaxed);
-    STATS.anything_woken.fetch_add(anything as u64, Ordering::Relaxed);
+    notify_keys(&[key]);
 }
 
 /// `poll_slice_ms=<ms>` (lever; **1000 by default** since the in-world A/B of 2026-10-09, PS99
@@ -194,48 +406,80 @@ pub fn notify_key(key: Key) {
 pub static SLICE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
 
 /// Wake every waiter of this host process to look again: a signal was posted (the waiter whose
-/// task it is sees it and answers `EINTR`), or a process is ending. Rare.
+/// task it is sees it and answers `EINTR`), or a process is ending. Not rare: each exec'd helper's
+/// end is one, and the `SIGCHLD` its parent may take another (`OMNI_POLL_STATS` counts them).
 pub fn wake_everyone() {
-    wake_anything();
-    wake_keyed();
+    let woken = wake_all();
+    STATS.everyone.fetch_add(1, Ordering::Relaxed);
+    STATS.herd_woken.fetch_add(woken as u64, Ordering::Relaxed);
 }
 
-/// What each of `keys` names changed: [`notify_key`] for them all, under one lock.
+/// What each of `keys` names changed: their waiters woken, and those waiting on anything -- each
+/// once (`wake_dedupe`).
 pub fn notify_keys(keys: &[Key]) {
     for key in keys {
         edge(*key);
     }
     GENERATION.fetch_add(1, Ordering::SeqCst);
-    wake_anything();
-    for key in keys {
-        wake_key(*key);
-    }
+    let anything = if dedupe() {
+        let mut wakes = Wakes::default();
+        let anything = mark_anything(&mut wakes);
+        for key in keys {
+            mark_key(*key, &mut wakes);
+        }
+        wakes.signal();
+        anything
+    } else {
+        let anything = wake_anything();
+        for key in keys {
+            wake_key(*key);
+        }
+        anything
+    };
     STATS.notifies.fetch_add(1, Ordering::Relaxed);
+    STATS.anything_woken.fetch_add(anything as u64, Ordering::Relaxed);
 }
 
 /// A thread's registration in the queues, for one wait: made before it looks, ended when dropped.
+/// The thread that made it sleeps on it (a parked wait is woken by unparking that thread).
 pub(crate) struct Watch {
     me: Arc<Waiter>,
-    keys: Option<Vec<Key>>,
+    keys: Option<Keys>,
 }
 
 /// Wait on `keys` (`None`: on anything) -- registered now, before the caller looks.
-pub(crate) fn watch(keys: Option<Vec<Key>>) -> Watch {
+pub(crate) fn watch<K: Into<Keys>>(keys: Option<K>) -> Watch {
     // A wait on no key at all (`ppoll` of no descriptor) is still a waiter: in a queue that a
     // posted signal, a process's end and an unkeyed change reach ([`wake_everyone`], [`notify`]).
     // In none, it slept through them until its slice ran out (1 s).
-    let keys = keys.map(|k| if k.is_empty() { vec![INERT] } else { k });
+    let keys = keys.map(|k| {
+        let k = k.into();
+        if k.is_empty() { Keys::from([INERT]) } else { k }
+    });
     let me = ME.with(Arc::clone);
-    *me.woken.lock() = false;
+    me.parks.store(PARK.load(Ordering::Relaxed), Ordering::Relaxed);
+    me.woken.store(false, Ordering::Release);
     match &keys {
-        None => ANYTHING.lock().push(Arc::clone(&me)),
+        None => {
+            let mut anything = ANYTHING.lock();
+            anything.push(Arc::clone(&me));
+            ANYTHING_COUNT.store(anything.len(), Ordering::Relaxed);
+            drop(anything);
+            // Before the caller looks (`ANYTHING_COUNT`).
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
         Some(keys) => {
-            for k in keys {
+            for k in keys.iter() {
                 shard(*k).lock().entry(*k).or_default().push(Arc::clone(&me));
             }
         }
     }
     Watch { me, keys }
+}
+
+/// [`watch`] on anything.
+fn watch_anything() -> Watch {
+    watch(None::<Keys>)
 }
 
 /// What kind of file has no key, for `OMNI_POLL_STATS`: each kind said once per host process.
@@ -281,24 +525,44 @@ pub(crate) fn keys_of<'a>(files: impl IntoIterator<Item = &'a OpenFile>) -> Opti
 }
 
 impl Watch {
-    /// Sleep until a change it watches, `deadline`, or a slice of 50 ms (so a posted signal is
-    /// seen); `EINTR` if the task has a deliverable signal. The caller looks again afterwards.
+    /// Sleep until a change it watches, `deadline`, or a slice ([`SLICE_MS`]); `EINTR` if the
+    /// task has a deliverable signal. The caller looks again afterwards.
     pub(crate) fn wait(&self, deadline: Option<Instant>, task: &Task) -> Result<(), Errno> {
         if task.pending.load(Ordering::SeqCst) & !task.sigmask != 0 || task.process.futexes.interrupted() {
             return Err(EINTR);
         }
-        let slice = Instant::now() + Duration::from_millis(SLICE_MS.load(Ordering::Relaxed).max(1));
-        self.sleep(deadline.map_or(slice, |d| d.min(slice)));
+        let now = Instant::now();
+        let slice = now + Duration::from_millis(SLICE_MS.load(Ordering::Relaxed).max(1));
+        self.sleep_from(Some(now), deadline.map_or(slice, |d| d.min(slice)));
         Ok(())
     }
 
     /// Sleep until a change it watches or `until`: a host thread's wait.
     pub(crate) fn sleep(&self, until: Instant) {
+        self.sleep_from(None, until);
+    }
+
+    /// [`sleep`](Self::sleep), given the time now when the caller has it. Parked, the clock is read
+    /// once a park and not after a wake.
+    fn sleep_from(&self, now: Option<Instant>, until: Instant) {
         let _counted = Waiting::new();
-        let mut woken = self.me.woken.lock();
-        while !*woken {
-            if self.me.cv.wait_until(&mut woken, until).timed_out() {
-                break;
+        let me = &*self.me;
+        debug_assert_eq!(me.thread.id(), std::thread::current().id(), "a watch slept on by a thread that did not make it");
+        if me.parks.load(Ordering::Relaxed) {
+            let mut now = now.unwrap_or_else(Instant::now);
+            while !me.woken.load(Ordering::Acquire) && now < until {
+                std::thread::park_timeout(until - now);
+                if me.woken.load(Ordering::Acquire) {
+                    break;
+                }
+                now = Instant::now();
+            }
+        } else {
+            let mut guard = me.lock.lock();
+            while !me.woken.load(Ordering::Acquire) {
+                if me.cv.wait_until(&mut guard, until).timed_out() {
+                    break;
+                }
             }
         }
     }
@@ -314,9 +578,13 @@ impl Drop for Watch {
             }
         };
         match &self.keys {
-            None => gone(&mut ANYTHING.lock()),
+            None => {
+                let mut anything = ANYTHING.lock();
+                gone(&mut anything);
+                ANYTHING_COUNT.store(anything.len(), Ordering::Relaxed);
+            }
             Some(keys) => {
-                for k in keys {
+                for k in keys.iter() {
                     let mut shard = shard(*k).lock();
                     if let Some(list) = shard.get_mut(k) {
                         gone(list);
@@ -400,6 +668,11 @@ struct Stats {
     unkeyed: std::sync::atomic::AtomicU64,
     /// Wake-ups sent to waiters on anything by keyed changes ([`notify_key`]).
     anything_woken: std::sync::atomic::AtomicU64,
+    /// Calls of [`wake_everyone`]: posted signals and processes' ends.
+    everyone: std::sync::atomic::AtomicU64,
+    /// Wake-ups sent by herds ([`wake_everyone`], [`notify`]): one a waiter (`wake_dedupe`), or
+    /// one for each key of each waiter.
+    herd_woken: std::sync::atomic::AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -408,12 +681,15 @@ static STATS: Stats = Stats {
     wakes: std::sync::atomic::AtomicU64::new(0),
     unkeyed: std::sync::atomic::AtomicU64::new(0),
     anything_woken: std::sync::atomic::AtomicU64::new(0),
+    everyone: std::sync::atomic::AtomicU64::new(0),
+    herd_woken: std::sync::atomic::AtomicU64::new(0),
 };
 
 /// `OMNI_POLL_STATS=<seconds>`: a `[poll]` line that often -- changes told a second, threads
 /// waiting, and wake-ups a second; then of those, the changes told with no key (each wakes every
 /// waiter), the threads waiting on anything now, and the wake-ups a second keyed changes sent
-/// them (what `poll_keyed` is for).
+/// them (what `poll_keyed` is for); then the herds -- `wake_everyone` calls a second -- and the
+/// wake-ups a second herds of either kind sent (what `wake_dedupe` cuts).
 pub fn start_stats() {
     let Some(every) = std::env::var("OMNI_POLL_STATS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0) else { return };
     let _ = std::thread::Builder::new().name("omni-poll-stats".into()).spawn(move || {
@@ -422,10 +698,11 @@ pub fn start_stats() {
             std::thread::sleep(Duration::from_secs(every));
             let n = STATS.notifies.swap(0, Ordering::Relaxed);
             let w = STATS.wakes.swap(0, Ordering::Relaxed);
+            let (everyone, herd_woken) = (STATS.everyone.swap(0, Ordering::Relaxed), STATS.herd_woken.swap(0, Ordering::Relaxed));
             let (unkeyed, anything) = (STATS.unkeyed.load(Ordering::Relaxed), STATS.anything_woken.load(Ordering::Relaxed));
-            let on_anything = ANYTHING.lock().len();
+            let on_anything = ANYTHING_COUNT.load(Ordering::Relaxed);
             eprintln!(
-                "[poll] pid {}: {} notifications/s, {} threads waiting, {} wake-ups/s; {} unkeyed/s, {on_anything} waiting on anything, {} wake-ups/s to them (poll_keyed={})",
+                "[poll] pid {}: {} notifications/s, {} threads waiting, {} wake-ups/s; {} unkeyed/s, {on_anything} waiting on anything, {} wake-ups/s to them (poll_keyed={}); {} wake_everyone/s, {} herd wake-ups/s (wake_dedupe={})",
                 std::process::id(),
                 n / every,
                 STATS.waiting.load(Ordering::Relaxed),
@@ -433,6 +710,9 @@ pub fn start_stats() {
                 (unkeyed - unkeyed_was) / every,
                 (anything - anything_was) / every,
                 u8::from(keyed()),
+                everyone / every,
+                herd_woken / every,
+                u8::from(dedupe()),
             );
             (unkeyed_was, anything_was) = (unkeyed, anything);
         }
@@ -460,7 +740,7 @@ impl Drop for Waiting {
 /// latest; `EINTR` if the task has a deliverable signal. A waiter re-checks what it waits for
 /// afterwards: this can wake early. A wait on anything; [`watch`] waits on what it names.
 pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task) -> Result<(), Errno> {
-    let w = watch(None);
+    let w = watch_anything();
     if GENERATION.load(Ordering::SeqCst) != seen {
         return Ok(());
     }
@@ -470,7 +750,7 @@ pub(crate) fn wait_for_change(seen: u64, deadline: Option<Instant>, task: &Task)
 /// [`wait_for_change`] for a host thread, which has no signals to see: until `deadline` at the
 /// latest.
 pub(crate) fn wait_for_change_host(seen: u64, deadline: Instant) {
-    let w = watch(None);
+    let w = watch_anything();
     if GENERATION.load(Ordering::SeqCst) == seen {
         w.sleep(deadline);
     }
@@ -521,7 +801,7 @@ fn eventfd_read(efd: &EventFd, buf: &mut [u8], nonblocking: bool, task: &Task) -
             return Err(EAGAIN);
         }
         match watching.take() {
-            None => watching = Some(watch(Some(vec![key]))),
+            None => watching = Some(watch(Some([key]))),
             Some(w) => w.wait(None, task)?,
         }
     }
@@ -549,7 +829,7 @@ fn eventfd_write(efd: &EventFd, bytes: &[u8], nonblocking: bool, task: &Task) ->
             return Err(EAGAIN);
         }
         match watching.take() {
-            None => watching = Some(watch(Some(vec![key]))),
+            None => watching = Some(watch(Some([key]))),
             Some(w) => w.wait(None, task)?,
         }
     }
@@ -669,7 +949,7 @@ fn timerfd_read(timer: &TimerFd, buf: &mut [u8], nonblocking: bool, task: &Task)
         return Err(EINVAL);
     }
     loop {
-        let watch = watch(Some(vec![std::ptr::from_ref(timer) as Key]));
+        let watch = watch(Some([std::ptr::from_ref(timer) as Key]));
         let n = timer.take(Instant::now());
         if n > 0 {
             // Its expiries taken: the next one is a new edge (`EPOLLET`).
@@ -1158,5 +1438,176 @@ mod tests {
             waker.join().expect("waker");
             assert!(started.elapsed() < Duration::from_millis(1000), "woken after {:?}, not by the wake", started.elapsed());
         }
+    }
+
+    fn levers(dedupe: bool, park: bool) {
+        DEDUPE.store(dedupe, Ordering::Relaxed);
+        PARK.store(park, Ordering::Relaxed);
+    }
+
+    /// **A waiter on many keys is signalled once a change** (`wake_dedupe`): marked for each key,
+    /// kept once, and a second change that finds it woken keeps nothing to signal.
+    #[test]
+    fn a_waiter_on_many_keys_is_signalled_once() {
+        let w = Arc::new(Waiter::new());
+        let mut wakes = Wakes::default();
+        let kept = (0..6).filter(|_| wakes.mark(&w)).count();
+        assert_eq!(kept, 1);
+        assert_eq!(wakes.signal(), 1);
+        let mut again = Wakes::default();
+        assert!(!again.mark(&w), "woken already");
+        assert_eq!(again.signal(), 0);
+    }
+
+    /// **A waiter on many keys is signalled once** by each real way of waking it with
+    /// `wake_dedupe` -- a change of all its keys, a herd, an unkeyed change -- and once a key
+    /// without it. A herd from another test meanwhile finds it woken already and signals nothing
+    /// more (the lever is held).
+    #[test]
+    fn a_change_of_all_its_keys_signals_a_waiter_once() {
+        let _one = LEVERS_IN_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let words = [0u64; 6];
+        let keys: Vec<Key> = words.iter().map(|w| std::ptr::from_ref(w) as Key).collect();
+        // Counted from before it is in a queue, so no herd falls outside the count.
+        let fresh = || {
+            ME.with(|me| me.signals.store(0, Ordering::SeqCst));
+            watch(Some(keys.clone()))
+        };
+        for park in [false, true] {
+            levers(true, park);
+            for wake in [(|keys: &[Key]| notify_keys(keys)) as fn(&[Key]), |_| wake_everyone(), |_| notify()] {
+                let w = fresh();
+                wake(&keys);
+                assert_eq!(w.me.signals.load(Ordering::SeqCst), 1, "waiter_park={park}");
+            }
+        }
+        levers(false, true);
+        let w = fresh();
+        notify_keys(&keys);
+        assert!(w.me.signals.load(Ordering::SeqCst) >= keys.len() as u32, "wake_dedupe=0: once a key");
+        drop(w);
+        levers(true, true);
+    }
+
+    /// **No wake is lost**, whichever way waiters are woken and sleep: threads register, look and
+    /// sleep (5 s at most), while a change is made and then told, one at a time, each to be seen
+    /// at once -- told by key, by several keys at once, by a herd; and to waiters on anything, which
+    /// every keyed change reaches (past `ANYTHING_COUNT` with `wake_dedupe`).
+    #[test]
+    fn no_wake_is_lost() {
+        const WAITERS: usize = 6;
+        const ROUNDS: u64 = 1000;
+        let _one = LEVERS_IN_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (dedupe, park) in [(false, false), (true, false), (false, true), (true, true)] {
+            levers(dedupe, park);
+            // Each waiter's word, changed by the test, and what it last saw of it.
+            let words: Arc<Vec<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>> = Arc::new((0..WAITERS).map(|_| Default::default()).collect());
+            let keys: Vec<Key> = words.iter().map(|w| std::ptr::from_ref(&w.0) as Key).collect();
+            let threads: Vec<_> = (0..WAITERS)
+                .map(|i| {
+                    let (words, key) = (Arc::clone(&words), keys[i]);
+                    std::thread::spawn(move || {
+                        let (word, seen) = &words[i];
+                        let mut last = 0;
+                        while last < ROUNDS {
+                            let w = if i % 3 == 2 { watch_anything() } else { watch(Some([key, INERT])) };
+                            let now = word.load(Ordering::SeqCst);
+                            if now != last {
+                                last = now;
+                                seen.store(now, Ordering::SeqCst);
+                                continue;
+                            }
+                            w.sleep(Instant::now() + Duration::from_secs(5));
+                        }
+                    })
+                })
+                .collect();
+            for round in 1..=ROUNDS {
+                for (word, _) in words.iter() {
+                    word.store(round, Ordering::SeqCst);
+                }
+                match round % 3 {
+                    0 => wake_everyone(),
+                    1 => keys.iter().for_each(|k| notify_key(*k)),
+                    _ => notify_keys(&keys),
+                }
+                let deadline = Instant::now() + Duration::from_secs(2);
+                for (i, (_, seen)) in words.iter().enumerate() {
+                    while seen.load(Ordering::SeqCst) != round {
+                        assert!(Instant::now() < deadline, "round {round}: waiter {i} slept through its change (wake_dedupe={dedupe}, waiter_park={park})");
+                        std::thread::yield_now();
+                    }
+                }
+            }
+            for t in threads {
+                t.join().expect("waiter");
+            }
+        }
+        levers(true, true);
+    }
+
+    /// **A wait sleeps the way it began**: `waiter_park` switched while it sleeps, its waker still
+    /// wakes it on the token or the condition variable it waits on.
+    #[test]
+    fn a_wait_switched_midway_is_still_woken() {
+        let _one = LEVERS_IN_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (dedupe, park) in [(false, false), (true, false), (false, true), (true, true)] {
+            levers(dedupe, park);
+            let word = 0u64;
+            let key = std::ptr::from_ref(&word) as Key;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let sleeper = std::thread::spawn(move || {
+                let w = watch(Some([key]));
+                tx.send(()).expect("told");
+                let started = Instant::now();
+                w.sleep(started + Duration::from_secs(5));
+                started.elapsed()
+            });
+            rx.recv().expect("registered");
+            std::thread::sleep(Duration::from_millis(30));
+            PARK.store(!park, Ordering::Relaxed);
+            notify_key(key);
+            let slept = sleeper.join().expect("sleeper");
+            assert!(slept < Duration::from_secs(1), "woken after {slept:?} (wake_dedupe={dedupe}, waiter_park={park} then {})", !park);
+        }
+        levers(true, true);
+    }
+
+    /// `notify_key_one` wakes one waiter, the newest, in both ways of waking. (A herd from another
+    /// test meanwhile wakes both: that try is taken again.)
+    #[test]
+    fn one_waiter_is_woken_for_work_one_takes() {
+        let _one = LEVERS_IN_TEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let herds = || STATS.everyone.load(Ordering::SeqCst) + STATS.unkeyed.load(Ordering::SeqCst);
+        for dedupe in [false, true] {
+            levers(dedupe, true);
+            for _try in 0..5 {
+                let before = herds();
+                let word = 0u64;
+                let key = std::ptr::from_ref(&word) as Key;
+                let (tx, rx) = std::sync::mpsc::channel();
+                let sleepers: Vec<_> = (0..2)
+                    .map(|_| {
+                        let tx = tx.clone();
+                        let sleeper = std::thread::spawn(move || {
+                            let w = watch(Some([key]));
+                            tx.send(()).expect("told");
+                            w.sleep(Instant::now() + Duration::from_millis(300));
+                            w.me.woken.load(Ordering::SeqCst)
+                        });
+                        rx.recv().expect("registered");
+                        sleeper
+                    })
+                    .collect();
+                notify_key_one(key);
+                let woken: Vec<bool> = sleepers.into_iter().map(|s| s.join().expect("sleeper")).collect();
+                if herds() != before {
+                    continue;
+                }
+                assert_eq!(woken, [false, true], "the newest alone (wake_dedupe={dedupe})");
+                break;
+            }
+        }
+        levers(true, true);
     }
 }

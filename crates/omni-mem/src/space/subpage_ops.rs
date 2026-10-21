@@ -15,11 +15,16 @@
 //! 5. An alias is unmapped only after its host page is unmapped or replaced, never on a
 //!    protection change.
 
-use super::{GuestAddr, GuestSpace, Inner, OsState, Placement};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use super::{GuestAddr, GuestSpace, Inner, OsState, Placement, SpaceUsage};
+use crate::backing::Backing;
+use crate::entry::{Entry, Owner};
 use crate::error::{platform, MemError, MemResult};
 use crate::region::{RegionInfo, RegionKind};
 use crate::subpage::{Part, Split, SubPages, SubPagesHandle, GUEST_PAGE};
-use crate::CommitPolicy;
+use crate::{CommitPolicy, MappingId};
 use omni_platform::vm::{self, Protection};
 
 /// What the guest asked of a 4 KiB-exact range.
@@ -40,6 +45,19 @@ pub enum AccessPtr {
     /// The range mixes trapping and ordinary host pages: copy it in chunks
     /// ([`GuestSpace::for_each_access_chunk`]).
     Straddle,
+}
+
+/// How [`GuestSpace::map_file_exact`] puts its view under an edge host page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// The page is free: a new view, its other parts holes.
+    Free,
+    /// A never-touched anonymous page whose other parts are `PROT_NONE` or holes (the dynamic
+    /// linker's reservation around a library): a new view, those parts foreign (`Split::foreign`).
+    Reserved,
+    /// Already a view of the same file at the same offset that was never writable (the library's
+    /// neighbouring segment, from the same file or shifted file): no new view.
+    Same,
 }
 
 /// The overlay's numbers, for the memory report.
@@ -164,6 +182,14 @@ impl GuestSpace {
             }
             SubOp::Protect(protection) => {
                 inner.require_mapped(operation, address, len)?;
+                // A page leaving the overlay with foreign parts: their bytes become their own (zero)
+                // first, or the whole page would be the view's.
+                for &host_page in &tracked {
+                    let foreign = st.split.get(&host_page).map_or(0, |s| s.foreign);
+                    if foreign != 0 {
+                        self.privatise(inner, st, operation, host_page, foreign)?;
+                    }
+                }
                 // Host first, then the bits (SUBPAGE-ORDER 3).
                 inner.protect_range(operation, address, len, protection)?;
             }
@@ -203,14 +229,19 @@ impl GuestSpace {
                 }
             }
         };
+        let range = Split::mask(i0, i1);
         let (fill, zero, eager) = match op {
-            SubOp::Map(protection, commit) => (Part::Mapped(protection), true, commit == CommitPolicy::Eager),
-            SubOp::Protect(protection) => (Part::Mapped(protection), false, false),
-            SubOp::Unmap => (if Self::is_strict(st, at, len) { Part::StrictHole } else { Part::Hole }, false, false),
+            SubOp::Map(protection, commit) => (Part::Mapped(protection), range, commit == CommitPolicy::Eager),
+            // A foreign part made accessible reads zero, as the reservation it is (`Split::foreign`).
+            SubOp::Protect(protection) => (Part::Mapped(protection), if protection == Protection::None { 0 } else { split.foreign & range }, false),
+            SubOp::Unmap => (if Self::is_strict(st, at, len) { Part::StrictHole } else { Part::Hole }, 0, false),
         };
         let mapped_here = !st.split.contains_key(&host_page) && split.empty();
         split.set(i0, i1, fill);
-        let settled = self.settle(inner, st, operation, host_page, split, zero.then_some((i0, i1)), eager);
+        if !matches!(op, SubOp::Protect(Protection::None)) {
+            split.foreign &= !range;
+        }
+        let settled = self.settle(inner, st, operation, host_page, split, zero, eager);
         if settled.is_err() && mapped_here {
             // The host page this call mapped for a 4 KiB map goes again (checkpoint A, 4).
             let _ = inner.unmap_range(operation, host_page, page);
@@ -252,16 +283,34 @@ impl GuestSpace {
         }
     }
 
-    /// Put a changed host page's parts into effect, in SUBPAGE-ORDER. `zero`: parts newly mapped,
-    /// which must read zero.
+    /// The host protection a page with parts `split` gets (lenient where it may be), and the strict
+    /// one it falls back to: `(host, strict_host)`.
+    fn planned_host(&self, inner: &Inner, st: &SubPages, host_page: GuestAddr, split: &Split) -> (Protection, Protection) {
+        // PROT_NONE parts count toward the host page only where the guest asked for strictness.
+        let strict = crate::subpage::strict_prot_none_everywhere() || Self::is_strict(st, host_page, self.page);
+        // Read-only parts beside a writable one leniently (`Split::host_protection_lenient`) --
+        // not on a view of a shared backing, whose writes would reach every other view of it.
+        let shared = inner
+            .map
+            .entry_start(host_page)
+            .and_then(|s| inner.map.get(s))
+            .is_some_and(|e| matches!(e.os, OsState::View { .. }) && e.owner.as_ref().and_then(|o| o.backing.as_ref()).is_some_and(|b| b.is_shared()));
+        let lenient = crate::subpage::lenient_read_only() && !shared;
+        let strict_host = split.host_protection(strict);
+        let sealed = |i: usize| Self::is_sealed(st, host_page + i * GUEST_PAGE);
+        (if lenient { split.host_protection_lenient(strict, sealed) } else { strict_host }, strict_host)
+    }
+
+    /// Put a changed host page's parts into effect, in SUBPAGE-ORDER. `zero`: parts (bits) newly
+    /// mapped, which must read zero.
     fn settle(
         &self,
         inner: &mut Inner,
         st: &mut SubPages,
         operation: &'static str,
         host_page: GuestAddr,
-        split: Split,
-        zero: Option<(usize, usize)>,
+        mut split: Split,
+        zero: u64,
         eager: bool,
     ) -> MemResult<()> {
         let sub = self.sub_handle();
@@ -276,34 +325,23 @@ impl GuestSpace {
             self.unalias_range(st, host_page, page);
             return Ok(());
         }
-        // PROT_NONE parts count toward the host page only where the guest asked for strictness.
-        let strict = crate::subpage::strict_prot_none_everywhere() || Self::is_strict(st, host_page, page);
-        // Read-only parts beside a writable one leniently (`Split::host_protection_lenient`) --
-        // not on a view of a shared backing, whose writes would reach every other view of it.
-        let shared = inner
-            .map
-            .entry_start(host_page)
-            .and_then(|s| inner.map.get(s))
-            .is_some_and(|e| matches!(e.os, OsState::View { .. }) && e.owner.as_ref().and_then(|o| o.backing.as_ref()).is_some_and(|b| b.is_shared()));
-        let lenient = crate::subpage::lenient_read_only() && !shared;
-        let strict_host = split.host_protection(strict);
-        let sealed = |i: usize| Self::is_sealed(st, host_page + i * GUEST_PAGE);
-        let mut host = if lenient { split.host_protection_lenient(strict, sealed) } else { strict_host };
-        let needs_view = split.traps_under(host) || eager || (zero.is_some() && committed(inner));
+        let (mut host, strict_host) = self.planned_host(inner, st, host_page, &split);
+        let needs_view = split.traps_under(host) || eager || (zero != 0 && committed(inner));
         if needs_view {
             self.commit_page(inner, operation, host_page)?;
-            self.privatise(inner, st, operation, host_page)?;
+            self.privatise(inner, st, operation, host_page, split.foreign)?;
+            split.foreign = 0;
             self.ensure_alias(st, host_page)?;
         }
-        if let Some((i0, i1)) = zero {
-            if committed(inner) {
-                let alias = self.alias_of(st, host_page);
+        if zero != 0 && committed(inner) {
+            let alias = self.alias_of(st, host_page);
+            for i in (0..split.parts.len()).filter(|i| zero >> i & 1 != 0) {
                 // SAFETY: the alias is a live read-write view of this committed host page (just
                 // made), and the parts being zeroed are ones the guest has just mapped afresh.
-                unsafe { std::ptr::write_bytes((alias + i0 * GUEST_PAGE) as *mut u8, 0, (i1 - i0) * GUEST_PAGE) };
+                unsafe { std::ptr::write_bytes((alias + i * GUEST_PAGE) as *mut u8, 0, GUEST_PAGE) };
             }
         }
-        if let Some(protection) = split.uniform() {
+        if let Some(protection) = split.uniform().filter(|_| split.foreign == 0) {
             // Leaves the overlay: host first, then the bit (the alias stays, SUBPAGE-ORDER 5).
             inner.protect_range(operation, host_page, page, protection)?;
             sub.set_trapping(host_page, false);
@@ -315,7 +353,8 @@ impl GuestSpace {
             host = strict_host;
             if split.traps_under(host) {
                 self.commit_page(inner, operation, host_page)?;
-                self.privatise(inner, st, operation, host_page)?;
+                self.privatise(inner, st, operation, host_page, split.foreign)?;
+                split.foreign = 0;
                 self.ensure_alias(st, host_page)?;
             }
         }
@@ -333,6 +372,175 @@ impl GuestSpace {
         }
         st.split.insert(host_page, split);
         Ok(())
+    }
+
+    /// [`GuestSpace::map_file_exact`] with the overlay active: `[address, address + len)` is
+    /// 4 KiB-exact and `file_offset` agrees with `address` modulo the host page.
+    pub(super) fn map_file_edges(&self, backing: &Arc<Backing>, file_offset: u64, address: GuestAddr, len: usize, protection: Protection) -> MemResult<(GuestAddr, usize)> {
+        const OP: &str = "map_file_exact";
+        let page = self.page;
+        let mut inner = self.write();
+        let sub = self.sub_handle();
+        let mut st = sub.state.lock();
+        if !self.guest_view_is(&inner, &st, address, len, false) {
+            return Err(MemError::AddressTaken {
+                operation: OP,
+                requested: address,
+                requested_end: address + len,
+                conflict_start: address,
+                conflict_end: address + len,
+                conflict: "a mapped 4 KiB page",
+            });
+        }
+        let end = address + len;
+        let (first, last) = (address & !(page - 1), (end - 1) & !(page - 1));
+        let offset_at = |at: GuestAddr| file_offset + at as u64 - address as u64;
+        // Both ends inside one host page: one edge.
+        let single = first == last && address % page != 0 && end % page != 0;
+        let (head, tail) = {
+            let edge = |at: GuestAddr, from: GuestAddr, to: GuestAddr| {
+                self.edge(&inner, &st, at, Split::mask((from - at) / GUEST_PAGE, (to - at) / GUEST_PAGE), backing, offset_at(at), protection)
+            };
+            ((address % page != 0).then(|| edge(first, address, end.min(first + page))), (end % page != 0 && !single).then(|| edge(last, last.max(address), end)))
+        };
+        let taken = |e: &Option<Option<(Edge, Split)>>| !matches!(e, Some(None));
+        let fresh = |e: &Option<Option<(Edge, Split)>>| matches!(e, Some(Some((Edge::Free | Edge::Reserved, _))));
+        // The part made a view, and the host pages that need a new one.
+        let from = if taken(&head) { address } else { first + page };
+        let to = if single || taken(&tail) { end } else { last };
+        if from >= to {
+            return Ok((address, 0));
+        }
+        let lo = match &head {
+            None => address,
+            Some(_) if fresh(&head) => first,
+            Some(_) => first + page,
+        };
+        let hi = match &tail {
+            _ if single => if fresh(&head) { first + page } else { lo },
+            None => end,
+            Some(_) if fresh(&tail) => last + page,
+            Some(_) => last,
+        };
+        let (head_fresh, tail_fresh) = (fresh(&head), !single && fresh(&tail));
+        let edges: Vec<(GuestAddr, Edge, Split)> = [(first, head), (last, tail)].into_iter().filter_map(|(at, e)| e.flatten().map(|(k, s)| (at, k, s))).collect();
+        if lo < hi {
+            // A reservation's host page leaves it first -- never committed, nothing to give back --
+            // so the new view's range is free, and goes back to it if the view cannot be made.
+            let reserved: Vec<(GuestAddr, Option<Owner>)> = edges
+                .iter()
+                .filter(|(_, k, _)| *k == Edge::Reserved)
+                .map(|(at, _, _)| (*at, inner.map.entry_start(*at).and_then(|s| inner.map.get(s)).and_then(|e| e.owner.clone())))
+                .collect();
+            for &(at, _) in &reserved {
+                inner.unmap_range(OP, at, page)?;
+            }
+            // One mapping, but each new edge page an OS view of its own: made private later -- a
+            // `.bss` mapped over its reservation part -- it unmaps that view alone, where one view of
+            // the whole range would be unmapped, mapped again and scanned for copy-on-write pages
+            // (`Inner::unmap_view`) at each library's load.
+            let whole = (address.next_multiple_of(page), end & !(page - 1));
+            let mut pieces: Vec<(GuestAddr, usize)> = Vec::new();
+            if head_fresh {
+                pieces.push((first, page));
+            }
+            if whole.0 < whole.1 {
+                pieces.push((whole.0, whole.1 - whole.0));
+            }
+            if tail_fresh {
+                pieces.push((last, page));
+            }
+            let owner = Owner {
+                id: MappingId(super::NEXT_MAPPING.fetch_add(1, Ordering::Relaxed)),
+                mapping_start: lo,
+                mapping_len: hi - lo,
+                protection,
+                granule: inner.granule,
+                commit: CommitPolicy::Eager,
+                backing: Some(Arc::clone(backing)),
+                file_offset: offset_at(lo),
+                label: crate::label::current(),
+            };
+            let ever_writable = protection.is_writable() && !backing.is_shared();
+            let mut made: Vec<(GuestAddr, usize)> = Vec::new();
+            for (at, n) in pieces {
+                match inner.make_exact_placeholder(OP, at, n, true).and_then(|()| inner.map_view(OP, backing, offset_at(at), at, n, protection)) {
+                    Ok(view) => {
+                        inner.map.replace(at, n, Entry { len: n, os: OsState::View { view }, owner: Some(owner.clone()), ever_writable });
+                        made.push((at, n));
+                    }
+                    Err(e) => {
+                        for (at, n) in made {
+                            let _ = inner.unmap_range(OP, at, n);
+                        }
+                        for (at, owner) in reserved {
+                            if inner.make_exact_placeholder(OP, at, page, true).is_ok() {
+                                inner.map.replace(at, page, Entry { len: page, os: OsState::Placeholder, owner, ever_writable: false });
+                            }
+                        }
+                        inner.validate();
+                        return Err(e);
+                    }
+                }
+            }
+            debug_assert_eq!(made.first().map(|m| m.0), Some(lo), "the pieces start the range");
+            debug_assert_eq!(made.last().map(|m| m.0 + m.1), Some(hi), "and end it");
+            // Replaced pages' aliases go (SUBPAGE-ORDER 5).
+            self.unalias_range(&mut st, lo, hi - lo);
+        }
+        st.sealed.retain(|&(s, e)| !(s < end && address < e));
+        // Each edge's parts first, so that undoing a failed settle (below) sees what was mapped.
+        for (at, _, split) in &edges {
+            st.split.insert(*at, split.clone());
+        }
+        for (at, _, split) in edges {
+            if let Err(e) = self.settle(&mut inner, &mut st, OP, at, split, 0, false) {
+                // Only what this call mapped goes: its parts, through the overlay.
+                drop(st);
+                let _ = self.sub_apply(&mut inner, OP, from, to - from, SubOp::Unmap);
+                inner.validate();
+                return Err(e);
+            }
+        }
+        drop(st);
+        inner.validate();
+        Ok((from, to - from))
+    }
+
+    /// Whether [`map_file_edges`](Self::map_file_edges)'s view can sit under edge host page
+    /// `host_page`, whose parts `ours` (bits) it maps from `offset` (the page's file offset): how,
+    /// and the page's parts with it in place. `None` leaves the page out, for the caller to copy
+    /// its part as before.
+    #[allow(clippy::too_many_arguments)]
+    fn edge(&self, inner: &Inner, st: &SubPages, host_page: GuestAddr, ours: u64, backing: &Backing, offset: u64, protection: Protection) -> Option<(Edge, Split)> {
+        // A shared view's page is aliased as it is (`privatise`), and its holes would be the file.
+        if backing.is_shared() {
+            return None;
+        }
+        let entry = inner.map.get(inner.map.entry_start(host_page)?)?;
+        let (kind, mut split) = if entry.is_free() {
+            (Edge::Free, Split::new(st.parts_per_page, Part::Hole))
+        } else {
+            let split = st.split.get(&host_page)?.clone();
+            let owner = entry.owner.as_ref()?;
+            let reserve = split.parts.iter().enumerate().all(|(i, p)| ours >> i & 1 != 0 || matches!(p, Part::Hole | Part::StrictHole | Part::Mapped(Protection::None)));
+            match (entry.os, owner.backing.as_ref()) {
+                (OsState::Placeholder, None) if reserve => (Edge::Reserved, split),
+                // Never writable: no copy-on-write page holds bytes the file does not.
+                (OsState::View { .. }, Some(b)) if b.id() == backing.id() && !entry.ever_writable && owner.offset_at(host_page) == offset => (Edge::Same, split),
+                _ => return None,
+            }
+        };
+        for i in 0..split.parts.len() {
+            if ours >> i & 1 != 0 {
+                split.parts[i] = Part::Mapped(protection);
+            } else if kind == Edge::Reserved && split.parts[i] == Part::Mapped(Protection::None) {
+                split.foreign |= 1 << i;
+            }
+        }
+        // A page that would trap is privatised by `settle`: a copy, which the caller makes anyway.
+        let (host, _) = self.planned_host(inner, st, host_page, &split);
+        (!split.traps_under(host)).then_some((kind, split))
     }
 
     /// Commit one host page whatever protection its entry records (`commit_range` skips a `None`
@@ -361,8 +569,10 @@ impl GuestSpace {
     }
 
     /// A file view's host page becomes private anonymous memory with the same bytes, so it can be
-    /// aliased without depending on how the host shares a copy-on-write view.
-    fn privatise(&self, inner: &mut Inner, st: &mut SubPages, operation: &'static str, host_page: GuestAddr) -> MemResult<()> {
+    /// aliased without depending on how the host shares a copy-on-write view. Its `foreign` parts
+    /// (bits, `Split::foreign`) get zeros instead: the reservation's own bytes. The caller clears
+    /// them from the page's split.
+    fn privatise(&self, inner: &mut Inner, st: &mut SubPages, operation: &'static str, host_page: GuestAddr, foreign: u64) -> MemResult<()> {
         let page = self.page;
         let Some(start) = inner.map.entry_start(host_page) else { return Ok(()) };
         let entry = inner.map.get(start).expect("entry vanished");
@@ -388,6 +598,11 @@ impl GuestSpace {
         // `inner` is held but guest code, whose writes the copy may or may not see -- as a
         // concurrent write during the guest's own mprotect may or may not land.
         unsafe { std::ptr::copy_nonoverlapping(inner.host(host_page) as *const u8, bytes.as_mut_ptr(), page) };
+        for (i, part) in bytes.chunks_mut(GUEST_PAGE).enumerate() {
+            if foreign >> i & 1 != 0 {
+                part.fill(0);
+            }
+        }
         inner.unmap_range(operation, host_page, page)?;
         self.unalias_range(st, host_page, page);
         self.map_anonymous_locked(inner, operation, Placement::Fixed(host_page), page, Protection::ReadWrite, CommitPolicy::Eager)?;
@@ -473,6 +688,10 @@ impl GuestSpace {
             let (first, count, part) = split.run_at((address - host_page) / GUEST_PAGE);
             let Part::Mapped(protection) = part else { return None };
             let start = host_page + first * GUEST_PAGE;
+            if split.is_foreign(first) {
+                // A reservation's part over the page's view: anonymous, holding nothing.
+                return Some(RegionInfo { start, len: count * GUEST_PAGE, protection, committed: 0, kind: RegionKind::Anonymous, ..info });
+            }
             return Some(RegionInfo {
                 start,
                 len: count * GUEST_PAGE,
@@ -498,6 +717,42 @@ impl GuestSpace {
         expand(regions, &st.split, self.page, include_free)
     }
 
+    /// [`GuestSpace::usage`]'s pass, `inner` held: every mapped entry (the host's ranges too, as
+    /// `mapped_regions` lists them), less the holes of the tracked pages it covers, which are
+    /// walked in step in address order. A page that runs past an entry's end is kept for the next.
+    pub(super) fn guest_usage(&self, inner: &Inner) -> SpaceUsage {
+        let st = self.sub.as_ref().map(|sub| sub.state.lock());
+        let mut tracked = st.as_ref().filter(|st| !st.split.is_empty()).map(|st| st.split.iter().peekable());
+        let page = self.page;
+        let mut usage = SpaceUsage::default();
+        for (start, entry) in inner.map.iter() {
+            if entry.is_free() {
+                continue;
+            }
+            let end = start + entry.len;
+            let private = matches!(entry.os, OsState::Private { .. });
+            usage.mapped += entry.len;
+            if private {
+                usage.committed += entry.len;
+            }
+            let Some(pages) = tracked.as_mut() else { continue };
+            while pages.next_if(|(p, _)| **p + page <= start).is_some() {}
+            for (p, split) in pages.clone().take_while(|(p, _)| **p < end) {
+                for (i, part) in split.parts.iter().enumerate() {
+                    if matches!(part, Part::Hole | Part::StrictHole) {
+                        let (from, to) = ((p + i * GUEST_PAGE).max(start), (p + (i + 1) * GUEST_PAGE).min(end));
+                        let hole = to.saturating_sub(from);
+                        usage.mapped -= hole;
+                        if private {
+                            usage.committed -= hole;
+                        }
+                    }
+                }
+            }
+        }
+        usage
+    }
+
     /// `[address, address + len)` cut at host page boundaries into maximal pieces that are all
     /// tracked or all not: `(start, len, tracked)`. `inner` is held.
     pub(super) fn pieces_by_tracking(&self, inner: &Inner, address: GuestAddr, len: usize) -> Vec<(GuestAddr, usize, bool)> {
@@ -521,7 +776,11 @@ impl GuestSpace {
     }
 
     /// Zero the mapped parts of `[at, at + len)`, inside tracked host pages, through their alias
-    /// (`discard`). Returns the bytes zeroed.
+    /// (`discard`). Returns the bytes zeroed. A view of a shared backing is left alone, as
+    /// `discard` leaves an untracked one: its page is the file's (`privatise` keeps it so), and
+    /// zeros written through its alias were written into the file -- or, on a page wholly past the
+    /// file's end, a host `SIGBUS` at the alias, outside the guest space, which killed the host
+    /// process. Linux's `MADV_DONTNEED` leaves a shared mapping's file as it is.
     pub(super) fn zero_tracked(&self, inner: &mut Inner, operation: &'static str, at: GuestAddr, len: usize) -> MemResult<usize> {
         let sub = self.sub_handle();
         let mut st = sub.state.lock();
@@ -529,9 +788,17 @@ impl GuestSpace {
         let mut zeroed = 0;
         let mut p = at & !(page - 1);
         while p < at + len {
-            let committed = inner.map.entry_start(p).and_then(|s| inner.map.get(s)).is_some_and(|e| matches!(e.os, OsState::Private { .. } | OsState::View { .. }));
+            let committed = inner.map.entry_start(p).and_then(|s| inner.map.get(s)).is_some_and(|e| match e.os {
+                OsState::Private { .. } => true,
+                OsState::View { .. } => !e.owner.as_ref().and_then(|o| o.backing.as_ref()).is_some_and(|b| b.is_shared()),
+                _ => false,
+            });
             if committed {
-                self.privatise(inner, &mut st, operation, p)?;
+                let foreign = st.split.get(&p).map_or(0, |s| s.foreign);
+                self.privatise(inner, &mut st, operation, p, foreign)?;
+                if let Some(s) = st.split.get_mut(&p) {
+                    s.foreign = 0;
+                }
                 self.ensure_alias(&mut st, p)?;
                 let (from, to) = (at.max(p), (at + len).min(p + page));
                 let mapped: Vec<(usize, usize)> = {
@@ -561,7 +828,11 @@ impl GuestSpace {
         let mut p = at & !(page - 1);
         while p < at + bytes.len() {
             self.commit_page(inner, operation, p)?;
-            self.privatise(inner, &mut st, operation, p)?;
+            let foreign = st.split.get(&p).map_or(0, |s| s.foreign);
+            self.privatise(inner, &mut st, operation, p, foreign)?;
+            if let Some(s) = st.split.get_mut(&p) {
+                s.foreign = 0;
+            }
             self.ensure_alias(&mut st, p)?;
             p += page;
         }
@@ -576,7 +847,8 @@ impl GuestSpace {
         Ok(())
     }
 
-    /// `held_ranges` in the guest's view: a tracked page's holes are not held. `inner` is held.
+    /// `held_ranges` in the guest's view: a tracked page's holes and foreign parts are not held.
+    /// `inner` is held.
     pub(super) fn guest_held(&self, held: Vec<(GuestAddr, usize)>) -> Vec<(GuestAddr, usize)> {
         let Some(sub) = &self.sub else { return held };
         let st = sub.state.lock();
@@ -605,7 +877,8 @@ impl GuestSpace {
                         let mut g = at;
                         while g < next {
                             let gn = ((g & !(GUEST_PAGE - 1)) + GUEST_PAGE).min(next);
-                            if matches!(s.parts[(g - host_page) / GUEST_PAGE], Part::Mapped(_)) {
+                            let i = (g - host_page) / GUEST_PAGE;
+                            if matches!(s.parts[i], Part::Mapped(_)) && !s.is_foreign(i) {
                                 push(g, gn);
                             }
                             g = gn;
@@ -779,6 +1052,9 @@ fn expand(regions: Vec<RegionInfo>, split: &std::collections::BTreeMap<usize, Sp
                 let (ps, pe) = (host_page + first * GUEST_PAGE, host_page + (first + count) * GUEST_PAGE);
                 let mut piece = clip(&r, ps.max(r.start), pe.min(r.end()));
                 match part {
+                    Part::Mapped(protection) if s.is_foreign(first) => {
+                        piece = RegionInfo { kind: RegionKind::Anonymous, protection, committed: 0, ..piece };
+                    }
                     Part::Mapped(protection) => piece.protection = protection,
                     Part::Hole | Part::StrictHole => {
                         piece = RegionInfo { kind: RegionKind::Free, protection: Protection::None, committed: 0, mapping: None, ..piece };

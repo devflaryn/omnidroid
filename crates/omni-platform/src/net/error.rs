@@ -281,7 +281,13 @@ pub enum NetError {
     },
 
     /// The host refused the operation, classified into something an errno can be derived from.
-    #[error("`{operation}` on {endpoint}: {kind} ({detail})")]
+    ///
+    /// A [`NetErrorKind::WouldBlock`] carries no endpoint and no detail (both empty, so nothing is
+    /// allocated): it is every non-blocking loop's answer, many thousands a second, and nothing
+    /// renders it -- naming the socket was a `getsockname` and two `format!`s a call. MEASURED (M4,
+    /// 2026-10-20): an empty UDP socket's `recv` 1.12 us as before, 0.37-0.45 us now
+    /// (`net::tests::what_a_would_block_receive_costs`).
+    #[error("`{operation}`{}: {kind}{}", on_endpoint(.endpoint), in_parens(.detail))]
     Io {
         /// The seam operation that was called.
         operation: &'static str,
@@ -369,6 +375,27 @@ pub enum NetError {
     },
 }
 
+/// A part of [`NetError::Io`]'s message around a text, or nothing when the text is empty (a
+/// would-block's endpoint and detail).
+struct Around<'a>(&'static str, &'a str, &'static str);
+
+impl fmt::Display for Around<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.1.is_empty() {
+            return Ok(());
+        }
+        write!(f, "{}{}{}", self.0, self.1, self.2)
+    }
+}
+
+fn on_endpoint(endpoint: &str) -> Around<'_> {
+    Around(" on ", endpoint, "")
+}
+
+fn in_parens(detail: &str) -> Around<'_> {
+    Around(" (", detail, ")")
+}
+
 impl NetError {
     /// True when this failure means "this backend has no implementation".
     ///
@@ -436,6 +463,16 @@ impl NetError {
         endpoint: impl Into<String>,
         error: &std::io::Error,
     ) -> NetError {
+        NetError::io_naming(operation, error, || endpoint.into())
+    }
+
+    /// [`io`](Self::io), the endpoint named only when the failure is not a would-block: `name` is
+    /// what costs (a socket's own address, asked of the host).
+    pub(super) fn io_naming(
+        operation: &'static str,
+        error: &std::io::Error,
+        name: impl FnOnce() -> String,
+    ) -> NetError {
         // `std` has no `ErrorKind` for every code a socket call produces -- `EMSGSIZE` among
         // them, on both families of host -- so the backend's own table of raw codes is asked
         // before a failure is left unclassified. MEASURED: a 1444-byte datagram with
@@ -448,7 +485,15 @@ impl NetError {
             }
             kind => kind,
         };
-        NetError::Io { operation, endpoint: endpoint.into(), kind, detail: error.to_string() }
+        if kind == NetErrorKind::WouldBlock {
+            return NetError::would_block(operation);
+        }
+        NetError::Io { operation, endpoint: name(), kind, detail: error.to_string() }
+    }
+
+    /// The would-block answer to `operation`: no endpoint, no detail, nothing allocated.
+    pub(super) fn would_block(operation: &'static str) -> NetError {
+        NetError::Io { operation, endpoint: String::new(), kind: NetErrorKind::WouldBlock, detail: String::new() }
     }
 
     /// Build a [`NetError::Io`] with a kind this seam decided rather than the host.
@@ -458,6 +503,9 @@ impl NetError {
         kind: NetErrorKind,
         detail: impl Into<String>,
     ) -> NetError {
+        if kind == NetErrorKind::WouldBlock {
+            return NetError::would_block(operation);
+        }
         NetError::Io { operation, endpoint: endpoint.into(), kind, detail: detail.into() }
     }
 
@@ -532,6 +580,29 @@ mod tests {
         let pending = NetError::kinded("connect", "fd 3", NetErrorKind::InProgress, "started");
         assert!(blocked.is_would_block());
         assert!(!pending.is_would_block(), "a pending connect is not a would-block");
+    }
+
+    /// A would-block names nothing -- no endpoint is asked for, nothing is allocated -- and still
+    /// says what it is; every other failure keeps its endpoint and the host's message.
+    #[test]
+    fn a_would_block_names_no_endpoint_and_another_failure_keeps_its_own() {
+        let asked = std::cell::Cell::new(0);
+        let name = || {
+            asked.set(asked.get() + 1);
+            "IPv4 stream bound to 127.0.0.1:5".to_owned()
+        };
+        let blocked = NetError::io_naming("recv", &std::io::Error::from(std::io::ErrorKind::WouldBlock), name);
+        assert!(blocked.is_would_block());
+        assert_eq!(asked.get(), 0, "a would-block does not name its socket");
+        let NetError::Io { endpoint, detail, .. } = &blocked else { panic!("{blocked:?}") };
+        assert_eq!((endpoint.capacity(), detail.capacity()), (0, 0), "nothing allocated");
+        assert_eq!(blocked.to_string(), format!("`recv`: {}", NetErrorKind::WouldBlock));
+        let reset = NetError::io_naming("recv", &std::io::Error::from(std::io::ErrorKind::ConnectionReset), name);
+        assert_eq!(asked.get(), 1);
+        let text = reset.to_string();
+        assert!(text.starts_with("`recv` on IPv4 stream bound to 127.0.0.1:5: "), "{text}");
+        assert!(text.ends_with(')'), "the host's message is kept: {text}");
+        assert!(NetError::kinded("accept", "fd 3", NetErrorKind::WouldBlock, "later").to_string().ends_with(NetErrorKind::WouldBlock.as_str()));
     }
 
     /// The classification is the host's, and a failure the host does not classify stays `Other`.

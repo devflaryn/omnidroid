@@ -19,7 +19,8 @@
 //! | 11, 12 | pixel bytes, low and high 32 bits |
 //! | 13 | where the pixels start in the region |
 //!
-//! The metadata page is zero but for the requestor's name, NUL-terminated at [`NAME_AT`].
+//! The metadata page is zero but for the requestor's name, NUL-terminated at [`NAME_AT`], and the
+//! requestor itself at [`OWNER_AT`] (written by the host alone).
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -44,6 +45,11 @@ const MAPPER_SUFFIX: &str = "omni";
 pub const PIXELS_AT: u64 = 4096;
 /// Where the requestor's name is in the metadata page.
 pub const NAME_AT: u64 = 64;
+/// Where the requestor is in the metadata page: the pid (i32) and uid (u32) of `allocate2`'s caller
+/// -- an app's own, a remote app's stand-in having its pid and uid -- after the share fields
+/// (`gpu::share`, 3200 .. 3415). Which app draws on a display ([`owner`],
+/// `hal::composer::Composer::owners`): an app allocates its windows' buffers itself (BLAST).
+pub const OWNER_AT: u64 = 3416;
 const MAGIC: u32 = 0x4247_4d4f; // 'OMGB'
 const LAYOUT_VERSION: i32 = 1;
 /// The most buffers one `allocate2` makes.
@@ -84,6 +90,29 @@ fn bytes_per_pixel(format: i32) -> Option<u64> {
 }
 
 const BLOB: i32 = 0x21;
+
+/// The requestor of the buffer whose region is `shm` ([`OWNER_AT`]): `(pid, uid)`, or `None` for a
+/// region the allocator did not make, or made for the host itself (pid 0).
+#[must_use]
+pub fn owner(shm: &Shm) -> Option<(i32, u32)> {
+    let mut b = [0u8; 8];
+    if shm.read_at(&mut b, OWNER_AT).ok()? != b.len() {
+        return None;
+    }
+    let (pid, uid) = (i32::from_le_bytes([b[0], b[1], b[2], b[3]]), u32::from_le_bytes([b[4], b[5], b[6], b[7]]));
+    (pid != 0).then_some((pid, uid))
+}
+
+/// Record `(pid, uid)` as the requestor of the buffer whose region is `shm` ([`owner`]).
+///
+/// # Errors
+/// The region's.
+pub fn set_owner(shm: &Shm, (pid, uid): (i32, u32)) -> Result<(), crate::errno::Errno> {
+    let mut b = [0u8; 8];
+    b[..4].copy_from_slice(&pid.to_le_bytes());
+    b[4..].copy_from_slice(&uid.to_le_bytes());
+    shm.write_at(&b, OWNER_AT).map(|_| ())
+}
 
 struct Descriptor {
     name: Vec<u8>,
@@ -170,14 +199,15 @@ impl Allocator {
             PING_TRANSACTION => return w.into_reply(),
             _ => {}
         }
-        if let Err(Malformed(why)) = self.answer(call.code, &call.data, &mut w) {
+        if let Err(Malformed(why)) = self.answer(call.code, &call.data, (call.sender_pid, call.sender_euid), &mut w) {
             w = Writer::new();
             w.exception(EX_ILLEGAL_ARGUMENT, why, None);
         }
         w.into_reply()
     }
 
-    fn answer(&self, code: u32, data: &[u8], w: &mut Writer) -> Result<(), Malformed> {
+    /// One transaction of `requestor` (its sender's pid and uid).
+    fn answer(&self, code: u32, data: &[u8], requestor: (i32, u32), w: &mut Writer) -> Result<(), Malformed> {
         let mut r = Reader::new(data);
         r.interface_token(DESCRIPTOR)?;
         match code {
@@ -185,7 +215,7 @@ impl Allocator {
             ALLOCATE2 => {
                 let d = Descriptor::read(&mut r)?;
                 let count = r.i32()?;
-                self.allocate(&d, count, w);
+                self.allocate(&d, count, requestor, w);
             }
             IS_SUPPORTED => {
                 let d = Descriptor::read(&mut r)?;
@@ -209,8 +239,9 @@ impl Allocator {
         Ok(())
     }
 
-    /// `allocate2`: `count` buffers of description `d`, or the `AllocationError` refusing them.
-    fn allocate(&self, d: &Descriptor, count: i32, w: &mut Writer) {
+    /// `allocate2`: `count` buffers of description `d` for `requestor`, or the `AllocationError`
+    /// refusing them.
+    fn allocate(&self, d: &Descriptor, count: i32, requestor: (i32, u32), w: &mut Writer) {
         let refuse = |w: &mut Writer, e: i32| w.exception(EX_SERVICE_SPECIFIC, "", Some(e));
         let (stride, bytes) = match d.layout() {
             Ok(l) => l,
@@ -224,7 +255,7 @@ impl Allocator {
         }
         let mut made = Vec::new();
         for _ in 0..count {
-            match self.make(d, bytes) {
+            match self.make(d, bytes, requestor) {
                 Ok(b) => made.push(b),
                 Err(()) => return refuse(w, NO_RESOURCES),
             }
@@ -260,8 +291,8 @@ impl Allocator {
         w.parcelable_end(result);
     }
 
-    /// One buffer's region: zeroed, its name in the metadata page.
-    fn make(&self, d: &Descriptor, bytes: u64) -> Result<(u64, Arc<Shm>), ()> {
+    /// One buffer's region: zeroed, its name and its requestor in the metadata page.
+    fn make(&self, d: &Descriptor, bytes: u64, requestor: (i32, u32)) -> Result<(u64, Arc<Shm>), ()> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let shm = Shm::create(&format!("omni-gralloc-{id}")).map_err(|_| ())?;
         shm.set_len(PIXELS_AT + bytes).map_err(|_| ())?;
@@ -269,6 +300,7 @@ impl Allocator {
         let mut name = d.name.clone();
         name.push(0);
         shm.write_at(&name, NAME_AT).map_err(|_| ())?;
+        set_owner(&shm, requestor).map_err(|_| ())?;
         let mut buffers = self.buffers.lock();
         buffers.retain(|_, b| b.strong_count() > 0);
         buffers.insert(id, Arc::downgrade(&shm));

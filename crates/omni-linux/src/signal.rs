@@ -67,6 +67,7 @@ pub const SI_TIMER: i32 = -2;
 pub const SI_TKILL: i32 = -6;
 pub const SEGV_MAPERR: i32 = 1;
 pub const SEGV_ACCERR: i32 = 2;
+pub const BUS_ADRERR: i32 = 2;
 pub const ILL_ILLOPC: i32 = 1;
 pub const TRAP_BRKPT: i32 = 1;
 pub const SYS_SECCOMP: i32 = 1;
