@@ -320,6 +320,28 @@ The owner's pool's saved devices were among the gutted ones: set aside as `.gutt
 
 ## Found, not acted on (yet)
 
+- **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the
+  system host at idle (+0 blocks). Not the guest's instruction-cache operations: a trace of
+  `cb_icache_op` (`OMNI_IC_TRACE`, tried and removed) saw none at idle -- they are the backend's
+  one-word plants and unplants (thunks, sentinels), each one thread's JIT, 4 bytes: cheap.
+- **Snapshots lower idle CPU**: 3.8-4.8% of a core against 6.9-7.2% without (s15 and a rerun with
+  the 256 MiB budget, `OMNI_JIT_SHARED_CACHE_LIVE_MB=256`, which keeps the same idle CPU for ~-25..+90
+  MB). Why is not found; the boot gain now converges only after two filled runs (10.5 s against
+  11.2-11.3 s), +30..+130 MB.
+- **An app's first frame**: HWUI's first frame of the probe app is ~740 ms ("Davey!"), most of it
+  ANGLE bringing up Vulkan on the host GPU in the app's process. A spare could initialise EGL ahead
+  -- but a waiting spare holding a GPU stack is ~90 MiB more on every warm device (the home's
+  GPU-drawn 165 MiB against software-drawn 72 MiB), so not done.
+- **Install** of the 243 MB Delta APK on a warm device: 1.5 s (`pm install -r -g`); first launch
+  of Roblox on it 4.5 s (TotalTime, with a spare).
+- **The Delta APKs on the Desktop** (Delta-updated 2.743, Delta-rebuild) both stop at Android's
+  "All files access" page for themselves: they ask for MANAGE_EXTERNAL_STORAGE without declaring
+  it, so autogrant skips it and AppOps refuses even `cmd appops set` (stays `default`). The same on
+  `main` -- no in-game check was possible with them.
+- **Binary size**: omni-linux-run.exe 12.4 MB (omni-linux 7.5 MB with the device's embedded files,
+  dynarmic 3.7 MB); fat LTO 12.2 MB (-1.6%), not worth its build time; the image decoders (~0.5 MB)
+  serve clipboard pastes.
+
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
   second forever -- cheap, a stub daemon would cost more than it saves.
 - JIT at boot (`OMNI_JIT_TIME=5`): the system host translates 1.13 M blocks by warm ready, 3.1 s
