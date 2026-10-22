@@ -104,6 +104,10 @@ pub static PRESENT_OVER_BLACK: AtomicBool = AtomicBool::new(true);
 /// The last vsync's time on the guest's clock (ns), for a present fence's signal time.
 static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
 
+/// Frames presented (`present`), for the vsync thread's account: how many of the vsyncs delivered
+/// were followed by a frame.
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// **`composer_skip_validate=1`** (lever; `OMNI_COMPOSER_SKIP_VALIDATE=1` from the start): a frame
 /// the composer composes itself is presented at `presentOrValidateDisplay` and answered
 /// `Presented`, as a hardware composer with nothing to change does -- rather than `Validated`,
@@ -261,13 +265,14 @@ impl VsyncRate {
         }
         let period = f64::from(vsync_period_ns()) / 1e6;
         eprintln!(
-            "[vsync] {:.2} Hz {} (period {period:.3} ms = {:.2} Hz): {} ticks in {:.1} s, {} delivered, {} missed, late avg {:.2} max {:.2} ms",
+            "[vsync] {:.2} Hz {} (period {period:.3} ms = {:.2} Hz): {} ticks in {:.1} s, {} delivered, {} frames presented, {} missed, late avg {:.2} max {:.2} ms",
             self.ticks as f64 / took.as_secs_f64(),
             if paced { "paced" } else { "sleep-loop" },
             1e3 / period,
             self.ticks,
             took.as_secs_f64(),
             self.delivered,
+            PRESENTS.swap(0, Ordering::Relaxed),
             self.missed,
             self.late_sum.as_secs_f64() * 1e3 / self.ticks as f64,
             self.late_max.as_secs_f64() * 1e3,
@@ -890,6 +895,7 @@ impl Client {
     /// or nothing while the display shows a card ([`Composer::set_card`]), whose lock is held to
     /// the end, so a card set meanwhile is drawn after this frame and never under it.
     fn present(&self, screen: &Screen) {
+        PRESENTS.fetch_add(1, Ordering::Relaxed);
         let card = screen.card.lock();
         if card.is_some() {
             return;
@@ -1956,7 +1962,9 @@ impl IComposerClientServer for Client {
 
     fn set_vsync_enabled(&self, _ctx: &Ctx<'_>, display: i64, enabled: bool) -> Result<(), Status> {
         self.screen(display)?;
-        self.vsync.store(enabled, Ordering::Relaxed);
+        if self.vsync.swap(enabled, Ordering::Relaxed) != enabled && std::env::var_os("OMNI_VSYNC_TRACE").is_some() {
+            eprintln!("[vsync] display {display}: SurfaceFlinger turned vsync {}", if enabled { "on" } else { "off" });
+        }
         Ok(())
     }
 

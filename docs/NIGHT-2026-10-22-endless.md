@@ -181,6 +181,29 @@ life. Now 50 ms (`OMNI_SPARE_POLL_MS` in the guest environment, e.g. through
 
 **-2 points of a core idle (-22% of a warm device's idle CPU), 3/3.**
 
+## s10 -- vsync while nothing is drawn
+
+Found with two new counters (`[vsync] ... N frames presented`, and `OMNI_VSYNC_TRACE=1` logging
+SurfaceFlinger's `setVsyncEnabled`): on an idle warm device SurfaceFlinger turned vsync on at boot
+and never off -- 1800 vsyncs delivered and 0 frames presented in 30 s, each one a binder
+transaction into SurfaceFlinger. `dumpsys SurfaceFlinger --vsync`: `hwVsyncState=Enabled`,
+`mMoreSamplesNeeded=1`, "No Last HW vsync" -- its VsyncReactor keeps asking for samples, so it never
+turns hardware vsync off (why its predictor keeps rejecting them is not found yet; its model reads
+period 16.67 ms, intercept 38 ns).
+
+`OMNI_VSYNC_IDLE_EVERY=<n>`: once no frame has been presented for 1 s, only every n-th vsync is
+delivered; the first frame presented brings every one back (SurfaceFlinger times its frames with
+its own predictor, not these callbacks).
+
+| | vsyncs delivered / 30 s idle | all hosts' CPU (% of a core) | system host |
+|---|---|---|---|
+| every vsync (A1-A3) | 1800 / 1801 / 1801 | 7.47 / 7.59 / 7.67 | 6.64 / 6.54 / 6.59 |
+| every 30th (B1-B3) | 61 / 61 / 61 | 7.35 / 7.66 / 7.52 | 6.88 / 6.59 / 6.64 |
+
+**No difference: not kept** (the throttle reverted; the frames-presented count and
+`OMNI_VSYNC_TRACE` stay, as diagnostics). A vsync callback is cheap; the system host's idle
+~6.6% of a core is elsewhere -- and `OMNI_THREAD_CPU` shows system_server's own threads idle.
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
