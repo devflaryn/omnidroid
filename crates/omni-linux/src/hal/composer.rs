@@ -108,6 +108,16 @@ static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
 /// were followed by a frame.
 static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Frames presented since the start (never reset).
+static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames this host process's composer has presented, on every display, since it started: whether
+/// anything was drawn between two looks (`crate::code_trim`, SurfaceFlinger's trim).
+#[must_use]
+pub fn presented() -> u64 {
+    PRESENTED.load(Ordering::Relaxed)
+}
+
 /// **`composer_skip_validate=1`** (lever; `OMNI_COMPOSER_SKIP_VALIDATE=1` from the start): a frame
 /// the composer composes itself is presented at `presentOrValidateDisplay` and answered
 /// `Presented`, as a hardware composer with nothing to change does -- rather than `Validated`,
@@ -896,6 +906,7 @@ impl Client {
     /// the end, so a card set meanwhile is drawn after this frame and never under it.
     fn present(&self, screen: &Screen) {
         PRESENTS.fetch_add(1, Ordering::Relaxed);
+        PRESENTED.fetch_add(1, Ordering::Relaxed);
         let card = screen.card.lock();
         if card.is_some() {
             return;

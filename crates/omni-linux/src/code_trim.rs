@@ -11,10 +11,12 @@
 //! have left generated code, and what it runs from then on is translated again, a small working
 //! set. At most once a process every [`AGAIN_AFTER`].
 //!
-//! **Not a busy host process's** (the game's: more than [`BUSY_CORES`] of a core over the period):
+//! host process (the game's: more than [`BUSY_CORES`] of a core over the period):
 //! a clear there would be translated again at once, a hitch for nothing. In the system's host
-//! process, **not SurfaceFlinger's**, which runs its frame path every frame. `OMNI_CODE_TRIM=0`
-//! turns it off.
+//! process, **SurfaceFlinger's only over a period no frame was presented in** (an idle device: its
+//! 41 MiB of boot-time translations kept forever before, 2026-10-22); while anything is drawn it
+//! runs its frame path every frame, and is left alone. `OMNI_CODE_TRIM_SF=0`: never, as before.
+//! `OMNI_CODE_TRIM=0` turns it all off.
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -66,6 +68,13 @@ fn parked_pass() {
     });
 }
 
+/// Whether SurfaceFlinger may be trimmed over a period nothing was drawn in (`OMNI_CODE_TRIM_SF=0`:
+/// never).
+fn sf_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_CODE_TRIM_SF").as_deref() != Ok("0"))
+}
+
 /// Start the trimmer for this host process (once).
 pub fn start() {
     age::start();
@@ -90,10 +99,13 @@ fn run() {
     let mut cpu = omni_platform::process::cpu_time().ok();
     let mut since = started;
     let mut early = false;
+    // Frames presented at the last look: SurfaceFlinger is trimmed only over a period without any.
+    let mut frames = crate::hal::composer::presented();
     while started.elapsed() < PERIOD {
         std::thread::sleep(Duration::from_secs(1));
         if crate::settle::FIRST_TRIM.load(std::sync::atomic::Ordering::Relaxed) && crate::settle::settled() {
-            look(&mut seen, threads.as_mut(), false, true, min_bytes);
+            look(&mut seen, threads.as_mut(), false, true, min_bytes, false);
+            frames = crate::hal::composer::presented();
             (cpu, since, early) = (omni_platform::process::cpu_time().ok(), Instant::now(), true);
             break;
         }
@@ -113,14 +125,17 @@ fn run() {
         };
         (cpu, since) = (now_cpu, Instant::now());
         let busy = cores > BUSY_CORES && crate::remote::is_remote();
-        look(&mut seen, threads.as_mut(), busy, false, min_bytes);
+        let now_frames = crate::hal::composer::presented();
+        let drawn_nothing = now_frames == frames;
+        frames = now_frames;
+        look(&mut seen, threads.as_mut(), busy, false, min_bytes, drawn_nothing);
     }
 }
 
 /// One look over the live processes: each quiet one (or every one, `all_quiet`) holding more than
 /// `min_bytes` of translations, not trimmed in [`AGAIN_AFTER`], has them dropped -- unless `busy`.
 /// One that is busy, or not quiet, has its largest quiet thread's dropped instead (`threads`).
-fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, mut threads: Option<&mut HashMap<usize, (u64, Option<Instant>)>>, busy: bool, all_quiet: bool, min_bytes: u64) {
+fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, mut threads: Option<&mut HashMap<usize, (u64, Option<Instant>)>>, busy: bool, all_quiet: bool, min_bytes: u64, drawn_nothing: bool) {
     let live = crate::process::all_live();
     census(&live);
     // A vfork child still on its parent's backend: the parent's threads, looked at once.
@@ -129,14 +144,15 @@ fn look(seen: &mut HashMap<i32, (u64, Option<Instant>)>, mut threads: Option<&mu
         let pid = p.sys.pid;
         let emitted = p.code_emitted();
         let (last, trimmed) = seen.get(&pid).copied().unwrap_or((emitted, None));
+        if p.comm.lock().as_slice() == b"surfaceflinger" && !(drawn_nothing && sf_trim()) {
+            seen.insert(pid, (emitted, trimmed));
+            continue;
+        }
         seen.insert(pid, (emitted, trimmed));
         let name = String::from_utf8_lossy(&p.comm.lock()).into_owned();
         let committed = p.code_cache_committed();
         let quiet = all_quiet || emitted.saturating_sub(last) < QUIET_BYTES;
         let due = trimmed.is_none_or(|t| t.elapsed() >= AGAIN_AFTER);
-        if name == "surfaceflinger" {
-            continue;
-        }
         if busy || !quiet {
             if !backends.insert(p.backend_key()) {
                 continue;

@@ -524,7 +524,9 @@ fn main() -> ExitCode {
             // Each thread's own caches (arm64): their per-block tables, beside their code.
             let tables: u64 = all.iter().map(|p| p.code_table_bytes()).sum::<u64>() >> 20;
             each.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-            let largest: Vec<String> = each.iter().take(6).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
+            // `OMNI_MEM_TRACE_ALL=1`: every guest process, not the six largest.
+            let shown = if std::env::var("OMNI_MEM_TRACE_ALL").as_deref() == Ok("1") { each.len() } else { 6 };
+            let largest: Vec<String> = each.iter().take(shown).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
             eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB (their tables {tables} MiB); largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
             // The translation caches' own tables, on the host's heap (not in the caches' commit).
             let census = omni_cpu::stats::code_caches_with_tables();
