@@ -240,7 +240,14 @@ pub(crate) fn import(gpu: &Gpu, p: &Process, device: u64, t: &Arc<Table>, info: 
         writable,
     };
     upload(&mut m);
-    gpu.ahb_memory.lock().insert(memory.as_raw(), m);
+    let live = {
+        let mut mirrors = gpu.ahb_memory.lock();
+        mirrors.insert(memory.as_raw(), m);
+        mirrors.len()
+    };
+    if trace() {
+        eprintln!("[ahb] mirror made ({} bytes): {live} live", req.size);
+    }
     p.mem.write(out, &memory.as_raw().to_le_bytes()).map_err(|_| CallError::Args)?;
     Ok(0)
 }
@@ -336,9 +343,19 @@ pub(crate) fn after_submit(gpu: &Gpu, t: &Arc<Table>, device: u64, queue: u64) -
 
 /// `vkFreeMemory` of imported memory: forget its mirror (the caller frees the memory).
 pub(crate) fn forget_memory(gpu: &Gpu, memory: u64) {
-    if let Some(m) = gpu.ahb_memory.lock().remove(&memory) {
+    let mut mirrors = gpu.ahb_memory.lock();
+    if let Some(m) = mirrors.remove(&memory) {
         gpu.ahb_images.lock().remove(&m.image);
+        if trace() {
+            eprintln!("[ahb] mirror freed: {} live", mirrors.len());
+        }
     }
+}
+
+/// `OMNI_AHB_TRACE=1`: each mirror made and freed, with how many are live.
+fn trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_AHB_TRACE").as_deref() == Ok("1"))
 }
 
 /// A device is gone: its mirrors with it.

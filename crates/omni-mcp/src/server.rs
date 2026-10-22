@@ -14,7 +14,7 @@ use crate::json::{self, Json};
 use crate::mcp::{Dispatch, RpcError};
 
 /// The protocol version this server speaks. MCP is dated; this is a widely-supported revision.
-const PROTOCOL_VERSION: &str = "2024-11-05";
+pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Configuration, resolved from arguments then environment then defaults. Every field is also
 /// overridable per `start_instance` call, so one server can drive several different runs.
@@ -128,6 +128,30 @@ pub trait Live: Send {
 pub const LIVE_TOOLS: &[&str] = &[
     "start_instance", "stop_instance", "list_instances", "install_apk", "launch_app", "screenshot", "shell", "uninstall_apk", "stop_app", "device_status", "stop_device",
 ];
+
+/// **The lab's tools**, as `tools/list` gives them -- data only: what lists them reaches none of the
+/// lab's code (the omnidroid app lists them and runs them in `omni-mcp --lab`, so its executable
+/// carries no CPU backend).
+#[must_use]
+pub fn lab_tools() -> Vec<Json> {
+    match Server::tool_list().get("tools") {
+        Some(Json::Array(all)) => all.iter().filter(|t| t.get("name").and_then(Json::as_str).is_some_and(|n| !LIVE_TOOLS.contains(&n))).cloned().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A [`Live`] with no tools: a server of the lab's alone (`omni-mcp --lab`).
+pub struct NoLive;
+
+impl Live for NoLive {
+    fn tools(&self) -> Vec<Json> {
+        Vec::new()
+    }
+
+    fn call(&mut self, _name: &str, _arguments: &Json) -> Option<Result<Json, RpcError>> {
+        None
+    }
+}
 
 /// The MCP server.
 pub struct Server {

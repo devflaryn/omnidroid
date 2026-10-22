@@ -42,7 +42,7 @@ fn an_object_in_flight_is_not_released_before_its_buffer_is_freed() {
     let given = holder.read(&mut h, &[]);
     assert_eq!(codes(&given), [1]);
     let handle = u32::from_le_bytes(given[0].data[8..12].try_into().unwrap());
-    assert_eq!(holder.write_read(&mut h, &free(given[0].buffer), false).0, 0);
+    assert_eq!(holder.write_read(&mut h, &[acquire(handle), free(given[0].buffer)].concat(), false).0, 0);
 
     // The holder sends the owner its own object back, then dies before the owner reads it.
     let back = holder.transaction(BC_TRANSACTION, handle, 2, TF_ONE_WAY, &object(TYPE_HANDLE, u64::from(handle), 0), &[0]);

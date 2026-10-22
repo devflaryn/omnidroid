@@ -30,7 +30,7 @@ const LONG_LEGACY_ERROR: &[u8] = b"Must use __system_property_read_callback() to
 const BUILD_PROPS: [&str; 4] = ["/system/build.prop", "/system_ext/etc/build.prop", "/vendor/build.prop", "/product/etc/build.prop"];
 
 /// What omnidroid, as the vendor, sets on top.
-const OVERLAY: [(&str, &str); 21] = [
+const OVERLAY: [(&str, &str); 22] = [
     // The property service speaks protocol 2 (a reply for every set).
     ("ro.property_service.version", "2"),
     // The runtime this device offers, as the options AndroidRuntime adds from
@@ -82,6 +82,13 @@ const OVERLAY: [(&str, &str); 21] = [
     // turning it off live (`service call SurfaceFlinger 1041 i32 -1`) gave back 138 MiB of the
     // system host process. `dumpsys SurfaceFlinger` says "Transaction tracing: disabled".
     ("debug.sf.enable_transaction_tracing", "0"),
+    // No boot animation. Its frames are an app's Vulkan frames (`bootanimation`, ANGLE), so the
+    // display window made its GPU presenter for them -- which then stayed: the system host +133 MB
+    // on every idle warm device, warm ready no different (four ABBA pairs, 2026-10-22: 1,077-1,081
+    // against 1,211-1,215 MB, ready 11.2-11.5 against 11.3-12.4 s). The boot is drawn by no one;
+    // a window shows black until the home or the app. (On 2026-10-01, at ~46 s boots, ready was
+    // later without it; not so now.) `OMNI_R_SETPROPS=debug.sf.nobootanimation=0` brings it back.
+    ("debug.sf.nobootanimation", "1"),
 ];
 
 /// `ro.hw_timeout_multiplier` for a host with `cpus` logical CPUs (`asked`: `OMNI_HW_TIMEOUT_MULTIPLIER`),

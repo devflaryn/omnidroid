@@ -41,6 +41,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     // why; `persist.omni.cached_processes`).
     ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
+    // The boot receivers a device of this kind has no use for, disabled once per device and for
+    // each user the pool makes (the script says which and why; `persist.omni.quiet_boot=0`: not).
+    ("/vendor/etc/init/omni_quiet.rc", include_bytes!("../device/vendor/etc/init/omni_quiet.rc")),
+    ("/vendor/bin/omni_quiet.sh", include_bytes!("../device/vendor/bin/omni_quiet.sh")),
     // The boot's own settings: no dexopt at install (the file says why).
     ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
     // Every app process's entry point and a spare app process's (`device/src/spare/`;
@@ -49,6 +53,8 @@ pub const FILES: &[(&str, &[u8])] = &[
     // The framework's configuration as this device has it: a static overlay (RRO), as a vendor
     // partition carries one (`device/src/overlay/`; the values file says why each is there).
     ("/vendor/overlay/omni-device-overlay.apk", include_bytes!("../device/vendor/overlay/omni-device-overlay.apk")),
+    // The kiosk device's home, in place of Settings' FallbackHome (`KIOSK_HOME`, `device/src/home/`).
+    ("/vendor/app/OmniHome/OmniHome.apk", include_bytes!("../device/vendor/app/OmniHome/OmniHome.apk")),
 ];
 
 /// The image's vendor files this device replaces with its own: device configuration, which a
@@ -226,6 +232,128 @@ pub fn idle_apps_key_suffix() -> &'static str {
     }
 }
 
+/// **The image's overlays that never apply here**, left out of every lean device
+/// (`OMNI_DEVICE_OVERLAYS=all` keeps them): the emulator's device skins (`EmulationPixel*` for the
+/// framework, `SystemUIEmulationPixel*` for SystemUI), Developer options' cutout emulations, an
+/// optional font and the notes role -- all disabled (`cmd overlay list`: `[ ]`, warm device
+/// 2026-10-22) -- and the telephony apps' overlays, whose targets [`LEAVES_OUT`] drops. 54 of the
+/// kiosk device's 134 packages with [`KIOSK_INERT_OVERLAYS`], each scanned by PackageManager and
+/// tracked by OverlayManager at every boot, and held in system_server.
+pub const INERT_OVERLAYS: &[&str] = &[
+    "/product/overlay/EmulationPixel2XL",
+    "/product/overlay/EmulationPixel3",
+    "/product/overlay/EmulationPixel3XL",
+    "/product/overlay/EmulationPixel3a",
+    "/product/overlay/EmulationPixel3aXL",
+    "/product/overlay/EmulationPixel4",
+    "/product/overlay/EmulationPixel4XL",
+    "/product/overlay/EmulationPixel4a",
+    "/product/overlay/EmulationPixel5",
+    "/product/overlay/EmulationPixel6",
+    "/product/overlay/EmulationPixel6Pro",
+    "/product/overlay/EmulationPixel6a",
+    "/product/overlay/EmulationPixel7",
+    "/product/overlay/EmulationPixel7Pro",
+    "/product/overlay/EmulationPixel7a",
+    "/product/overlay/EmulationPixel8",
+    "/product/overlay/EmulationPixel8Pro",
+    "/product/overlay/EmulationPixel8a",
+    "/product/overlay/EmulationPixelFold",
+    "/product/overlay/SystemUIEmulationPixel3",
+    "/product/overlay/SystemUIEmulationPixel3XL",
+    "/product/overlay/SystemUIEmulationPixel3a",
+    "/product/overlay/SystemUIEmulationPixel3aXL",
+    "/product/overlay/SystemUIEmulationPixel4",
+    "/product/overlay/SystemUIEmulationPixel4XL",
+    "/product/overlay/SystemUIEmulationPixel4a",
+    "/product/overlay/SystemUIEmulationPixel5",
+    "/product/overlay/SystemUIEmulationPixel6",
+    "/product/overlay/SystemUIEmulationPixel6Pro",
+    "/product/overlay/SystemUIEmulationPixel6a",
+    "/product/overlay/SystemUIEmulationPixel7",
+    "/product/overlay/SystemUIEmulationPixel7Pro",
+    "/product/overlay/SystemUIEmulationPixel7a",
+    "/product/overlay/SystemUIEmulationPixel8",
+    "/product/overlay/SystemUIEmulationPixel8Pro",
+    "/product/overlay/SystemUIEmulationPixel8a",
+    "/product/overlay/SystemUIEmulationPixelFold",
+    "/product/overlay/DisplayCutoutEmulationCorner",
+    "/product/overlay/DisplayCutoutEmulationDouble",
+    "/product/overlay/DisplayCutoutEmulationEmu01",
+    "/product/overlay/DisplayCutoutEmulationHole",
+    "/product/overlay/DisplayCutoutEmulationTall",
+    "/product/overlay/DisplayCutoutEmulationWaterfall",
+    "/product/overlay/FontNotoSerifSource",
+    "/product/overlay/NotesRoleEnabled",
+    "/product/overlay/TeleService__emulator__auto_generated_characteristics_rro.apk",
+    "/product/overlay/TelephonyProvider__emulator__auto_generated_characteristics_rro.apk",
+    "/vendor/overlay/CarrierConfig__sdk_phone64_arm64__auto_generated_rro_vendor.apk",
+    "/vendor/overlay/TeleService__sdk_phone64_arm64__auto_generated_rro_vendor.apk",
+];
+
+/// The overlays of what the kiosk device does not have: the navigation bar's modes (no SystemUI,
+/// no bar; all four disabled) and SystemUI's own vendor overlay.
+pub const KIOSK_INERT_OVERLAYS: &[&str] = &[
+    "/product/overlay/NavigationBarMode2Button",
+    "/product/overlay/NavigationBarMode3Button",
+    "/product/overlay/NavigationBarModeGestural",
+    "/product/overlay/TransparentNavigationBar",
+    "/vendor/overlay/SystemUI__sdk_phone64_arm64__auto_generated_rro_vendor.apk",
+];
+
+/// Whether [`INERT_OVERLAYS`] are left out: a lean device's, unless `OMNI_DEVICE_OVERLAYS=all`.
+#[must_use]
+pub fn inert_overlays_out() -> bool {
+    std::env::var("OMNI_DEVICE_OVERLAYS").as_deref() != Ok("all") && std::env::var("OMNI_DEVICE_APPS").as_deref() != Ok("full")
+}
+
+/// What a saved device's name carries when its image has no inert overlays (`-ol`), else nothing.
+#[must_use]
+pub fn overlays_key_suffix() -> &'static str {
+    if inert_overlays_out() {
+        "-ol"
+    } else {
+        ""
+    }
+}
+
+/// **The kiosk device's own home** (`/vendor/app/OmniHome`, `device/src/home/`): a black window,
+/// where Settings' FallbackHome was the home of a device without a launcher. FallbackHome brought
+/// up all of Settings -- a host process of ~220 MiB private on every warm device, and one more for
+/// every pool user (its own home), for a window the composer never shows -- and its statsd retries
+/// (`crate::socket`'s sink). Only the kiosk device has it (the others have Launcher3, and two homes
+/// would ask which); `OMNI_KIOSK_HOME=0` leaves it out (FallbackHome again).
+pub const KIOSK_HOME: &str = "/vendor/app/OmniHome";
+
+/// [`KIOSK_HOME`]'s package.
+pub const KIOSK_HOME_PACKAGE: &str = "com.omnidroid.home";
+
+/// **The kiosk home starts in a spare app process** (`crate::zygote`'s spare; `OMNI_HOME_SPARE=0`:
+/// not). boot_completed waits for the home to draw, and a home started cold spent ~0.8 of its ~2.5 s
+/// on its host process and ART coming up (run 2026-10-22); a spare started as soon as the zygote
+/// serves is up by then. Only where spares are kept (`OMNI_APP_SPARE=1`: the warm device, the pool).
+#[must_use]
+pub fn home_spare() -> bool {
+    std::env::var("OMNI_HOME_SPARE").as_deref() != Ok("0")
+}
+
+/// Whether this device has [`KIOSK_HOME`].
+#[must_use]
+pub fn kiosk_home() -> bool {
+    std::env::var("OMNI_DEVICE_APPS").as_deref() == Ok("kiosk") && std::env::var("OMNI_KIOSK_HOME").as_deref() != Ok("0")
+}
+
+/// What the name of a saved device (`kiosk` or not) carries when it has [`KIOSK_HOME`] (`-kh`),
+/// else nothing: a device saved with FallbackHome as its home is another device.
+#[must_use]
+pub fn kiosk_home_key_suffix(kiosk: bool) -> &'static str {
+    if kiosk && std::env::var("OMNI_KIOSK_HOME").as_deref() != Ok("0") {
+        "-kh"
+    } else {
+        ""
+    }
+}
+
 /// **The hardware this device does not have**, left out as a product build leaves a HAL's package
 /// out: its init service (`.rc`), its VINTF declaration (so no client waits for it) and its
 /// feature files (so no system service or app looks for it). What remains is what the app and the
@@ -340,15 +468,26 @@ pub const KIOSK_IME: &str = "/product/app/LatinIME";
 /// for keystore2 at every boot, gave up ("Could not create keystore key") and set both
 /// properties on its way out (2026-10-01) -- while init waited on `odsign.key.done`. The outcome is
 /// the same without it, 5 s sooner. `OMNI_KEEP_SERVICES=odsign` runs it.
-pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")])];
+///
+/// `apexd-bootstrap` (`apexd --bootstrap`, init's first `exec_start`, before /data): it activates the
+/// bootstrap APEXes from loop and device-mapper devices, which this kernel does not have, and failed
+/// at every boot -- "Failed LOOP_CTL_ADD", "Failed to open device-mapper", then "Failed to create
+/// directory /apex/sharedlibs: Read-only file system", exit 1 -- having set no property and written
+/// nothing; the flattened APEXes are in the sysroot, and the `apexd` service that follows is the
+/// one whose `apexd.status` init waits for. 199 ms of init's critical path (2026-10-22).
+pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")]), ("apexd-bootstrap", &[])];
 
 /// The properties `service` would have set, if the device leaves it out ([`SERVICES_LEFT_OUT`],
-/// less `OMNI_KEEP_SERVICES`, comma-separated).
+/// less `OMNI_KEEP_SERVICES`, comma-separated; more with `OMNI_LEAVE_OUT_SERVICES`, which set
+/// nothing -- for measuring what a service costs).
 #[must_use]
 pub fn service_left_out(service: &str) -> Option<&'static [(&'static str, &'static str)]> {
     let kept = std::env::var("OMNI_KEEP_SERVICES").unwrap_or_default();
     if kept.split(',').any(|k| k.trim() == service) {
         return None;
+    }
+    if std::env::var("OMNI_LEAVE_OUT_SERVICES").unwrap_or_default().split(',').any(|k| k.trim() == service) {
+        return Some(&[]);
     }
     SERVICES_LEFT_OUT.iter().find(|(name, _)| *name == service).map(|(_, props)| *props)
 }
@@ -410,11 +549,16 @@ pub fn left_out() -> Vec<&'static str> {
 fn apps_left_out() -> Vec<&'static str> {
     let ime = (std::env::var("OMNI_KIOSK_IME").as_deref() != Ok("1")).then_some(KIOSK_IME);
     let idle: &[&str] = if idle_apps_out() { IDLE_APPS_LEFT_OUT } else { &[] };
+    // The kiosk home is the device's own file, not the image's: out of every other device.
+    let home = (!kiosk_home()).then_some(KIOSK_HOME);
+    let ime = ime.into_iter().chain(home);
+    let overlays: &[&str] = if inert_overlays_out() { INERT_OVERLAYS } else { &[] };
+    let kiosk_overlays: &[&str] = if inert_overlays_out() { KIOSK_INERT_OVERLAYS } else { &[] };
     match std::env::var("OMNI_DEVICE_APPS").as_deref() {
-        Ok("full") => Vec::new(),
-        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).chain(idle).copied().chain(ime).collect(),
-        Ok("lean-hw") => LEAVES_OUT.iter().chain(idle).copied().chain(ime).collect(),
-        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(idle).copied().chain(ime).collect(),
+        Ok("full") => vec![KIOSK_HOME],
+        Ok("kiosk") => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(KIOSK_LEAVES_OUT).chain(idle).chain(overlays).chain(kiosk_overlays).copied().chain(ime).collect(),
+        Ok("lean-hw") => LEAVES_OUT.iter().chain(idle).chain(overlays).copied().chain(ime).collect(),
+        _ => LEAVES_OUT.iter().chain(HARDWARE_LEFT_OUT).chain(idle).chain(overlays).copied().chain(ime).collect(),
     }
 }
 

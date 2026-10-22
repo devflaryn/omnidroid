@@ -104,6 +104,20 @@ pub static PRESENT_OVER_BLACK: AtomicBool = AtomicBool::new(true);
 /// The last vsync's time on the guest's clock (ns), for a present fence's signal time.
 static LAST_VSYNC_NS: AtomicI64 = AtomicI64::new(0);
 
+/// Frames presented (`present`), for the vsync thread's account: how many of the vsyncs delivered
+/// were followed by a frame.
+static PRESENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames presented since the start (never reset).
+static PRESENTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Frames this host process's composer has presented, on every display, since it started: whether
+/// anything was drawn between two looks (`crate::code_trim`, SurfaceFlinger's trim).
+#[must_use]
+pub fn presented() -> u64 {
+    PRESENTED.load(Ordering::Relaxed)
+}
+
 /// **`composer_skip_validate=1`** (lever; `OMNI_COMPOSER_SKIP_VALIDATE=1` from the start): a frame
 /// the composer composes itself is presented at `presentOrValidateDisplay` and answered
 /// `Presented`, as a hardware composer with nothing to change does -- rather than `Validated`,
@@ -261,13 +275,14 @@ impl VsyncRate {
         }
         let period = f64::from(vsync_period_ns()) / 1e6;
         eprintln!(
-            "[vsync] {:.2} Hz {} (period {period:.3} ms = {:.2} Hz): {} ticks in {:.1} s, {} delivered, {} missed, late avg {:.2} max {:.2} ms",
+            "[vsync] {:.2} Hz {} (period {period:.3} ms = {:.2} Hz): {} ticks in {:.1} s, {} delivered, {} frames presented, {} missed, late avg {:.2} max {:.2} ms",
             self.ticks as f64 / took.as_secs_f64(),
             if paced { "paced" } else { "sleep-loop" },
             1e3 / period,
             self.ticks,
             took.as_secs_f64(),
             self.delivered,
+            PRESENTS.swap(0, Ordering::Relaxed),
             self.missed,
             self.late_sum.as_secs_f64() * 1e3 / self.ticks as f64,
             self.late_max.as_secs_f64() * 1e3,
@@ -358,7 +373,8 @@ pub fn edid(port: u8, name: &str) -> Vec<u8> {
 
 /// The windows left out of what is presented (this module's "Only the app"), by the start of their
 /// buffers' window name: SystemUI's bars and screen decorations (rounded corners, cutout), the
-/// launcher's taskbar, and Settings' `FallbackHome` (the home of a device without a launcher).
+/// launcher's taskbar, Settings' `FallbackHome` (the home of a device without a launcher) and the
+/// kiosk device's own home (`OmniKioskHome`, `crate::device::KIOSK_HOME`).
 ///
 /// Not the crash dialog (`AppErrorDialog`, titled `Application Error: <process>`), though it is no
 /// more the app's: a view root names its buffers after the last dot-separated part of its window's
@@ -367,7 +383,7 @@ pub fn edid(port: u8, name: &str) -> Vec<u8> {
 /// Responding: com.roblox.client`), shown because waiting or closing is the person's choice, and
 /// that of any window of the app whose title ends in `.client`. A crashed app's display gets a
 /// card instead ([`Composer::set_card`]), which covers the dialog with the rest.
-const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer", "FallbackHome"];
+const CHROME: &[&str] = &["StatusBar", "NavigationBar", "Taskbar", "ScreenDecorOverlay", "ScreenDecorHwcLayer", "FallbackHome", "OmniKioskHome"];
 
 /// Whether a buffer of this name (`hal::gralloc`'s metadata page) is one of the windows left out
 /// ([`CHROME`]): a view root's BufferQueue is named `VRI[<name>]#<n>(BLAST Consumer)<n>`, the name
@@ -889,6 +905,8 @@ impl Client {
     /// or nothing while the display shows a card ([`Composer::set_card`]), whose lock is held to
     /// the end, so a card set meanwhile is drawn after this frame and never under it.
     fn present(&self, screen: &Screen) {
+        PRESENTS.fetch_add(1, Ordering::Relaxed);
+        PRESENTED.fetch_add(1, Ordering::Relaxed);
         let card = screen.card.lock();
         if card.is_some() {
             return;
@@ -914,12 +932,16 @@ impl Client {
             super::compose::levers_from_env();
             // `present_zero`: shown by the window's GPU from the app's share images, when every
             // layer can be; else this frame is composed on the CPU as below.
+            // Without a sink, a frame with share images has the window make one (this frame
+            // composed on the CPU); frames without any have it dropped after a while.
             if crate::gpu::share::on() {
                 if let Some(sink) = screen.framebuffer.sink() {
                     if present_shared(&st, screen, &order, &*sink) {
+                        screen.framebuffer.set_sink_wanted(true);
                         return;
                     }
                 }
+                screen.framebuffer.set_sink_wanted(any_shared(&st, &order));
             }
             let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
             // One opaque layer over the whole display (a game's SurfaceView): its rows straight
@@ -1169,6 +1191,15 @@ static ZERO_WHY: Mutex<&str> = Mutex::new("");
 /// plane alpha 1 and untransformed, the window's GPU composes them (`sink`) and the framebuffer
 /// gets the frame without its pixels -- composed on the CPU only if someone reads them. False, with
 /// nothing presented: the CPU composes this frame.
+/// Whether a visible layer's buffer has a share image (an app's Vulkan frames, `present_zero`).
+fn any_shared(st: &State, order: &[(i32, i64)]) -> bool {
+    order.iter().any(|&(_, l)| {
+        st.device.get(&l).is_some_and(|d| {
+            !st.hidden.contains(&l) && d.frame.is_some() && d.slot.and_then(|s| d.buffers.get(&s)).is_some_and(|b| crate::gpu::share::ShareDesc::read(&b.shm).is_some())
+        })
+    })
+}
+
 fn present_shared(st: &State, screen: &Screen, order: &[(i32, i64)], sink: &dyn super::framebuffer::ZeroSink) -> bool {
     use crate::gpu::share::{self, ShareBlend, ShareDesc, ShareLayer};
     let why = (|| -> Result<(Vec<ShareLayer>, Vec<OwnedLayer>), &'static str> {
@@ -1955,7 +1986,9 @@ impl IComposerClientServer for Client {
 
     fn set_vsync_enabled(&self, _ctx: &Ctx<'_>, display: i64, enabled: bool) -> Result<(), Status> {
         self.screen(display)?;
-        self.vsync.store(enabled, Ordering::Relaxed);
+        if self.vsync.swap(enabled, Ordering::Relaxed) != enabled && std::env::var_os("OMNI_VSYNC_TRACE").is_some() {
+            eprintln!("[vsync] display {display}: SurfaceFlinger turned vsync {}", if enabled { "on" } else { "off" });
+        }
         Ok(())
     }
 

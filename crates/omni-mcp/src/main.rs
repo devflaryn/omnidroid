@@ -29,11 +29,24 @@ fn main() {
                 }
                 return;
             }
+            // `--lab`: the lab's tools alone (no instance or device tools, nothing booted) -- the
+            // omnidroid app runs its lab tools here, a process of their own.
+            "--lab" => {
+                let mut server = Server::with_live(Config::from_env(), Box::new(omni_mcp::server::NoLive));
+                let stdin = io::stdin();
+                let stdout = io::stdout();
+                if let Err(e) = mcp::serve(BufReader::new(stdin.lock()), stdout.lock(), &mut server) {
+                    eprintln!("omni-mcp: transport error: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
             "--help" | "-h" => {
                 eprintln!(
                     "omni-mcp: an MCP (stdio) server that drives omnidroid.\n\
                      Speaks JSON-RPC 2.0 on stdin/stdout (one message per line).\n\
-                     `omni-mcp --connect <url>` is a bridge to the omnidroid app's MCP server instead.\n\
+                     `omni-mcp --connect <url>` is a bridge to the omnidroid app's MCP server instead;\n\
+                     `omni-mcp --lab` serves the lab's tools alone (the app's lab).\n\
                      Config via env: OMNI_MCP_APK, OMNI_MCP_ARGS, OMNI_MCP_LINK_ID, OMNI_MCP_GPU,\n\
                      OMNI_MCP_SIZE, OMNI_MCP_DEVICE_RAM_MB, OMNI_MCP_MINUTES, OMNIDROID_BIN, OMNI_MCP_REPO.\n\
                      See crates/omni-mcp/README.md for a .mcp.json snippet."

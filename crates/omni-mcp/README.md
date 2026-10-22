@@ -19,6 +19,10 @@ claude mcp add --transport http --scope user omnidroid http://127.0.0.1:7457/mcp
 omni-mcp --connect http://127.0.0.1:7457/mcp     # the stdio bridge, for an agent that starts MCP servers as programs
 ```
 
+The lab's tools run in a process of their own, `omni-mcp --lab` beside the app's executable,
+started at the first lab call (the app itself carries no CPU backend); build both
+(`cargo build --release -p omnidroid -p omni-mcp`).
+
 Every agent then drives the same pool of warm Androids. The app's own tools (`crates/omnidroid/src/app/live.rs`):
 
 | tool | does |

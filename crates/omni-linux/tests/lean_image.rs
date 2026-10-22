@@ -78,6 +78,27 @@ fn each_device_mode_leaves_its_apps_out_of_the_image() {
     let with_hardware = open(Some("lean-hw"));
     assert!(with_hardware.has(CAMERA_HAL) && with_hardware.has(FINGERPRINT_HAL) && !with_hardware.has(TELESERVICE) && !with_hardware.has(IME));
 
+    // The inert overlays (`device::INERT_OVERLAYS`): each one the full image has, so a renamed
+    // overlay cannot slip through; gone from every lean device, the navigation bar's from the kiosk
+    // only; all kept with `OMNI_DEVICE_OVERLAYS=all`.
+    let (inert, kiosk_inert) = (omni_linux::device::INERT_OVERLAYS, omni_linux::device::KIOSK_INERT_OVERLAYS);
+    for p in inert.iter().chain(kiosk_inert) {
+        assert!(full.has(p.as_bytes()), "the full image has {p}");
+        assert!(!kiosk.has(p.as_bytes()), "the kiosk device leaves out {p}");
+    }
+    for p in inert {
+        assert!(!lean.has(p.as_bytes()) && !with_hardware.has(p.as_bytes()), "every lean device leaves out {p}");
+    }
+    for p in kiosk_inert {
+        assert!(lean.has(p.as_bytes()), "a device with SystemUI keeps {p}");
+    }
+    assert!(kiosk.has(b"/product/overlay/RanchuCommonOverlay.apk"), "an enabled overlay stays");
+    assert_eq!(omni_linux::device::overlays_key_suffix(), "-ol");
+    std::env::set_var("OMNI_DEVICE_OVERLAYS", "all");
+    assert!(open(Some("kiosk")).has(inert[0].as_bytes()), "OMNI_DEVICE_OVERLAYS=all keeps them");
+    assert_eq!(omni_linux::device::overlays_key_suffix(), "");
+    std::env::remove_var("OMNI_DEVICE_OVERLAYS");
+
     // The idle apps (`device::IDLE_APPS_LEFT_OUT`, `OMNI_DEVICE_IDLE_APPS=out`): in the image by
     // default (the setup disables them once the device is up); with `out`, gone from lean and
     // kiosk -- each listed path one the image has, so a renamed APEX app cannot slip through --

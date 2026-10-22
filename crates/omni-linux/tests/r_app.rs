@@ -61,6 +61,8 @@ const NOT_SAVED: &[&str] = &[".omni-binds", ".omni-loopback", "data/local/tmp"];
 /// Copy the device at `from` into `to` (made), less `NOT_SAVED`: the bytes copied. The directories
 /// are made first, then the files copied by four threads, the largest first (a saved device of a
 /// large game is ~840 files, 14 of them 627 of its 778 MB: one thread per big file instead of one after another).
+/// A file read-only on the host (the decompressed APEXes, `omni_linux::apex::predecompress`) is
+/// linked, not copied: no device writes it, and each of them is ~237 MB of every device.
 fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
     fn walk(from: &Path, to: &Path, rel: &Path, files: &mut Vec<(u64, std::path::PathBuf)>) -> std::io::Result<()> {
         std::fs::create_dir_all(to.join(rel))?;
@@ -89,6 +91,10 @@ fn copy_device(from: &Path, to: &Path) -> std::io::Result<u64> {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some((_, r)) = files.get(i) else { return };
+                let shared = std::fs::metadata(from.join(r)).is_ok_and(|m| m.permissions().readonly());
+                if shared && std::fs::hard_link(from.join(r), to.join(r)).is_ok() {
+                    continue;
+                }
                 match std::fs::copy(from.join(r), to.join(r)) {
                     Ok(n) => {
                         bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -185,8 +191,10 @@ fn resizable_script() -> &'static str {
     }
 }
 
-/// Until Android says it has booted (`sys.boot_completed`), at most 20 minutes.
-const BOOTED: &str = "i=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
+/// Until Android says it has booted (`sys.boot_completed`), at most 20 minutes: the runner starts
+/// the shell once the property is set (`#after`, omni-linux-run's own wait); the loop is for a
+/// runner without it.
+const BOOTED: &str = "#after sys.boot_completed=1\ni=0; until [ \"$(getprop sys.boot_completed)\" = 1 ] || [ $i -ge 1200 ]; do sleep 1; i=$((i+1)); done; \
                       echo \"[r] boot_completed=$(getprop sys.boot_completed)\"; ";
 
 /// A new device's settings, as its owner would set them once: set up, the screen kept on, no
@@ -205,13 +213,22 @@ fn settings_script() -> String {
     )
 }
 
+/// Whether the device quiets its boot receivers (init's `omni_quiet`, `/vendor/bin/omni_quiet.sh`,
+/// which names them and says why: once per device, as root, before it is saved).
+/// `OMNI_R_QUIET_BOOT=0`: `persist.omni.quiet_boot=0` at boot, and the saved device keyed `-loud`.
+fn quiet_boot() -> bool {
+    std::env::var("OMNI_R_QUIET_BOOT").as_deref() != Ok("0")
+}
+
 /// How saved devices are set up: a device saved by an older setup is not booted (2: the package
-/// installer kept enabled).
-const DEVICE_SETUP: u32 = 2;
+/// installer kept enabled; 3: the boot receivers quieted, `quiet_boot`; 4: no notification assistant;
+/// 5: the owners' log whole -- one saved before could have lost most of it, `omni_linux::owners`).
+const DEVICE_SETUP: u32 = 5;
 
 /// How saved warm devices are set up (`warm_device`): one saved by an older setup is not booted
-/// (3: the idle apps' disabling written before the device is saved).
-const WARM_SETUP: u32 = 3;
+/// (3: the idle apps' disabling written before the device is saved; 4: the boot receivers quieted;
+/// 5: no notification assistant, `omni_quiet.sh`; 6: the owners' log whole, `omni_linux::owners`).
+const WARM_SETUP: u32 = 6;
 
 /// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
 /// file or another setup is another device.
@@ -238,7 +255,12 @@ fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool
     let bootu = omni_linux::boot_image::key_suffix();
     // `-idleout`: a device whose image has no idle apps (`OMNI_DEVICE_IDLE_APPS=out`) is another.
     let idle = omni_linux::device::idle_apps_key_suffix();
-    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    // `-kh`: a kiosk device with its own home (`omni_linux::device::KIOSK_HOME`) is another.
+    let kh = omni_linux::device::kiosk_home_key_suffix(kiosk);
+    // `-ol`: a device whose image has no inert overlays (`omni_linux::device::INERT_OVERLAYS`).
+    let ol = omni_linux::device::overlays_key_suffix();
+    let loud = if quiet_boot() { "" } else { "-loud" };
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}{kh}{ol}{loud}", stem(apk), if kiosk { "kiosk" } else { "ui" });
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
 }
 
@@ -658,6 +680,9 @@ fn the_apk_is_installed_started_and_draws() {
 /// and each of `OMNI_R_SETPROPS` (`name=value`, comma-separated: a lever tried at boot).
 fn boot_args(locale: &str) -> Vec<String> {
     let mut args = vec!["--zygote".to_string(), "--setprop".to_string(), locale.to_string()];
+    if !quiet_boot() {
+        args.extend(["--setprop".to_string(), "persist.omni.quiet_boot=0".to_string()]);
+    }
     for kv in std::env::var("OMNI_R_SETPROPS").unwrap_or_default().split(',').filter(|kv| kv.contains('=')) {
         args.extend(["--setprop".to_string(), kv.trim().to_string()]);
     }
@@ -708,7 +733,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key())));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key(), omni_linux::device::kiosk_home_key_suffix(kiosk), omni_linux::device::overlays_key_suffix(), if quiet_boot() { "" } else { "-loud" })));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");
@@ -770,15 +795,16 @@ fn golden_key_separates_rooted_devices_and_leaves_unrooted_unchanged() {
     let plain = golden_dir(&root, &apk, None, true, "tr-TR");
     // The unrooted key as it was before rooted devices existed (with the boot image's and the idle
     // apps' suffixes, which the switches' defaults add whatever the root).
-    let (bootu, idle) = (omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix());
-    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}")), "the unrooted key is unchanged");
+    let (bootu, idle, kh) = (omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), omni_linux::device::kiosk_home_key_suffix(true));
+    let ol = omni_linux::device::overlays_key_suffix();
+    assert_eq!(plain, root.join(format!("x-0-guest-kiosk-tr-TR-v{DEVICE_SETUP}{bootu}{idle}{kh}{ol}")), "the unrooted key is unchanged");
     let a = root_hash("root=1\nmodule=a\n", &[("a", "sha_a")], 29000, "bin");
     let b = root_hash("root=1\nmodule=a\nmodule=b\n", &[("a", "sha_a"), ("b", "sha_b")], 29000, "bin");
     let rooted = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&a));
     let rooted_b = golden_dir_rooted(&root, &apk, None, true, "tr-TR", Some(&b));
     assert_ne!(plain, rooted, "rooted differs from unrooted");
     assert_ne!(rooted, rooted_b, "the module set changes the key");
-    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}")));
+    assert!(rooted.to_string_lossy().ends_with(&format!("-root-{a}{bootu}{idle}{kh}{ol}")));
     assert_eq!(plain, golden_dir_rooted(&root, &apk, None, true, "tr-TR", None));
     // The denylist is part of the staged profile text, so it keys another saved/warm device.
     let profile = |deny: &[&str]| {

@@ -39,7 +39,8 @@ fn the_hosts_oneway_calls_to_a_node_go_one_at_a_time() {
     let host = std::thread::spawn(move || broker(Context::Binder).host_transact(0, 1, object(TYPE_BINDER, service, service).to_vec(), &[0]));
     let given = until(&g, &mut t, &[], BR_TRANSACTION);
     let handle = u32::from_le_bytes(given.data[8..12].try_into().unwrap());
-    let mut reply = free(given.buffer);
+    let mut reply = acquire(handle);
+    reply.extend(free(given.buffer));
     reply.extend(g.transaction(BC_REPLY, 0, 0, 0, &[], &[]));
     assert_eq!(g.write_read(&mut t, &reply, false).0, 0);
     assert_eq!(host.join().unwrap(), Ok(Vec::new()));

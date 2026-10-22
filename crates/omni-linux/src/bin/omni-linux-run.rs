@@ -170,6 +170,11 @@ fn main() -> ExitCode {
         stderr: Output::Host,
         trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
     };
+    // The boot's first process (init): the owners' log compacted before anything else of the
+    // device runs (`omni_linux::owners::compact`).
+    if !init_classes.is_empty() {
+        omni_linux::owners::compact(&instance);
+    }
     let p = match Process::spawn_as(config, uid) {
         Ok(p) => p,
         Err(e) => {
@@ -193,10 +198,19 @@ fn main() -> ExitCode {
                 let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string(), vm_options };
                 omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
                 eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
-                // OMNI_APP_SPARE=1: a spare app process once Android has booted.
+                // OMNI_APP_SPARE=1: a spare app process once Android has booted -- on a device whose
+                // home takes one (`device::home_spare`), once system_server has started (it sets
+                // `sys.system_server.start_count`; ~5 s before the home), or at the first app's start.
                 let sysroot = std::sync::Arc::clone(p.vfs.sysroot());
+                let home = omni_linux::device::home_spare() && sysroot.has(format!("{}/OmniHome.apk", omni_linux::device::KIOSK_HOME).as_bytes());
+                if home {
+                    omni_linux::zygote::start_spare_at_first_launch();
+                }
+                // `OMNI_HOME_SPARE_EARLY=0`: not at system_server's start (the first app's only).
+                let early = home && std::env::var("OMNI_HOME_SPARE_EARLY").as_deref() != Ok("0");
                 omni_linux::zygote::start_spares_when(move || {
-                    omni_linux::props::PropertyService::global(&sysroot).get("sys.boot_completed").as_deref() == Some("1")
+                    let props = omni_linux::props::PropertyService::global(&sysroot);
+                    (early && props.get("sys.system_server.start_count").is_some()) || props.get("sys.boot_completed").as_deref() == Some("1")
                 });
             }
             Err(e) => eprintln!("[zygote] {e}"),
@@ -510,7 +524,9 @@ fn main() -> ExitCode {
             // Each thread's own caches (arm64): their per-block tables, beside their code.
             let tables: u64 = all.iter().map(|p| p.code_table_bytes()).sum::<u64>() >> 20;
             each.sort_by(|a, b| (b.1 + b.2).cmp(&(a.1 + a.2)));
-            let largest: Vec<String> = each.iter().take(6).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
+            // `OMNI_MEM_TRACE_ALL=1`: every guest process, not the six largest.
+            let shown = if std::env::var("OMNI_MEM_TRACE_ALL").as_deref() == Ok("1") { each.len() } else { 6 };
+            let largest: Vec<String> = each.iter().take(shown).map(|(n, g, c)| format!("{n} {g}+{c}M")).collect();
             eprintln!("[mem] {name} host process {}: {} guest processes, guest memory {guest} MiB, translation caches {code} MiB (their tables {tables} MiB); largest (guest+code): {}", std::process::id(), all.len(), largest.join(", "));
             // The translation caches' own tables, on the host's heap (not in the caches' commit).
             let census = omni_cpu::stats::code_caches_with_tables();
@@ -540,16 +556,26 @@ fn main() -> ExitCode {
         }
     }
     for command in &then {
+        // `#after <name>=<value>` as a shell's first line: it starts once the property has that
+        // value, the host's own wait (`PropertyService::wait_for`, woken by the change) -- not a
+        // guest loop that runs getprop and sleeps a second, which saw `sys.boot_completed` up to a
+        // second late (0.5 s on average, every boot). `OMNI_THEN_AFTER=0`: the line is a comment.
+        let (after, command) = match command.strip_prefix("#after ").and_then(|rest| rest.split_once('\n')) {
+            Some((cond, rest)) if std::env::var("OMNI_THEN_AFTER").as_deref() != Ok("0") => {
+                (cond.trim().split_once('=').map(|(k, v)| (k.to_string(), v.to_string())), rest.to_string())
+            }
+            _ => (None, command.clone()),
+        };
         let config = SpawnConfig {
             sysroot: sysroot.clone(),
             instance_dir: instance.clone(),
-            argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.as_bytes().to_vec()],
+            argv: vec![b"/system/bin/sh".to_vec(), b"-c".to_vec(), command.into_bytes()],
             envp: envp.iter().filter(|e| !e.starts_with(b"CLASSPATH=")).cloned().collect(),
             stdout: Output::Host,
             stderr: Output::Host,
             trace: false,
         };
-        match Process::spawn_as(config, 2000) {
+        let run = |config: SpawnConfig| match Process::spawn_as(config, 2000) {
             Ok(sh) => {
                 std::thread::spawn(move || {
                     let status = sh.run();
@@ -557,6 +583,16 @@ fn main() -> ExitCode {
                 });
             }
             Err(e) => eprintln!("[then] {e}"),
+        };
+        match after {
+            None => run(config),
+            Some((name, value)) => {
+                let props = omni_linux::props::PropertyService::global(p.vfs.sysroot());
+                std::thread::spawn(move || {
+                    props.wait_for(&name, &value, std::time::Duration::from_secs(20 * 60));
+                    run(config);
+                });
+            }
         }
     }
     if let Some(dir) = control {

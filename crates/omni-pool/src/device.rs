@@ -242,10 +242,13 @@ fn new_user_id(out: &str) -> Option<u32> {
     out.rsplit("created user id ").next()?.trim().split_whitespace().next()?.parse().ok()
 }
 
-/// What disables, for `user`, every package disabled for user 0.
+/// What disables, for `user`, every package disabled for user 0, and the boot receivers the
+/// device quiets for each user (`/vendor/bin/omni_quiet.sh`, absent from older devices).
 #[must_use]
 pub fn disable_like_owner(user: u32) -> String {
-    format!("for a in $(pm list packages -d --user 0 | sed 's/^package://'); do cmd package disable-user --user {user} $a >/dev/null 2>&1; done; true")
+    format!(
+        "for a in $(pm list packages -d --user 0 | sed 's/^package://'); do cmd package disable-user --user {user} $a >/dev/null 2>&1; done;          [ -f /vendor/bin/omni_quiet.sh ] && sh /vendor/bin/omni_quiet.sh {user} >/dev/null 2>&1; true"
+    )
 }
 
 /// What grants an app everything it asks for, for `user` -- the device's `omni_autogrant.sh`

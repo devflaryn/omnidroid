@@ -231,6 +231,9 @@ fn export_share(t: &Arc<Table>, d: vk::Device, memory_types: &[vk::MemoryType], 
             let desc = super::share::ShareDesc { format, width, height, size, device_uuid: uuids.0, driver_uuid: uuids.1, name };
             desc.write(shm);
             super::share::write_generation(shm, 0);
+            if std::env::var_os("OMNI_SHARE_TRACE").is_some() {
+                eprintln!("[gpu] share image {width}x{height} ({} KiB) exported", size / 1024);
+            }
             Ok(Share { image, memory, handle })
         }
         Err(e) => {

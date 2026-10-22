@@ -172,7 +172,12 @@ fn answer(args: &[String], launcher: &Arc<Launcher>, instance: usize) -> Option<
     let uid = uid.unwrap_or(10000);
     // (Without `--package-name`, an app's main process is named after its package.)
     let package = if package.is_empty() { nice.clone().unwrap_or_default() } else { package };
-    let installed = uid >= 10_000 && installed_app(&launcher.instance, &package);
+    if EARLY_SPARE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        start_spare();
+    }
+    // The kiosk device's home takes one too (`device::home_spare`): it starts on boot's path.
+    let home = crate::device::home_spare() && package == crate::device::KIOSK_HOME_PACKAGE;
+    let installed = uid >= 10_000 && (home || installed_app(&launcher.instance, &package));
     let pid = launch(launcher, uid, nice.as_deref(), sdk.unwrap_or(0), &rest, installed).unwrap_or(-1);
     let mut reply = int(pid);
     reply.push(1); // usingWrapper: the process runs WrapperInit
@@ -480,6 +485,18 @@ pub(crate) fn hiding_device(instance: &std::path::Path) -> bool {
     crate::root::Profile::of(instance).is_some_and(|p| p.is_rooted() && (!p.denylist.is_empty() || p.shamiko == crate::root::Shamiko::Whitelist))
 }
 
+static EARLY_SPARE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Start the first spare at the first app's start (the WebView's relro maker, ~1.3 s before the
+/// home on the i7) rather than once Android has booted: the kiosk home takes it (`device::
+/// home_spare`). Not at the zygote's own start: a spare started before system_server (pid 2000)
+/// never attached as the home, and the boot waited 58 s for it (run 2026-10-22).
+pub fn start_spare_at_first_launch() {
+    if spares() {
+        EARLY_SPARE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Start the first spare once `ready` (Android has booted), and keep one after.
 pub fn start_spares_when(ready: impl Fn() -> bool + Send + 'static) {
     if !spares() {
@@ -537,7 +554,10 @@ fn take_spare(uid: u32, nice: Option<&str>, sdk: u32, class_and_args: &[String])
         return None;
     }
     eprintln!("[zygote] launching {} as pid {} uid {uid} (the spare process): {}", nice.unwrap_or("?"), spare.pid, class_and_args.join(" "));
-    let delay = std::env::var("OMNI_APP_SPARE_DELAY_S").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    // The home's start is light and comes just before the device is ready for an app: the next
+    // spare at once, not after the app's start (`OMNI_APP_SPARE_DELAY_S`).
+    let home = nice == Some(crate::device::KIOSK_HOME_PACKAGE);
+    let delay = if home { 0 } else { std::env::var("OMNI_APP_SPARE_DELAY_S").ok().and_then(|v| v.parse().ok()).unwrap_or(5) };
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(delay));
         start_spare();
