@@ -63,13 +63,15 @@ const UNTIL_CLOSED_SECONDS: u64 = 315_360_000;
 const APP_USAGE: &str = "\
 usage: omnidroid                    open the omnidroid app: warm Androids, any APK run on them
        omnidroid <app.apk> [xN]     open it and launch N instances of that APK
+       omnidroid <bundle> [xN] [--package <name>]   ... of a bundle (.apkm, .xapk, .apks): its
+                                    splits and OBB files too; --package for one of several apps
        omnidroid <app.apk> [xN] --cookie <c> --place <id>   ... with a plugin's options (`roblox`)
        omnidroid restart <id>... | all          restart instances' apps on their windows (in 5 s)
        omnidroid autorestart [on|off <id>...|all]  restart an app when it crashes (all: the pool's
                                     setting, for instances without their own; ids bare, as 3: a
                                     shell drops a word beginning with # as a comment)
 
-In the app: run <apk> [xN] [plugin options], close <#id>, restart <#id>, autorestart on|off [#id], warm, kill <D#>,
+In the app: run <apk or bundle> [xN] [--package <name>] [plugin options], close <#id>, restart <#id>, autorestart on|off [#id], warm, kill <D#>,
 shell, plugins, settings, mcp, help.
 Coding agents drive it through its MCP server (`mcp on` in the app, then `mcp status`).
 Its settings: <app-data>/../app.conf (OMNI_APP_CONFIG). The one-shot commands scripts use: `omnidroid help commands`.";
@@ -177,9 +179,10 @@ struct Options {
     control: Option<PathBuf>,
 }
 
-/// Whether `arg` names an APK given bare (`omnidroid app.apk`).
+/// Whether `arg` names an APK given bare (`omnidroid app.apk`), or a bundle of APKs by its usual
+/// extensions (`.apkm`, `.xapk`, `.apks`; a zip of APKs is run with `run <path>` at the prompt).
 fn is_apk_path(arg: &str) -> bool {
-    !arg.starts_with('-') && Path::new(arg).extension().is_some_and(|e| e.eq_ignore_ascii_case("apk"))
+    !arg.starts_with('-') && Path::new(arg).extension().is_some_and(|e| ["apk", "apkm", "xapk", "apks"].iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 /// The command and the arguments after it. Nothing, or an APK's path, means the app
@@ -874,6 +877,12 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
         println!("Omnidroid (real AOSP): a warm device, no app");
         (PathBuf::new(), None)
     } else {
+        // A bundle's splits are installed by the app's pool (`omni_warm::bundle`); a session of its
+        // own installs one APK at its boot.
+        if options.apk.as_deref().is_some_and(|a| omni_warm::bundle::is_bundle(a).unwrap_or(false)) {
+            eprintln!("omnidroid: a bundle of APKs runs in the app: `omnidroid <bundle> [--package <name>]` (or the MCP server's start_instance); `aosp` installs one APK");
+            return ExitCode::from(2);
+        }
         let apk = match omni_apk::choose_apk(options.apk.as_deref(), &repo_root()) {
             Ok(apk) => apk,
             Err(error) => {

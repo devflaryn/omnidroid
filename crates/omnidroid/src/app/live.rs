@@ -19,12 +19,13 @@ pub struct PoolLive {
 pub type ToolDef = (&'static str, &'static str, &'static [(&'static str, &'static str, bool, &'static str)]);
 
 const TOOLS: &[ToolDef] = &[
-    ("start_instance", "Launch any APK (a host path) as `count` instances (default 1). Answers their ids at once; each runs in a window of its own on a warm Android: the same APK file again shares an Android (one Android user per extra instance), another package goes into a warm Android beside the others, another build of a package running elsewhere gets an Android of its own. `wait_instance` waits until one runs. `auto_restart` sets each new instance's own auto restart (else the pool's setting holds: `auto_restart` tool).", &[("apk", "string", true, "host path of the APK"), ("count", "number", false, "how many instances (1-64, default 1)"), ("options", "string", false, "the installed plugins' options, as on omnidroid's command line: e.g. `--cookie <file or name login saved> --place <id>` (roblox plugin) signs each instance in as that account and joins the place"), ("auto_restart", "boolean", false, "restart each new instance's app when it crashes (its own setting)")]),
+    ("start_instance", "Launch any APK (a host path) as `count` instances (default 1). A bundle of APKs works too (`.apkm`, `.xapk`, `.apks`, a zip of APKs): its base APK and splits installed together, its OBB files placed; when it holds several packages, name one with `package` (an error lists them; `apk_info` shows them first). Answers their ids at once; each runs in a window of its own on a warm Android: the same APK file again shares an Android (one Android user per extra instance), another package goes into a warm Android beside the others, another build of a package running elsewhere gets an Android of its own. `wait_instance` waits until one runs. `auto_restart` sets each new instance's own auto restart (else the pool's setting holds: `auto_restart` tool).", &[("apk", "string", true, "host path of the APK or bundle"), ("package", "string", false, "which package of a bundle of several to launch"), ("count", "number", false, "how many instances (1-64, default 1)"), ("options", "string", false, "the installed plugins' options, as on omnidroid's command line: e.g. `--cookie <file or name login saved> --place <id>` (roblox plugin) signs each instance in as that account and joins the place"), ("auto_restart", "boolean", false, "restart each new instance's app when it crashes (its own setting)")]),
     ("wait_instance", "Wait until an instance runs (its app's Activity displayed) or ends, at most `timeout` seconds (default 300); one restarting is waited through until it runs again (or ends). Answers its state, auto_restart, restarts and, while restarting, restart_in (seconds); an ended or restarting one's `details` too (what its Android's log says happened, as the card its window shows), and once restarted, `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[("instance_id", "number", true, "the id start_instance gave"), ("timeout", "number", false, "seconds (default 300)")]),
     ("list_instances", "Every instance: id, package, its Android (device), user, display, state (waiting, installing, starting, running, restarting, closing, ended: why), auto_restart (its own setting, else the pool's), restarts (how many so far), restart_in (seconds, while restarting), screenshot path; an ended or restarting one's `details` too -- when its app crashed, was killed, or did not start, what its Android's log says happened (exception and frames, signal and library, ANR...), the card its window shows until it is closed or restarted -- and a restarted one's `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[]),
     ("stop_instance", "Close an instance: its app stopped, its window gone (no card, no auto restart). Its Android stays warm.", &[("instance_id", "number", true, "the instance")]),
     ("restart_instance", "Restart an instance's app on its window: its app stopped (a running one) and started again after `delay` seconds (default 5) while its window's card counts down (\"Restarting in 5 seconds\", \"Click here to restart now\"); a crashed one's card shows the countdown under its crash log. Same instance id. wait_instance waits for it to run again. Answers its state.", &[("instance_id", "number", true, "the instance"), ("delay", "number", false, "seconds before its app starts again (default 5; 0 now)")]),
     ("auto_restart", "Restart an app automatically when it crashes or ends on its own (its card says \"Automatically restarting in 5 seconds\"): for one instance, or without instance_id for every instance without its own setting (saved). After 3 ends in a row within a minute of starting, it stops restarting it. An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) is not restarted: its window closes. Answers the setting now.", &[("on", "boolean", true, "true: restart it when it crashes; false: leave it ended, its card shown"), ("instance_id", "number", false, "the instance (without: the pool's setting)")]),
+    ("apk_info", "What an APK or a bundle of APKs (`.apkm`, `.xapk`, `.apks`, a zip of APKs) holds, read on the host without launching it: each package's name, versionCode, launcher Activity, the splits that would be installed with it (and those of other ABIs left out) and its OBB files. A bundle of several packages needs one named on start_instance (`package`).", &[("apk", "string", true, "host path of the APK or bundle")]),
     ("screenshot", "The instance's display as a PNG, written now: path, width, height.", &[("instance_id", "number", true, "the instance")]),
     ("input", "Input to an instance's display: action tap (x,y), swipe (x,y,x2,y2,ms), text (text), key (key: a KEYCODE_ name or number).", &[("instance_id", "number", true, "the instance"), ("action", "string", true, "tap | swipe | text | key"), ("x", "number", false, "x"), ("y", "number", false, "y"), ("x2", "number", false, "swipe end x"), ("y2", "number", false, "swipe end y"), ("ms", "number", false, "swipe duration"), ("text", "string", false, "text to type"), ("key", "string", false, "e.g. KEYCODE_BACK")]),
     ("shell", "A shell command on an Android (as `adb shell`): exit status and output. `device` defaults to the first ready one; `uid` 0 runs as root.", &[("command", "string", true, "a /system/bin/sh command line"), ("device", "number", false, "the Android's id (list_devices)"), ("uid", "number", false, "0 root, 1000 system, default 2000 shell")]),
@@ -35,6 +36,39 @@ const TOOLS: &[ToolDef] = &[
     ("settings", "The app's settings; with `key` and `value`, change one (idle_close_minutes, keep_warm, warm_on_start, stop_on_exit, max_devices, instance_size, gpu, device_ram_mb, auto_restart).", &[("key", "string", false, "a setting"), ("value", "string", false, "its new value")]),
     ("pool_log", "The app's log (launches, installs, boots, ends), newest last.", &[("lines", "number", false, "how many (default 60)")]),
 ];
+
+/// `apk_info`: what the file at `apk` holds -- one APK, or a bundle's packages.
+fn apk_info(apk: &Path) -> Result<Json, String> {
+    let opt = |v: &Option<String>| v.as_ref().map_or(Json::Null, |s| json::s(s.clone()));
+    let num = |v: Option<u32>| v.map_or(Json::Null, |n| Json::Num(f64::from(n)));
+    let names = |v: &[String]| Json::Array(v.iter().map(|n| json::s(n.clone())).collect());
+    if !omni_warm::bundle::is_bundle(apk)? {
+        let a = omni_warm::Apk::read(apk)?;
+        return Ok(json::obj([
+            ("kind", json::s("apk")),
+            ("packages", Json::Array(vec![json::obj([("package", json::s(a.package)), ("version_code", num(a.version_code)), ("launcher", opt(&a.launcher)), ("splits", Json::Array(Vec::new())), ("obbs", Json::Array(Vec::new()))])])),
+        ]));
+    }
+    let b = omni_warm::bundle::Bundle::open(apk)?;
+    let packages = b
+        .packages
+        .iter()
+        .map(|p| {
+            let splits: Vec<String> = p.splits.iter().map(|(n, _)| n.clone()).collect();
+            let obbs: Vec<String> = p.obbs.iter().map(|o| omni_warm::bundle::own_name(o)).collect();
+            json::obj([
+                ("package", json::s(p.package.clone())),
+                ("version_code", num(p.version_code)),
+                ("launcher", opt(&p.launcher)),
+                ("splits", names(&splits)),
+                ("splits_left_out", names(&p.left_out)),
+                ("obbs", names(&obbs)),
+            ])
+        })
+        .collect();
+    let note = if b.packages.len() > 1 { "several packages: start_instance needs `package`" } else { "one package: start_instance installs it" };
+    Ok(json::obj([("kind", json::s("bundle")), ("packages", Json::Array(packages)), ("note", json::s(note))]))
+}
 
 fn arg_u64(args: &Json, name: &str) -> Option<u64> {
     args.get(name).and_then(|v| v.as_f64().map(|f| f as u64).or_else(|| v.as_str().and_then(|s| s.trim_start_matches(['#', 'D']).parse().ok())))
@@ -172,9 +206,13 @@ impl PoolLive {
             "start_instance" | "launch_app" => {
                 let apk = args.get("apk").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `apk` (a host path)"))?;
                 let count = arg_u64(args, "count").unwrap_or(1).clamp(1, 64) as u32;
-                let options = args.get("options").and_then(Json::as_str).map(super::command::words).unwrap_or_default();
-                let extras = super::plugged::extras(Path::new(apk), &options).map_err(RpcError::params)?;
-                let ids = pool.launch_with(Path::new(apk), count, extras).map_err(RpcError::server)?;
+                let mut options = args.get("options").and_then(Json::as_str).map(super::command::words).unwrap_or_default();
+                if let Some(package) = args.get("package").and_then(Json::as_str).filter(|p| !p.trim().is_empty()) {
+                    options.extend(["--package".to_string(), package.trim().to_string()]);
+                }
+                // A bundle of several packages and none named: the caller is asked which (the
+                // error lists them).
+                let ids = super::plugged::launch(pool, Path::new(apk), count, &options).map_err(RpcError::params)?;
                 if let Some(on) = arg_bool(args, "auto_restart") {
                     for id in &ids {
                         let _ = pool.set_auto_restart(Some(*id), on);
@@ -184,6 +222,10 @@ impl PoolLive {
                     ("instances", Json::Array(ids.iter().map(|i| Json::Num(f64::from(*i))).collect())),
                     ("note", json::s("launching: wait_instance {instance_id} waits until it runs; list_instances shows every state")),
                 ]))
+            }
+            "apk_info" => {
+                let apk = args.get("apk").and_then(Json::as_str).ok_or_else(|| RpcError::params("need `apk` (a host path)"))?;
+                apk_info(Path::new(apk)).map_err(RpcError::params)
             }
             "wait_instance" => {
                 let id = need_u64(args, "instance_id")? as u32;

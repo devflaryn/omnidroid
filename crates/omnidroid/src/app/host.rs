@@ -270,7 +270,7 @@ impl Host {
             // The plugins' hooks run first (a moment, or more): not on the window's call.
             Ok(Command::Run(apk, n, options)) => {
                 std::thread::spawn(move || {
-                    if let Err(e) = super::plugged::extras(&apk, &options).and_then(|extras| pool.launch_with(&apk, n, extras)) {
+                    if let Err(e) = super::plugged::launch(&pool, &apk, n, &options) {
                         pool.say(format!("run: {e}"));
                     }
                 });

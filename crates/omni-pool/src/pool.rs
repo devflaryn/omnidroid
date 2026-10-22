@@ -891,7 +891,7 @@ impl Pool {
                     device: i.device,
                     package: i.apk.package.clone(),
                     sha256: i.apk.sha256.clone(),
-                    apk: i.apk.path.clone(),
+                    apk: i.apk.bundle.clone().unwrap_or_else(|| i.apk.path.clone()),
                     user: i.user,
                     display: i.display.filter(|_| i.hwc.is_some()),
                     screenshot: dir.zip(i.hwc).map(|(d, h)| {
@@ -931,8 +931,18 @@ impl Pool {
     /// # Errors
     /// As `launch`.
     pub fn launch_with(self: &Arc<Self>, apk: &Path, count: u32, extras: Extras) -> Result<Vec<InstanceId>, String> {
+        self.launch_package(apk, None, count, extras)
+    }
+
+    /// [`launch_with`](Self::launch_with) of a file that may be a bundle of APKs (`.apkm`, `.xapk`,
+    /// `.apks`, a zip of APKs: `omni_warm::bundle`), its package `package` -- needed when it holds
+    /// several (the error names them).
+    ///
+    /// # Errors
+    /// As `launch`; a bundle of several packages and no `package`, or `package` not in it.
+    pub fn launch_package(self: &Arc<Self>, apk: &Path, package: Option<&str>, count: u32, extras: Extras) -> Result<Vec<InstanceId>, String> {
         let apk = std::fs::canonicalize(apk).map_err(|e| format!("{}: {e}", apk.display()))?;
-        let apk = Arc::new(omni_warm::Apk::read(&apk)?);
+        let apk = Arc::new(omni_warm::Apk::read_package(&apk, package)?);
         let launcher = apk.launcher.clone().ok_or_else(|| format!("{} has no launcher Activity: nothing to start", apk.package))?;
         let max = self.config.lock().max_devices;
         let mut ids = Vec::new();
@@ -963,7 +973,7 @@ impl Pool {
             let extras = extras.clone();
             let _ = std::thread::Builder::new().name(format!("omni-pool-launch-{id}")).spawn(move || pool.run_launch(id, &launcher, extras));
         }
-        self.say(format!("launch {} x{} ({}): instance{} {}", apk.package, ids.len(), &apk.sha256[..12], if ids.len() == 1 { "" } else { "s" }, ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" ")));
+        self.say(format!("launch {} x{} ({}): instance{} {}", apk.describe(), ids.len(), &apk.sha256[..12], if ids.len() == 1 { "" } else { "s" }, ids.iter().map(|i| format!("#{i}")).collect::<Vec<_>>().join(" ")));
         for line in &extras.said {
             self.say(format!("  {line}"));
         }
@@ -1181,6 +1191,10 @@ impl Pool {
                 }
             },
         };
+        // A bundle's OBB files, copied to this user's OBB directory (user 0's has them).
+        let obbs = omni_warm::obbs_for_user(&apk, user);
+        let before = if obbs.is_empty() { before } else if before.is_empty() { obbs } else { format!("{before}
+{obbs}") };
         // The device's log from before the start: what says the app is ready for the link.
         let log = extras.link.as_ref().map(|_| omni_warm::LogTail::from_end(&dev.log()));
         // And where it was, for what the card says should the app end on its own.
@@ -2405,7 +2419,7 @@ mod tests {
 
     #[test]
     fn three_quick_ends_in_a_row_stop_the_auto_restarts() {
-        let apk = Arc::new(omni_warm::Apk { path: PathBuf::from("/a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None });
+        let apk = Arc::new(omni_warm::Apk { path: PathBuf::from("/a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None, ..Default::default() });
         let mut i = InstanceRec::new(1, apk, Extras::default());
         i.started = Some(Instant::now());
         assert!(i.count_end() && i.count_end(), "one and two quick ends: restarted");
@@ -2446,7 +2460,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = pool(&dir, 1);
-        let other = Arc::new(omni_warm::Apk { path: PathBuf::from("/b.apk"), sha256: "e".repeat(64), package: "com.b".into(), launcher: Some(".Main".into()), version_code: None });
+        let other = Arc::new(omni_warm::Apk { path: PathBuf::from("/b.apk"), sha256: "e".repeat(64), package: "com.b".into(), launcher: Some(".Main".into()), version_code: None, ..Default::default() });
         {
             let mut s = p.state.lock();
             s.instances.insert(1, instance(1, InstanceState::Running, Some(2)));
@@ -2676,7 +2690,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = pool(&dir, 2);
-        let apk = Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None });
+        let apk = Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None, ..Default::default() });
         let rec = |device, hwc| InstanceRec { user: Some(10), hwc: Some(hwc), display: Some(3), state: InstanceState::Ended("native crash: SIGSEGV".into()), details: vec!["SIGSEGV at 0x8".into()], ..InstanceRec::new(device, Arc::clone(&apk), Extras::default()) };
         {
             let mut s = p.state.lock();
@@ -2723,7 +2737,7 @@ mod tests {
 
     /// An instance of `com.a` on `device`, in `state`, as user 10 on display `hwc`.
     fn instance(device: DeviceId, state: InstanceState, hwc: Option<i64>) -> InstanceRec {
-        let apk = Arc::new(omni_warm::Apk { path: PathBuf::from("/a.apk"), sha256: "f".repeat(64), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None });
+        let apk = Arc::new(omni_warm::Apk { path: PathBuf::from("/a.apk"), sha256: "f".repeat(64), package: "com.a".into(), launcher: Some(".Main".into()), version_code: None, ..Default::default() });
         InstanceRec { user: Some(10), hwc, display: hwc.map(|_| 3), state, ..InstanceRec::new(device, apk, Extras::default()) }
     }
 
@@ -2975,7 +2989,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let p = pool(&dir, 2);
-        let build = |package: &str, sha: &str| Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: sha.repeat(64), package: package.into(), launcher: Some(".Main".into()), version_code: None });
+        let build = |package: &str, sha: &str| Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: sha.repeat(64), package: package.into(), launcher: Some(".Main".into()), version_code: None, ..Default::default() });
         {
             let mut s = p.state.lock();
             let d1 = s.devices.get_mut(&1).unwrap();
