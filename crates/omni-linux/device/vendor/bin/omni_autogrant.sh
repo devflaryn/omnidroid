@@ -38,6 +38,17 @@ grant() {
     log -t omni_autogrant "granted $pkg"
 }
 
+# A wait that starts no process: a timed read on a coprocess that never writes (`cat`, started
+# once). `sleep 2` was a new process every 2 s, forever, its code translated afresh each time.
+# `setprop persist.omni.tick sleep` waits with `sleep` again.
+if [ "$(getprop persist.omni.tick)" != sleep ]; then
+    cat |&
+    exec 3<&p
+    tick() { read -t "$1" -u3 tick_; }
+else
+    tick() { sleep "$1"; }
+fi
+
 last=
 granted=
 while true; do
@@ -54,5 +65,5 @@ while true; do
             esac
         done
     fi
-    sleep 2
+    tick 2
 done

@@ -39,9 +39,21 @@ log -t omni_lean "max_cached_processes $(device_config get activity_manager max_
 # SERVICE_ADJ), so never while the home is in front, and Android starts it again if the home is
 # asked for. `setprop persist.omni.home_process keep` keeps it.
 [ "$(getprop persist.omni.home_process)" = keep ] && exit 0
-# Only without a launcher in the image (the kiosk device): a real home is left alone.
+# Only without a launcher in the image (the kiosk device): a real home is left alone. (With the
+# kiosk device's own home, Settings is not the home; the loop stays all the same: without its
+# `cmd` every 30 s, android.process.media stayed after boot, cached, +75 MB -- ActivityManager
+# applies the cached-process limit when something has it update its processes, 2026-10-22.)
 [ -d /system_ext/priv-app/Launcher3QuickStep ] && exit 0
+# A wait that starts no process (`omni_autogrant.sh` says how); `setprop persist.omni.tick sleep`:
+# with `sleep`.
+if [ "$(getprop persist.omni.tick)" != sleep ]; then
+    cat |&
+    exec 3<&p
+    tick() { read -t "$1" -u3 tick_; }
+else
+    tick() { sleep "$1"; }
+fi
 while :; do
-    sleep 30
+    tick 30
     cmd activity kill com.android.settings >/dev/null 2>&1
 done
