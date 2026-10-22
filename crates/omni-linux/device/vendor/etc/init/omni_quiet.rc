@@ -1,0 +1,8 @@
+# omnidroid: the boot receivers this device has no use for, disabled once per device
+# (/vendor/bin/omni_quiet.sh says which and why). Root: a shell may not disable a system app's
+# component. Started with its class: the script waits for the system to have booted.
+service omni_quiet /system/bin/sh /vendor/bin/omni_quiet.sh
+    class late_start
+    user root
+    group root shell
+    oneshot

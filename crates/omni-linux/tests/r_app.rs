@@ -213,13 +213,20 @@ fn settings_script() -> String {
     )
 }
 
+/// Whether the device quiets its boot receivers (init's `omni_quiet`, `/vendor/bin/omni_quiet.sh`,
+/// which names them and says why: once per device, as root, before it is saved).
+/// `OMNI_R_QUIET_BOOT=0`: `persist.omni.quiet_boot=0` at boot, and the saved device keyed `-loud`.
+fn quiet_boot() -> bool {
+    std::env::var("OMNI_R_QUIET_BOOT").as_deref() != Ok("0")
+}
+
 /// How saved devices are set up: a device saved by an older setup is not booted (2: the package
-/// installer kept enabled).
-const DEVICE_SETUP: u32 = 2;
+/// installer kept enabled; 3: the boot receivers quieted, `quiet_boot`).
+const DEVICE_SETUP: u32 = 3;
 
 /// How saved warm devices are set up (`warm_device`): one saved by an older setup is not booted
-/// (3: the idle apps' disabling written before the device is saved).
-const WARM_SETUP: u32 = 3;
+/// (3: the idle apps' disabling written before the device is saved; 4: the boot receivers quieted).
+const WARM_SETUP: u32 = 4;
 
 /// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
 /// file or another setup is another device.
@@ -250,7 +257,8 @@ fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool
     let kh = omni_linux::device::kiosk_home_key_suffix(kiosk);
     // `-ol`: a device whose image has no inert overlays (`omni_linux::device::INERT_OVERLAYS`).
     let ol = omni_linux::device::overlays_key_suffix();
-    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}{kh}{ol}", stem(apk), if kiosk { "kiosk" } else { "ui" });
+    let loud = if quiet_boot() { "" } else { "-loud" };
+    let name = format!("{}-{apk_len}-{account}-{}-{locale}-v{DEVICE_SETUP}{rooted}{bootu}{idle}{kh}{ol}{loud}", stem(apk), if kiosk { "kiosk" } else { "ui" });
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
 }
 
@@ -670,6 +678,9 @@ fn the_apk_is_installed_started_and_draws() {
 /// and each of `OMNI_R_SETPROPS` (`name=value`, comma-separated: a lever tried at boot).
 fn boot_args(locale: &str) -> Vec<String> {
     let mut args = vec!["--zygote".to_string(), "--setprop".to_string(), locale.to_string()];
+    if !quiet_boot() {
+        args.extend(["--setprop".to_string(), "persist.omni.quiet_boot=0".to_string()]);
+    }
     for kv in std::env::var("OMNI_R_SETPROPS").unwrap_or_default().split(',').filter(|kv| kv.contains('=')) {
         args.extend(["--setprop".to_string(), kv.trim().to_string()]);
     }
@@ -720,7 +731,7 @@ fn warm_device(sysroot: &Path) {
     let root_req = root_request();
     let rooted_key = root_req.as_ref().map_or_else(String::new, |r| format!("-root-{}", r.hash));
     let golden = std::env::var_os("OMNI_R_GOLDEN")
-        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key(), omni_linux::device::kiosk_home_key_suffix(kiosk), omni_linux::device::overlays_key_suffix())));
+        .map(|root| PathBuf::from(root).join(format!("base-{}-{locale_name}-v{WARM_SETUP}{rooted_key}{}{}{}{}{}{}", if kiosk { "kiosk" } else { "ui" }, omni_linux::boot_image::key_suffix(), omni_linux::device::idle_apps_key_suffix(), multi_display_key(), omni_linux::device::kiosk_home_key_suffix(kiosk), omni_linux::device::overlays_key_suffix(), if quiet_boot() { "" } else { "-loud" })));
     let saved = golden.as_ref().filter(|g| g.join("ready").exists());
     // Up: the screen woken, then ready for an app.
     let ready = format!("{BOOTED}input keyevent KEYCODE_WAKEUP; echo \"[r] warm ready\"; ");

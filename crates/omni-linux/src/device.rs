@@ -41,6 +41,10 @@ pub const FILES: &[(&str, &[u8])] = &[
     // why; `persist.omni.cached_processes`).
     ("/vendor/etc/init/omni_lean.rc", include_bytes!("../device/vendor/etc/init/omni_lean.rc")),
     ("/vendor/bin/omni_lean.sh", include_bytes!("../device/vendor/bin/omni_lean.sh")),
+    // The boot receivers a device of this kind has no use for, disabled once per device and for
+    // each user the pool makes (the script says which and why; `persist.omni.quiet_boot=0`: not).
+    ("/vendor/etc/init/omni_quiet.rc", include_bytes!("../device/vendor/etc/init/omni_quiet.rc")),
+    ("/vendor/bin/omni_quiet.sh", include_bytes!("../device/vendor/bin/omni_quiet.sh")),
     // The boot's own settings: no dexopt at install (the file says why).
     ("/vendor/etc/init/omni_boot.rc", include_bytes!("../device/vendor/etc/init/omni_boot.rc")),
     // Every app process's entry point and a spare app process's (`device/src/spare/`;
