@@ -15,6 +15,10 @@ pub const BINDER_THREAD_EXIT: u64 = 0x4004_6208;
 pub const BC_TRANSACTION: u32 = 0x4040_6300;
 pub const BC_REPLY: u32 = 0x4040_6301;
 pub const BC_FREE_BUFFER: u32 = 0x4008_6303;
+pub const BC_INCREFS: u32 = 0x4004_6304;
+pub const BC_ACQUIRE: u32 = 0x4004_6305;
+pub const BC_RELEASE: u32 = 0x4004_6306;
+pub const BC_DECREFS: u32 = 0x4004_6307;
 pub const BC_ACQUIRE_DONE: u32 = 0x4010_6309;
 pub const BC_ENTER_LOOPER: u32 = 0x0000_630c;
 pub const BC_EXIT_LOOPER: u32 = 0x0000_630d;
@@ -164,6 +168,17 @@ pub fn free(buffer: u64) -> Vec<u8> {
     let mut c = BC_FREE_BUFFER.to_le_bytes().to_vec();
     c.extend_from_slice(&buffer.to_le_bytes());
     c
+}
+
+/// What libbinder sends for a handle it keeps (a `BpBinder` made for it): `BC_INCREFS` and
+/// `BC_ACQUIRE`. A handle a process never takes up goes when the buffer that brought it is freed.
+pub fn acquire(handle: u32) -> Vec<u8> {
+    [BC_INCREFS.to_le_bytes(), handle.to_le_bytes(), BC_ACQUIRE.to_le_bytes(), handle.to_le_bytes()].concat()
+}
+
+/// What libbinder sends when it lets a handle go (its `BpBinder` gone): `BC_RELEASE`, `BC_DECREFS`.
+pub fn release(handle: u32) -> Vec<u8> {
+    [BC_RELEASE.to_le_bytes(), handle.to_le_bytes(), BC_DECREFS.to_le_bytes(), handle.to_le_bytes()].concat()
 }
 
 /// A flat binder object: (type, binder or handle, cookie).

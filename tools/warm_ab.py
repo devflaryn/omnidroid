@@ -3,9 +3,13 @@
 
     python tools/warm_ab.py launch  --apk A.apk --package P --activity C --pairs 4 --b-env OMNI_APP_PRELOAD=0
     python tools/warm_ab.py install --apk A.apk --apk2 A2.apk --pairs 4 --b-prop pm.dexopt.install=skip
+        [--a-env OMNI_APP_SPARE=0 --b-env OMNI_APP_SPARE=0]  (a switch both arms share)
+        [--dir <instance>]  (that device, not the newest warm one -- which may be someone's pool)
 
 launch:  each trial force-stops the app, then `am start -W`; arm B's app processes get --b-env
-         (the device's `<instance>.appenv`, read by the zygote at each app start). Timed: the
+         (the device's `<instance>.appenv`, read by the zygote at each app start), arm A's
+         --a-env. A switch read when an app's host process starts does nothing to an app a spare
+         process becomes: give both arms OMNI_APP_SPARE=0 for those. Timed: the
          control channel's wall seconds and Android's TotalTime.
 install: each trial installs the other of two APKs of one package (so every install is a real
          reinstall); arm B sets --b-prop (as root) first, arm A the property's default back.
@@ -27,11 +31,13 @@ def main():
     ap.add_argument("--activity")
     ap.add_argument("--pairs", type=int, default=4)
     ap.add_argument("--b-env", action="append", default=[])
+    ap.add_argument("--a-env", action="append", default=[])
     ap.add_argument("--b-prop")
     ap.add_argument("--out")
+    ap.add_argument("--dir", help="the instance to use (default: the newest live warm device)")
     ap.add_argument("--gap", type=float, default=2, help="seconds between a stop and the next start")
     a = ap.parse_args()
-    dev = find_device()
+    dev = Path(a.dir) if a.dir else find_device()
     if not dev:
         raise SystemExit("no live warm device")
     appenv = dev.with_suffix(".appenv")
@@ -54,7 +60,8 @@ def main():
         default = default.strip()
     for n, arm in enumerate(order):
         if a.what == "launch":
-            appenv.write_text("\n".join(a.b_env) + "\n" if arm == "B" else "")
+            env = a.b_env if arm == "B" else a.a_env
+            appenv.write_text("\n".join(env) + "\n" if env else "")
             if prop_name:
                 run(dev, f"setprop {prop_name} {prop_value if arm == 'B' else (default or chr(39) * 2)}", uid=0)
             run(dev, f"am force-stop {a.package}")

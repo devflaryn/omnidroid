@@ -275,6 +275,49 @@ aging's first pass), interleaved after one fill run:
 The boot gain is smaller now (-0.5 s; s3's -2.2 s was before the home and init fixes); the RAM cost
 stays after aging (+100..+126 MB, system host); new: **idle CPU -2.5 points of a core** with them.
 
+## s16 -- binder handle references counted: the per-launch leak closed (KEPT)
+
+Found from the GPU memory: the system host's write-combined memory was 42 MiB on an idle device,
+~76 after one app launch, 124 after eight, 183 after a dozen -- and stayed after the app ended.
+`OMNI_AHB_TRACE=1` (new): the host-visible mirrors of gralloc buffers SurfaceFlinger's ANGLE
+imports went 7 -> 21 live over 8 launches (+2 a launch). `dumpsys SurfaceFlinger --list`: every
+launch left its task, activity, window (with the app's last buffers) and leash layers offscreen
+-- 76 layers after three launches. Not GC (forced, no change), not the window presenter's import
+cache (`OMNI_PRESENT_KEEP_FRAMES=2`, no change), not blur (`ro.surface_flinger.supports_background_blur=0`,
+no change). Cause: the binder broker ignored `BC_ACQUIRE`/`BC_RELEASE`/`BC_INCREFS`/`BC_DECREFS`
+from live processes -- "a live process's handles last as long as it does" -- so system_server,
+which never ends, never let go of a layer handle, and SurfaceFlinger never destroyed a layer.
+
+Now each handle's references are counted per process; a handle whose counts reach zero, with no
+transaction in flight naming its object, is deleted (re-checked when the object is unpinned), and
+the object released by its owner when no one else refers to it. Never handle 0, never the host's
+own handles. The counting commands never fail (libbinder resends a write from where a failed
+transaction stopped it). `OMNI_BINDER_REFCOUNT=0` is the old way. Tests: two binder tests whose
+raw clients used a handle without acquiring it now acquire it as libbinder does; a new one,
+`binder_handle_release`, has a live process let a handle go and its owner hear the release.
+Checked live: 25 launches on one device (layers flat at 52, 4 mirrors, no new error -- the one
+`DeadObjectException` is WindowManager telling a force-stopped app, in the old way's runs too),
+Roblox (Delta) to the same screen as without.
+
+After 8 launches of the probe app on one device (force-stopped after each), 30 s later, same build:
+
+| | SurfaceFlinger layers | live mirrors | system host commit | its GPU memory | its private bytes |
+|---|---|---|---|---|---|
+| not counted (A1, A2) | 116 / 116 | 20 / 20 | 817 / 812 MiB | 127 / 125 MiB | 939 / 934 MB |
+| counted (B0-B2) | 60 / 60 / 60 | 4 / 4 / 4 | 748 / 754 / 752 MiB | 68 / 69 / 70 MiB | 870 / 872 / 873 MB |
+
+**-60..-65 MiB after 8 launches, and no growth after**: 25 launches ended at 743 MiB, 52 layers.
+Launch times unchanged (1.2-1.5 s TotalTime either way).
+
+## The saved devices gutted again (fixed, 302e04b5)
+
+Mid-run every device stopped coming up: `/data/apex/sessions`, `/data/tombstones`, `/data/local`
+were gone from every saved device in `%TEMP%\omni-golden` -- Windows' empty-folder cleanup (C: at
+~20 GB free), as on 2026-10-03; `.omni-init-dirs` said they were made, so nothing made them, and
+apexd aborted. The marker now lists them and each boot re-makes what is gone (`init_dirs_healed`).
+The owner's pool's saved devices were among the gutted ones: set aside as `.gutted-20261022`
+(main still trusts the marker -- this commit is one to take first).
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a

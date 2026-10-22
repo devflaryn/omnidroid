@@ -90,6 +90,18 @@ type NodeId = u64;
 /// The host: the owner of host services' nodes and the sender of the host's own transactions. A
 /// guest's id counts up from 1, so never meets it.
 const HOST: ProcId = u64::MAX;
+
+/// **Handle references counted**, as the kernel counts them (`OMNI_BINDER_REFCOUNT=0`: not -- a
+/// live process's handles then last as long as it does). Without it nothing a long-lived process
+/// (system_server) was ever handed went away: every SurfaceFlinger layer WindowManager made for an
+/// app -- its task, activity, window and leash surfaces, the app's last buffers and their GPU
+/// mirrors with them -- stayed, offscreen, after the app ended (76 layers after three launches,
+/// ~17 MiB of the system host's commit a launch, 2026-10-22). A strong reference is kept until the
+/// weak ones go too: an owner holds its object a little longer than the kernel would have it.
+fn refcount() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OMNI_BINDER_REFCOUNT").as_deref() != Ok("0"))
+}
 /// The uid the host's transactions come from: `system`, as a platform service's are.
 const HOST_EUID: u32 = 1000;
 /// How long the host waits for a reply before giving up on it.
@@ -328,6 +340,9 @@ struct ProcState {
     pid: i32,
     refs: BTreeMap<u32, NodeId>,
     by_node: HashMap<NodeId, u32>,
+    /// `refcount`: each handle's references as its process counts them (strong, weak) --
+    /// `BC_ACQUIRE`/`BC_RELEASE`, `BC_INCREFS`/`BC_DECREFS`.
+    counts: HashMap<u32, (u32, u32)>,
     /// The last handle number given out: numbers are not reused (a process's cached proxy for a
     /// deleted handle must not name another object).
     last_handle: u32,
@@ -567,6 +582,9 @@ impl State {
             *count -= 1;
             if *count == 0 {
                 self.pins.remove(&node);
+                if refcount() {
+                    self.drop_unheld_handles(node);
+                }
                 if self.release_if_unreferenced(node) {
                     released += 1;
                 }
@@ -587,6 +605,58 @@ impl State {
             self.async_done(node, receiver);
         }
         self.unpin(txn.pinned)
+    }
+
+    /// `refcount`: a handle reference command from `id` (`BC_INCREFS`, `BC_ACQUIRE`, `BC_RELEASE`,
+    /// `BC_DECREFS`). Never fails, as the kernel's does not (it logs a bad handle and goes on): a
+    /// failed ioctl would make libbinder send the write again, and its commands twice.
+    fn count_handle(&mut self, id: ProcId, code: u32, h: u32) {
+        let Some(proc) = self.procs.get_mut(&id) else { return };
+        if !proc.refs.contains_key(&h) {
+            return;
+        }
+        let c = proc.counts.entry(h).or_default();
+        match code {
+            BC_ACQUIRE => c.0 += 1,
+            BC_INCREFS => c.1 += 1,
+            BC_RELEASE => c.0 = c.0.saturating_sub(1),
+            _ => c.1 = c.1.saturating_sub(1),
+        }
+        if *c == (0, 0) {
+            self.drop_handle_if_unheld(id, h);
+        }
+    }
+
+    /// `refcount`: `id`'s handle `h`, if nothing holds it any more -- no reference its process
+    /// counts and no transaction in flight naming its object -- is deleted, as the kernel deletes a
+    /// `binder_ref` at zero, and its object released by its owner when no one else refers to it.
+    /// Handle 0 (the context manager) and the host's own handles are never deleted.
+    fn drop_handle_if_unheld(&mut self, id: ProcId, h: u32) {
+        if h == 0 || id == HOST {
+            return;
+        }
+        let Some(proc) = self.procs.get(&id) else { return };
+        if proc.dead || proc.counts.get(&h).is_some_and(|c| *c != (0, 0)) {
+            return;
+        }
+        let Some(&node) = proc.refs.get(&h) else { return };
+        if self.pins.contains_key(&node) {
+            return; // checked again when it is unpinned
+        }
+        let proc = self.procs.get_mut(&id).expect("the process");
+        proc.refs.remove(&h);
+        proc.by_node.remove(&node);
+        proc.counts.remove(&h);
+        self.release_if_unreferenced(node);
+    }
+
+    /// `refcount`: `node` is no longer in flight: every process's handle to it that nothing holds
+    /// goes (a handle delivered and never taken up, or let go while a transaction named it).
+    fn drop_unheld_handles(&mut self, node: NodeId) {
+        let holders: Vec<(ProcId, u32)> = self.procs.iter().filter(|(id, p)| **id != HOST && !p.dead).filter_map(|(id, p)| p.by_node.get(&node).map(|h| (*id, *h))).collect();
+        for (id, h) in holders {
+            self.drop_handle_if_unheld(id, h);
+        }
     }
 
     /// No live process refers to `node` any more, and no transaction in flight names it: its
@@ -1498,11 +1568,15 @@ fn command(p: &Process, t: &mut Task, file: &Arc<BinderFile>, cmds: &[u8], at: u
                 st.unpin(b.pinned);
             }
         }
-        // A live process's handle references are not counted: its handles last as long as it
-        // does, and are released with it (`BinderFile::release`). Counting them needs the whole
-        // write to go on past a failed command, as the kernel's does (a dropped BC_ACQUIRE with
-        // its BC_RELEASE counted deleted handles still in use).
-        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {}
+        // A live process's handle references: counted with `refcount` (`count_handle`), else not
+        // -- its handles then last as long as it does, released with it (`BinderFile::release`).
+        // A write that stops at a failed transaction is sent again from there by libbinder, so no
+        // command is lost; these never fail, so none is counted twice.
+        BC_INCREFS | BC_ACQUIRE | BC_RELEASE | BC_DECREFS => {
+            if refcount() {
+                file.broker.state.lock().count_handle(file.id, code, u32_at(arg, 0));
+            }
+        }
         BC_ACQUIRE_DONE => file.broker.state.lock().acquire_done(file.id, u64_at(arg, 0)),
         BC_INCREFS_DONE | BC_DEAD_BINDER_DONE => {}
         BC_REGISTER_LOOPER | BC_ENTER_LOOPER => {
