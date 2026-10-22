@@ -921,15 +921,16 @@ impl Client {
             super::compose::levers_from_env();
             // `present_zero`: shown by the window's GPU from the app's share images, when every
             // layer can be; else this frame is composed on the CPU as below.
+            // Without a sink, a frame with share images has the window make one (this frame
+            // composed on the CPU); frames without any have it dropped after a while.
             if crate::gpu::share::on() {
                 if let Some(sink) = screen.framebuffer.sink() {
                     if present_shared(&st, screen, &order, &*sink) {
+                        screen.framebuffer.set_sink_wanted(true);
                         return;
                     }
-                } else if !screen.framebuffer.sink_wanted() && any_shared(&st, &order) {
-                    // The window's swapchain is made now; this frame is composed on the CPU.
-                    screen.framebuffer.want_sink();
                 }
+                screen.framebuffer.set_sink_wanted(any_shared(&st, &order));
             }
             let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
             // One opaque layer over the whole display (a game's SurfaceView): its rows straight

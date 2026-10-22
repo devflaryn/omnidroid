@@ -715,8 +715,12 @@ impl Drop for RowsSlot<'_> {
 }
 
 /// The present thread: each frame to the window, and the window's size to the display.
-/// `OMNI_PRESENT_EAGER=1`: the window's swapchain made at its start, as before 2026-10-22, not when
-/// the composer first has share images to show ([`Framebuffer::want_sink`]).
+/// How long the window keeps its swapchain once the composer's frames have no share images (the
+/// app gone, the home in front): a few seconds, so an app's transitions do not remake it.
+const PRESENT_IDLE: Duration = Duration::from_secs(10);
+
+/// `OMNI_PRESENT_EAGER=1`: the window's swapchain made at its start and kept, as before 2026-10-22,
+/// not while the composer has share images to show ([`Framebuffer::set_sink_wanted`]).
 fn present_eager() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("OMNI_PRESENT_EAGER").as_deref() == Ok("1"))
@@ -752,11 +756,19 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
     let zero_shown = Arc::new(AtomicU64::new(0));
     let (mut has_gpu, mut gpu_failed, mut sink_on) = (false, false, false);
     let mut gpu_size = (0u32, 0u32);
+    let mut unwanted_since: Option<Instant> = None;
     while !stop.load(Ordering::Acquire) {
         let zero = crate::gpu::share::on();
-        // `present_zero`'s swapchain once the composer has share images to show on it (or at
-        // once with `OMNI_PRESENT_EAGER=1`).
-        let want_gpu = (crate::gpu::window_present::on() || (zero && (framebuffer.sink_wanted() || present_eager()))) && !gpu_failed;
+        // `present_zero`'s swapchain while the composer has share images to show on it, and for
+        // `PRESENT_IDLE` after (or from the start, kept, with `OMNI_PRESENT_EAGER=1`).
+        let wanted = framebuffer.sink_wanted();
+        if wanted || !has_gpu {
+            unwanted_since = None;
+        } else if unwanted_since.is_none() {
+            unwanted_since = Some(Instant::now());
+        }
+        let idle = unwanted_since.is_some_and(|t| t.elapsed() >= PRESENT_IDLE);
+        let want_gpu = (crate::gpu::window_present::on() || (zero && (present_eager() || (!idle && (wanted || has_gpu))))) && !gpu_failed;
         if want_gpu && !has_gpu {
             match crate::gpu::window_present::WindowPresenter::new(raw) {
                 Ok(p) => {
@@ -776,7 +788,7 @@ fn present(presenter: &Presenter, raw: omni_platform::window::RawWindow, framebu
             gpu.release();
             (has_gpu, sink_on) = (false, false);
             shown = shown.saturating_sub(1);
-            eprintln!("[window] present_gpu off: GDI");
+            eprintln!("[window] present_gpu off: GDI{}", if idle { " (no app frames to show)" } else { "" });
         }
         if has_gpu && zero && !sink_on {
             framebuffer.set_sink(Some(Arc::new(WindowSink { slot: Arc::clone(&gpu.slot), presenter: presenter.clone(), zero_shown: Arc::clone(&zero_shown) })));

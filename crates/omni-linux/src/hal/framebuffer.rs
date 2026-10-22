@@ -36,8 +36,7 @@ pub struct Framebuffer {
     /// Where the composer can write a frame's pixels itself (`CpuSink`): the display window's
     /// image, while it has one that takes rows (macOS's `IOSurface`).
     cpu_sink: Mutex<Option<Arc<dyn CpuSink>>>,
-    /// The composer had a frame of share images to show and no [`sink`](Self::sink) to show it on:
-    /// the display window makes its swapchain then, not before ([`want_sink`](Self::want_sink)).
+    /// The composer's last frame had share images to show ([`set_sink_wanted`](Self::set_sink_wanted)).
     sink_wanted: AtomicBool,
 }
 
@@ -114,15 +113,18 @@ impl Framebuffer {
         self.sink.lock().clone()
     }
 
-    /// **Ask the display window for a [`sink`](Self::sink)** (`present_zero`): a frame of the app's
-    /// share images came with none. The window's swapchain (a Vulkan device and its images, ~118 MB
-    /// of the system host on an idle warm device, 2026-10-22) is made once a display shows an app's
-    /// Vulkan frames, not for the home and system windows the CPU composes anyway.
-    pub fn want_sink(&self) {
-        self.sink_wanted.store(true, Ordering::Relaxed);
+    /// **Whether the composer's last frame had share images to show** (`present_zero`): the
+    /// display window has a [`sink`](Self::sink) while it does, and drops it some seconds after it
+    /// stops. The window's swapchain (a Vulkan device and its images: the system host +118-133 MB
+    /// on an idle warm device, 2026-10-22) is for an app's Vulkan frames, not for the home and
+    /// system windows the CPU composes anyway.
+    pub fn set_sink_wanted(&self, wanted: bool) {
+        if self.sink_wanted.load(Ordering::Relaxed) != wanted {
+            self.sink_wanted.store(wanted, Ordering::Relaxed);
+        }
     }
 
-    /// See [`want_sink`](Self::want_sink).
+    /// See [`set_sink_wanted`](Self::set_sink_wanted).
     #[must_use]
     pub fn sink_wanted(&self) -> bool {
         self.sink_wanted.load(Ordering::Relaxed)
