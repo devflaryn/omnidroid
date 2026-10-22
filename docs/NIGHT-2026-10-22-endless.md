@@ -262,6 +262,19 @@ s14's logs): system_server's program starts at 1.75 s, ART is up at ~3.0 s, its 
 1.1 s, system_server's services 5.2 s (PackageManager 1.8 s), the home (in its spare) +0.2 s,
 then the user's unlock ~1.1 s to boot_completed at 11.2 s.
 
+## s15 -- translation snapshots again, 4 minutes after ready (MEASURED, owner's call)
+
+With s1-s13 in, `OMNI_JIT_SNAPSHOT=1` against the default, 240 s after warm ready (after code
+aging's first pass), interleaved after one fill run:
+
+| | warm ready | all hosts private | system host | idle CPU (30 s, % of a core) |
+|---|---|---|---|---|
+| snapshots (F1-F3) | 10.7 / 10.6 / 10.6 s | 1357.7 / 1342.9 / 1336.1 MB | 967.6 / 950.9 / 941.0 MB | 5.68 / 4.48 / 4.79 |
+| default (N1-N3) | 11.2 / 11.2 / 11.2 s | 1222.3 / 1221.8 / 1219.8 MB | 841.2 / 841.0 / 839.3 MB | 7.12 / 8.64 / 7.03 |
+
+The boot gain is smaller now (-0.5 s; s3's -2.2 s was before the home and init fixes); the RAM cost
+stays after aging (+100..+126 MB, system host); new: **idle CPU -2.5 points of a core** with them.
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
