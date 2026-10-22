@@ -478,12 +478,16 @@ pub const KIOSK_IME: &str = "/product/app/LatinIME";
 pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")]), ("apexd-bootstrap", &[])];
 
 /// The properties `service` would have set, if the device leaves it out ([`SERVICES_LEFT_OUT`],
-/// less `OMNI_KEEP_SERVICES`, comma-separated).
+/// less `OMNI_KEEP_SERVICES`, comma-separated; more with `OMNI_LEAVE_OUT_SERVICES`, which set
+/// nothing -- for measuring what a service costs).
 #[must_use]
 pub fn service_left_out(service: &str) -> Option<&'static [(&'static str, &'static str)]> {
     let kept = std::env::var("OMNI_KEEP_SERVICES").unwrap_or_default();
     if kept.split(',').any(|k| k.trim() == service) {
         return None;
+    }
+    if std::env::var("OMNI_LEAVE_OUT_SERVICES").unwrap_or_default().split(',').any(|k| k.trim() == service) {
+        return Some(&[]);
     }
     SERVICES_LEFT_OUT.iter().find(|(name, _)| *name == service).map(|(_, props)| *props)
 }
