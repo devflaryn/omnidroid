@@ -170,6 +170,11 @@ fn main() -> ExitCode {
         stderr: Output::Host,
         trace: std::env::var("OMNI_SYSCALL_TRACE").as_deref() == Ok("1"),
     };
+    // The boot's first process (init): the owners' log compacted before anything else of the
+    // device runs (`omni_linux::owners::compact`).
+    if !init_classes.is_empty() {
+        omni_linux::owners::compact(&instance);
+    }
     let p = match Process::spawn_as(config, uid) {
         Ok(p) => p,
         Err(e) => {

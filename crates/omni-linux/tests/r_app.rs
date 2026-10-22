@@ -221,13 +221,14 @@ fn quiet_boot() -> bool {
 }
 
 /// How saved devices are set up: a device saved by an older setup is not booted (2: the package
-/// installer kept enabled; 3: the boot receivers quieted, `quiet_boot`; 4: no notification assistant).
-const DEVICE_SETUP: u32 = 4;
+/// installer kept enabled; 3: the boot receivers quieted, `quiet_boot`; 4: no notification assistant;
+/// 5: the owners' log whole -- one saved before could have lost most of it, `omni_linux::owners`).
+const DEVICE_SETUP: u32 = 5;
 
 /// How saved warm devices are set up (`warm_device`): one saved by an older setup is not booted
 /// (3: the idle apps' disabling written before the device is saved; 4: the boot receivers quieted;
-/// 5: no notification assistant, `omni_quiet.sh`).
-const WARM_SETUP: u32 = 5;
+/// 5: no notification assistant, `omni_quiet.sh`; 6: the owners' log whole, `omni_linux::owners`).
+const WARM_SETUP: u32 = 6;
 
 /// The saved device for this APK, account and device setup under `root`: a new APK, a new cookie
 /// file or another setup is another device.

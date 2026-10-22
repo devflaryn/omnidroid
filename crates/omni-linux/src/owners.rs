@@ -3,7 +3,15 @@
 //! with the mode it asked for less its umask; `chown` and `chmod` change them; `stat` reports
 //! them. installd checks each app directory's owner and mode before it trusts it
 //! (`fs_prepare_dir_strict`), so they must hold across boots: each instance keeps them in
-//! `<instance>/.omni-owners`, a log replayed (and compacted) when the instance is first used.
+//! `<instance>/.omni-owners`, a log every host process replays when it starts and appends to.
+//!
+//! **Compacted once a boot, by its first process** ([`compact`], before init starts anything), never
+//! when a process loads it. Every host process used to rewrite the log as it loaded it
+//! (`fs::write`: truncated, then written): one that started meanwhile read a truncated log and
+//! rewrote its near-empty table over it. A saved device lost the owners of all of `/data/data` that
+//! way (2026-10-22, 98 of ~1,460 lines left): installd found them `0:0`, failed every app's data
+//! ("Failed to prepare /data/data/android", 237 lines), and PackageManager destroyed and remade
+//! each system app's data at every boot from it (`AppDataPrepare` 1.5 s).
 //!
 //! The table is ordered (a `BTreeMap`): `Path` orders by components, so a directory and everything
 //! under it are one range, and a rename moves that range alone. It was a hash map scanned whole,
@@ -71,15 +79,7 @@ impl Owners {
                 }
             }
         }
-        // Compacted: the table as it is now, one line a file.
         let _ = std::fs::create_dir_all(instance);
-        let mut out = String::new();
-        for (host, o) in &map {
-            if let Some(rel) = relative(instance, host) {
-                out.push_str(&format!("S\t{:o}\t{}\t{}\t{rel}\n", o.mode, o.uid, o.gid));
-            }
-        }
-        let _ = std::fs::write(&path, out);
         let log = std::fs::OpenOptions::new().append(true).create(true).open(&path).ok();
         Self { instance: Some(instance.to_path_buf()), map: Mutex::new(map), log: Mutex::new(log) }
     }
@@ -123,6 +123,28 @@ impl Owners {
     pub fn rename(&self, from: &Path, to: &Path) {
         move_tree(&mut self.map.lock(), from, to);
         self.append(|i| Some(format!("R\t{}\t{}\n", relative(i, from)?, relative(i, to)?)));
+    }
+}
+
+/// **The instance's log compacted** -- one line a file, as the table is now -- written beside it and
+/// renamed over it. Only while no other host process of the instance runs: the boot's first, before
+/// init starts anything (a process appending meanwhile would lose its lines).
+pub fn compact(instance: &Path) {
+    let path = instance.join(LOG);
+    if !path.exists() {
+        return;
+    }
+    let table = Owners::load(instance);
+    let mut out = String::new();
+    for (host, o) in table.map.lock().iter() {
+        if let Some(rel) = relative(instance, host) {
+            out.push_str(&format!("S\t{:o}\t{}\t{}\t{rel}\n", o.mode, o.uid, o.gid));
+        }
+    }
+    drop(table);
+    let part = instance.join(format!("{LOG}.part"));
+    if std::fs::write(&part, out).is_ok() && std::fs::rename(&part, &path).is_err() {
+        let _ = std::fs::remove_file(&part);
     }
 }
 
@@ -176,6 +198,31 @@ mod tests {
         assert_eq!(t.get(&dir.join("data/z/b")), Some(o(10001, 0o700)));
         assert_eq!(t.get(&dir.join("data/a")), None);
         assert_eq!(t.get(&dir.join("data/c")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_load_never_rewrites_the_log_and_a_boot_compacts_it() {
+        let dir = std::env::temp_dir().join(format!("omni-owners-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let o = |uid| Owner { uid, gid: uid, mode: 0o700 };
+        let log = || std::fs::read_to_string(dir.join(".omni-owners")).unwrap_or_default();
+        let writer = Owners::load(&dir);
+        writer.set(&dir.join("data/data/android"), o(1000));
+        writer.set(&dir.join("data/x"), o(1));
+        writer.forget(&dir.join("data/x"));
+        let before = log();
+        // Another host process starting: it reads, and leaves the log as it is -- the writer's
+        // next lines are not lost to a rewrite.
+        let reader = Owners::load(&dir);
+        assert_eq!(reader.get(&dir.join("data/data/android")), Some(o(1000)));
+        assert_eq!(log(), before, "a load writes nothing");
+        writer.set(&dir.join("data/data/com.a"), o(10001));
+        drop((writer, reader));
+        super::compact(&dir);
+        assert_eq!(log().lines().count(), 2, "one line a file: {}", log());
+        let t = Owners::load(&dir);
+        assert_eq!((t.get(&dir.join("data/data/android")), t.get(&dir.join("data/data/com.a")), t.get(&dir.join("data/x"))), (Some(o(1000)), Some(o(10001)), None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
