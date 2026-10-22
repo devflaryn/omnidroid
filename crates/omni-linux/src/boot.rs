@@ -9,12 +9,28 @@ use crate::vfs::Sysroot;
 pub const WRITABLE: [&str; 6] = ["/data", "/metadata", "/tmp", "/linkerconfig", "/mnt", "/storage"];
 
 /// Every `mkdir` in the image's init scripts whose path lies on a writable mount, made under
-/// `instance`. Once per instance: a marker records it.
+/// `instance`. Once per instance: a marker records it, and which directories they were -- each made
+/// again at a later boot if it is gone. Windows' temporary-file cleanup deletes empty directories
+/// under `%TEMP%`, where instances and saved devices live: twice (2026-10-03, 2026-10-22) it took
+/// `/data/apex/sessions`, `/data/tombstones` and the rest from every saved device, and a device made
+/// from one never booted (apexd aborts, system_server waits for it) while the marker said they
+/// were made.
 pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
     let marker = instance.join("data").join(".omni-init-dirs");
-    if marker.exists() {
-        return;
+    // A marker written before it listed them is empty: every directory is made once more.
+    if let Ok(list) = std::fs::read_to_string(&marker) {
+        if !list.is_empty() {
+            let gone: Vec<std::path::PathBuf> = list.lines().filter(|rel| !rel.is_empty()).map(|rel| instance.join(rel)).filter(|p| !p.is_dir()).collect();
+            for dir in &gone {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if !gone.is_empty() {
+                eprintln!("[boot] {} of init's directories were gone (an empty-folder cleanup?): made again", gone.len());
+            }
+            return;
+        }
     }
+    let mut made = String::new();
     let owners = crate::owners::Owners::of(instance);
     let mut scripts: Vec<Vec<u8>> = vec![b"/system/etc/init/hw/init.rc".to_vec()];
     for dir in [&b"/system/etc/init"[..], b"/system_ext/etc/init", b"/product/etc/init", b"/vendor/etc/init"] {
@@ -46,6 +62,7 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
             }
             let host = instance.join(&root[1..]).join(rest.trim_start_matches('/'));
             let _ = std::fs::create_dir_all(&host);
+            made.push_str(&format!("{}/{}\n", &root[1..], rest.trim_start_matches('/')));
             // `mkdir <path> [mode] [owner] [group]`: init makes it so (root, 0755 by default).
             let mode = words.next().and_then(|m| u32::from_str_radix(m, 8).ok()).unwrap_or(0o755);
             let uid = words.next().map_or(0, crate::init::uid_of);
@@ -85,5 +102,5 @@ pub fn make_init_dirs(sysroot: &Sysroot, instance: &Path) {
         }
     }
     let _ = std::fs::create_dir_all(instance.join("data"));
-    let _ = std::fs::write(marker, b"");
+    let _ = std::fs::write(marker, made);
 }
