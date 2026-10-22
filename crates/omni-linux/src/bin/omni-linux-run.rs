@@ -193,8 +193,12 @@ fn main() -> ExitCode {
                 let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string(), vm_options };
                 omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
                 eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
-                // OMNI_APP_SPARE=1: a spare app process once Android has booted.
+                // OMNI_APP_SPARE=1: a spare app process once Android has booted -- or at the first
+                // app's start, on a device whose home takes one (`device::home_spare`).
                 let sysroot = std::sync::Arc::clone(p.vfs.sysroot());
+                if omni_linux::device::home_spare() && sysroot.has(format!("{}/OmniHome.apk", omni_linux::device::KIOSK_HOME).as_bytes()) {
+                    omni_linux::zygote::start_spare_at_first_launch();
+                }
                 omni_linux::zygote::start_spares_when(move || {
                     omni_linux::props::PropertyService::global(&sysroot).get("sys.boot_completed").as_deref() == Some("1")
                 });

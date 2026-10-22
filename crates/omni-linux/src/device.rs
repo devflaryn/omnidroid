@@ -325,6 +325,18 @@ pub fn overlays_key_suffix() -> &'static str {
 /// would ask which); `OMNI_KIOSK_HOME=0` leaves it out (FallbackHome again).
 pub const KIOSK_HOME: &str = "/vendor/app/OmniHome";
 
+/// [`KIOSK_HOME`]'s package.
+pub const KIOSK_HOME_PACKAGE: &str = "com.omnidroid.home";
+
+/// **The kiosk home starts in a spare app process** (`crate::zygote`'s spare; `OMNI_HOME_SPARE=0`:
+/// not). boot_completed waits for the home to draw, and a home started cold spent ~0.8 of its ~2.5 s
+/// on its host process and ART coming up (run 2026-10-22); a spare started as soon as the zygote
+/// serves is up by then. Only where spares are kept (`OMNI_APP_SPARE=1`: the warm device, the pool).
+#[must_use]
+pub fn home_spare() -> bool {
+    std::env::var("OMNI_HOME_SPARE").as_deref() != Ok("0")
+}
+
 /// Whether this device has [`KIOSK_HOME`].
 #[must_use]
 pub fn kiosk_home() -> bool {

@@ -50,6 +50,13 @@ FallbackHome (Settings) was the kiosk home: 223 MB private, per device and per p
 launched on it draws (screenshot). Not run: a pool with users (the owner's pool held the machine's
 one pool); each pool user's home is this app too, so the saving repeats per user.
 
+**Correction (found in s7):** the device's `omni_lean.sh` already ended Settings every 30 s once
+it was in the background (`cmd activity kill com.android.settings`). So the saving holds while the
+home is in front -- an idle warm device, the pool's waiting state, where it was measured -- and is
+transient once an app is in front. That loop also ends `android.process.media` (a "recent
+provider" system_server keeps at PREVIOUS otherwise): ending the loop on kiosk-home devices kept it
+alive (+76 MB in every run), so the loop stays.
+
 ## s3 -- translation snapshots on a warm boot (MEASURED, left to the owner)
 
 `OMNI_JIT_SNAPSHOT=1` against the default, same build (s2's), interleaved after one fill run:
@@ -111,6 +118,54 @@ off. Interleaved, same build:
 | host wait (B1-B3) | ~13.0 / 12.8 / 12.9 s | 13.2 / 13.1 / 13.2 s | 13.5 / 13.4 / 13.5 s |
 
 **-0.3 s to warm ready (3/3)**, and every later step of an app session's script with it.
+
+## s5 -- system_server without the zygote's class preload (NOT KEPT, reverted)
+
+`OMNI_SYSTEM_PRELOAD=0` left `/system/etc/preloaded-classes` out of the system's host process too
+(apps' hosts already have none). Interleaved, same build:
+
+| | system_server entered | boot_completed (log) | warm ready | all hosts private | machine CPU to ready+60 s |
+|---|---|---|---|---|---|
+| preload (A1-A3) | ~5.0-5.1 s | 13.4 / 13.4 / 13.4 s | 13.7 s x3 | 1296.9 / 1291.9 / 1291.1 MB | 170.0 / 170.1 / 170.9 core-s |
+| none (B4-B6) | ~4.0-4.1 s | 13.4 / 13.4 / 13.4 s | 13.7 s x3 | 1292.7 / 1285.7 / 1293.4 MB | 164.5 / 171.5 / 169.3 core-s |
+
+system_server starts 1 s sooner and boots no sooner: the classes it uses are loaded later instead,
+and the home's start gates boot_completed. RAM and CPU inside the noise. Reverted.
+
+What it showed: boot_completed landed on the same 13.4 s every run, and warm ready on 13.7 s --
+the setup script polled `sys.boot_completed` with `sleep 1` (s6).
+
+## s7 -- boot receivers a kiosk device has no use for (KEPT, 4c8f81a9)
+
+`/vendor/bin/omni_quiet.sh` (init's `omni_quiet`, root; the pool runs it for each new user)
+disables 20 BOOT_COMPLETED receivers of Settings, PermissionController, AdServices' extension, the
+package installer, Shell, MTP and downloads (the script names each). First try ran it from the
+setup shell: "Shell cannot change component state", nothing disabled; then five receivers only:
+Settings came back for its other six. Same build, interleaved:
+
+| | app processes started | machine CPU to ready+60 s | warm ready |
+|---|---|---|---|
+| receivers on (A1-A3) | 14 / 14 / 14 | 169.0 / 162.1 / 165.7 core-s | 13.2 / 13.1 / 13.0 s |
+| disabled (B1-B3) | 10 / 10 / 10 | 159.5 / 163.8 / 154.2 core-s | 13.0 / 13.0 / 12.9 s |
+
+Settings, the package installer, Shell and AdServices no longer start after a boot. CPU lower in
+2 of 3 pairs (median -6 core-s) -- small against the machine's noise, kept for the processes.
+
+## s8 -- the kiosk home starts in a spare app process (KEPT)
+
+The home (on boot's critical path: boot_completed waits for it to draw) took ~2.4 s from its start
+to displayed, ~0.8 s of it a cold host process and ART. With spares on (`OMNI_APP_SPARE=1`: warm
+and pool devices) the first spare now starts at the first app's start (the WebView relro maker,
+~1.3 s before the home) and the home takes it; the next spare follows at once.
+`OMNI_HOME_SPARE=0` turns it off. First try started the spare at the zygote's own start (pid
+2000, before system_server): the home never attached and the boot waited 58 s -- not kept.
+
+| | home displayed after | warm ready |
+|---|---|---|
+| cold (C1-C3) | 2.441 / 2.381 / 2.402 s | 13.3 / 13.2 / 13.2 s |
+| spare (D1-D3) | 2.150 / 2.116 / 2.129 s | 13.1 / 13.0 / 12.9 s |
+
+**-0.27 s to the home, -0.2 s to warm ready (3/3).**
 
 ## Found, not acted on (yet)
 
