@@ -204,6 +204,34 @@ its own predictor, not these callbacks).
 `OMNI_VSYNC_TRACE` stay, as diagnostics). A vsync callback is cheap; the system host's idle
 ~6.6% of a core is elsewhere -- and `OMNI_THREAD_CPU` shows system_server's own threads idle.
 
+## s11 -- the home's spare started when system_server starts (KEPT)
+
+s8's spare started at the first app's start, ~1.3 s before the home: not enough for its preload.
+It now starts when system_server sets `sys.system_server.start_count` (~5 s before the home), the
+first-app start kept as a fallback; `OMNI_HOME_SPARE_EARLY=0`: as s8.
+
+| | home displayed after | `[r] boot_completed` | warm ready |
+|---|---|---|---|
+| s8's (E1-E3) | 2.216 / 2.238 / 2.238 s | 12.8 / 12.9 / 12.9 s | 13.1 / 13.2 / 13.1 s |
+| early (F1-F3) | 1.015 / 1.018 / 1.007 s | 11.9 / 11.8 / 11.8 s | 12.2 / 12.1 / 12.1 s |
+
+**-1.0 s to warm ready (3/3).**
+
+## s12 -- init skips what fails or does nothing here (KEPT)
+
+`apexd-bootstrap` (init's first `exec_start`) failed at every boot -- no loop-control or
+device-mapper, "/apex/sharedlibs: Read-only file system", exit 1 -- having set and written
+nothing: now a service the device leaves out (`OMNI_KEEP_SERVICES=apexd-bootstrap` runs it). The
+root module scripts (`omni_root_pfd`, `omni_root_service`) are not started on a device the host
+staged no root for (they exited at once).
+
+| | init's boot commands | system_server entered | warm ready |
+|---|---|---|---|
+| bootstrap apexd run (A1-A3) | 2083 / 2105 / 2083 ms | ~5.0-5.1 s | 12.0 / 12.2 / 12.3 s |
+| skipped (B1-B3) | 1929 / 1959 / 1961 ms | ~4.1-5.0 s | 12.0 / 12.1 / 12.1 s |
+
+**-140 ms of init (3/3)**; warm ready within noise.
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a

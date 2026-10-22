@@ -193,14 +193,19 @@ fn main() -> ExitCode {
                 let launcher = omni_linux::zygote::Launcher { runner, sysroot: sysroot.clone(), instance: instance.clone(), envp: envp.clone(), binder: addr.to_string(), vm_options };
                 omni_linux::zygote::serve(std::sync::Arc::as_ptr(p.vfs.binds()) as usize, launcher);
                 eprintln!("[zygote] /dev/socket/zygote; apps' binder at {addr}");
-                // OMNI_APP_SPARE=1: a spare app process once Android has booted -- or at the first
-                // app's start, on a device whose home takes one (`device::home_spare`).
+                // OMNI_APP_SPARE=1: a spare app process once Android has booted -- on a device whose
+                // home takes one (`device::home_spare`), once system_server has started (it sets
+                // `sys.system_server.start_count`; ~5 s before the home), or at the first app's start.
                 let sysroot = std::sync::Arc::clone(p.vfs.sysroot());
-                if omni_linux::device::home_spare() && sysroot.has(format!("{}/OmniHome.apk", omni_linux::device::KIOSK_HOME).as_bytes()) {
+                let home = omni_linux::device::home_spare() && sysroot.has(format!("{}/OmniHome.apk", omni_linux::device::KIOSK_HOME).as_bytes());
+                if home {
                     omni_linux::zygote::start_spare_at_first_launch();
                 }
+                // `OMNI_HOME_SPARE_EARLY=0`: not at system_server's start (the first app's only).
+                let early = home && std::env::var("OMNI_HOME_SPARE_EARLY").as_deref() != Ok("0");
                 omni_linux::zygote::start_spares_when(move || {
-                    omni_linux::props::PropertyService::global(&sysroot).get("sys.boot_completed").as_deref() == Some("1")
+                    let props = omni_linux::props::PropertyService::global(&sysroot);
+                    (early && props.get("sys.system_server.start_count").is_some()) || props.get("sys.boot_completed").as_deref() == Some("1")
                 });
             }
             Err(e) => eprintln!("[zygote] {e}"),
