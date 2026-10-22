@@ -420,6 +420,29 @@ User creation, measured on a warm device: `pm create-user` 1.6-1.7 s, the first 
 2.7 s); a start after the app's `install-existing` 1.07 s (the grant 66 ms) -- the pool makes and
 starts a user ahead, so nothing to take there.
 
+## s23 -- SurfaceFlinger's translations trimmed while nothing is drawn (KEPT, a trade-off)
+
+`OMNI_MEM_TRACE_ALL=1` (every guest process): the idle system host's 47 processes are system_server
+73+19 MiB (guest+code), SurfaceFlinger 7+41 MiB, the rest 2-6 MiB each. The trimmer never touched
+SurfaceFlinger; now it does, over a period with no frame presented. Three ABBA pairs each:
+
+| | trimmed (default) | kept (`OMNI_CODE_TRIM_SF=0`) |
+|---|---|---|
+| idle, 150 s after ready, all hosts | 935-947 MB | 1000-1001 MB |
+| first launch after the idle (probe) | 1962 / 1956 / 1920 ms | 1910 / 1845 / 1875 ms |
+| second launch | 1205-1238 ms | 1200-1239 ms |
+| system host after the launches | 790-794 MB | 838-844 MB |
+
+-55..-65 MB idle for +69 ms on the first launch after an idle period. Kept on; owner may prefer off.
+
+## Disk, for an install (2026-10-22, measured)
+
+Android image (sysroot) 1.76 GB (objects 1.70 GB, boot image 58 MB); programs ~20 MB
+(omni-linux-run 11.9, omni-mcp 5.5, omnidroid 2.8 MB); decompressed APEXes 237 MB, made once in
+%TEMP%; a saved warm device ~8 MB (its APEXes hard-linked); a running device ~10 MB + its apps.
+~2.1 GB after a first run. Next for size: the image (85%) -- NTFS/WOF compression
+(`compact /exe`) or what a kiosk never uses; not measured yet.
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the

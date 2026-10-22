@@ -33,7 +33,7 @@ Every number below is from an interleaved A/B on this PC; the ledger
 | | main (start of the night) | branch now |
 |---|---|---|
 | warm ready (boot from saved device) | 15.3 / 17.2 / 16.7 s | **~11.2-11.5 s** |
-| idle warm Android, private bytes, all hosts | ~1,470-1,520 MB | **~1,077-1,081 MB** at 60 s after ready (was 1,211-1,215 before s18) |
+| idle warm Android, private bytes, all hosts | ~1,470-1,520 MB | **~935-990 MB** (60-150 s after ready) |
 | disk per saved / running device | 248 MB | **~10 MB** (APEXes linked) |
 | system host after 8 app launches | +~110 MB and climbing | flat |
 | idle CPU of a warm Android (60-120 s after ready) | ~7-9 % of a core | **~2.4-2.8 %** |
@@ -60,6 +60,9 @@ Every number below is from an interleaved A/B on this PC; the ledger
   ~120-130 MB back (712-725 against 845 MB).
 - s22 the app's lab tools run in `omni-mcp --lab`, started at the first lab call: omnidroid.exe
   7.8 -> 2.9 MB (it carried dynarmic for them). Build `-p omnidroid -p omni-mcp` as the README says.
+- s23 SurfaceFlinger's translations trimmed over a period nothing was drawn in: -55..-65 MB per
+  idle device, **+69 ms on the first app launch after an idle period** (a trade-off:
+  `OMNI_CODE_TRIM_SF=0` turns it off).
 - s20 the device's idle shell loops wait without starting a process (`sleep 2` was a new guest
   process every 2 s, translated afresh): **idle CPU 7.3-9.2 -> 2.4-2.8 % of a core**, -13 MB.
 
