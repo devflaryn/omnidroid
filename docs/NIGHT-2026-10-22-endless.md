@@ -390,6 +390,22 @@ is what has ActivityManager apply the cached-process limit. The loop stays, wait
 
 **Idle CPU -5.3 points of a core per warm device** (two thirds of what it used), -13 MB.
 
+## s21 -- statsd and mediametrics left out (NOT KEPT)
+
+`OMNI_LEAVE_OUT_SERVICES=statsd,mediametrics` (a measuring lever, kept): warm ready 27.5-27.7 s
+against 11.5-11.8 s (something waits ~16 s for statsd), for -5 MB. Reverted.
+
+## The owners' log emptied itself (fixed, 935b9bc4)
+
+The boot's system_server timings showed `AppDataPrepare` 1.5 s and 237 lines of installd's "Failed
+to prepare /data/data/<pkg>: Function not implemented" -- the errno stale: libcutils said "Expected
+path /data/data/android with owner 1000:1000 but found 0:0", and PackageManager then destroyed and
+remade each system app's data at every boot. The saved device (v5, made 09:02) had 98 owner lines
+of the v4's 1,465, none for /data/data: every host process compacted the log at load with a
+truncating write, and one starting meanwhile wrote back what little it had read. Compacted now only
+by the boot's first process; WARM_SETUP 6 / DEVICE_SETUP 5. Boots from the new saved device: no
+failures, AppDataPrepare 716-735 ms, warm ready 11.1-11.4 s (the v5 ones 11.5-11.8 s).
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the

@@ -5,7 +5,7 @@ The ask: keep making omnidroid boot faster and use less RAM, CPU and disk, until
 Every number below is from an interleaved A/B on this PC; the ledger
 (`docs/NIGHT-2026-10-22-endless.md`) has each run.
 
-## Take first: two fixes
+## Take first: three fixes
 
 1. **`302e04b5` -- saved devices survive Windows' temp cleanup.** At ~07:00 Windows' empty-folder
    cleanup (C: at ~20 GB free) deleted `/data/apex/sessions`, `/data/tombstones`, ... from **every**
@@ -20,6 +20,13 @@ Every number below is from an interleaved A/B on this PC; the ledger
    mirrors: **~17 MiB of the system host per launch, forever** (an agent testing 100 APKs: ~1.7 GB).
    Now counted as the kernel counts them; after 8 launches 812-817 -> 748-754 MiB, after 25 flat at
    743 MiB. `OMNI_BINDER_REFCOUNT=0` is the old way.
+
+3. **`935b9bc4` -- the owners' log can no longer empty itself.** Every host process rewrote
+   `.omni-owners` as it loaded it; one starting meanwhile read it truncated and wrote its near-empty
+   table back. A saved device of this branch lost the owners of all `/data/data` that way: every
+   boot from it, installd failed each app's data (`0:0`) and PackageManager destroyed and remade
+   every system app's data (1.5 s of the boot). Now compacted once, by the boot's first process.
+   **`main` has the same code**; your pool's saved devices checked out whole (1,9xx lines each).
 
 ## Where things stand (saved warm device, Windows i7)
 
@@ -49,6 +56,8 @@ Every number below is from an interleaved A/B on this PC; the ledger
   per idle warm device (the boot animation's Vulkan frames had the presenter made, and it stayed).
 - s19 that presenter dropped 10 s after the app's frames stop: a pool device whose app closed gives
   ~120-130 MB back (712-725 against 845 MB).
+- s20 the device's idle shell loops wait without starting a process (`sleep 2` was a new guest
+  process every 2 s, translated afresh): **idle CPU 7.3-9.2 -> 2.4-2.8 % of a core**, -13 MB.
 
 **Also asked for during the night: bundles** -- `feat/bundles` (its own branch from `main`, worktree
 `C:\ob`, pushed, not merged): `.apkm`, `.xapk`, `.apks` and zips of APKs run like an APK (base and
