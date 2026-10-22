@@ -25,9 +25,18 @@ public final class Spare {
             preload.setAccessible(true);
             preload.invoke(null, trace);
         }
+        // The file is looked for every 50 ms (`OMNI_SPARE_POLL_MS`): a spare waits minutes for its
+        // app, and every 10 ms was ~2% of a core for the whole of a warm device's life (a stat and a
+        // wake-up through the guest's code, 100 times a second) to start the app 20 ms sooner.
+        long poll = 50;
+        try {
+            poll = Long.parseLong(System.getenv("OMNI_SPARE_POLL_MS"));
+        } catch (RuntimeException e) {
+            // unset or not a number: the default
+        }
         File go = new File(args[0]);
         while (!go.exists()) {
-            Thread.sleep(10);
+            Thread.sleep(poll);
         }
         String[] w = new String(Files.readAllBytes(go.toPath()), "UTF-8").trim().split(" ");
         go.delete();

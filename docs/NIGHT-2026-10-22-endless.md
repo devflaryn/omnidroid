@@ -167,6 +167,20 @@ and pool devices) the first spare now starts at the first app's start (the WebVi
 
 **-0.27 s to the home, -0.2 s to warm ready (3/3).**
 
+## s9 -- the spare looks for its app every 50 ms, not 10 (KEPT)
+
+A warm device keeps a spare app process waiting for its app; it looked for its "go" file every
+10 ms -- a stat and a wake-up through the guest's code 100 times a second, for the device's whole
+life. Now 50 ms (`OMNI_SPARE_POLL_MS` in the guest environment, e.g. through
+`OMNI_APP_GUEST_ENV`): an app taken by a spare starts ~20 ms later on average.
+
+| | all hosts' CPU, 60 s idle (% of a core) | warm ready |
+|---|---|---|
+| 10 ms (A1-A3) | 9.56 / 9.12 / 9.32 | 13.2 / 12.9 / 12.9 s |
+| 50 ms (B1-B3) | 7.30 / 7.58 / 7.23 | 13.0 / 13.0 / 13.1 s |
+
+**-2 points of a core idle (-22% of a warm device's idle CPU), 3/3.**
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
