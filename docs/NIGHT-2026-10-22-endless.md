@@ -363,6 +363,33 @@ is shown from its share images as before. `OMNI_PRESENT_EAGER=1` / `OMNI_R_SETPR
 debug.sf.nobootanimation=0` restore either half. (The `E/SystemServiceRegistry` stack under
 `bootAnimationComplete` -- no USB manager -- is in the runs with the animation too.)
 
+## s19 -- the presenter dropped once the app is gone (KEPT, c7443ff5)
+
+The composer says frame by frame whether its frame had share images; the window drops its
+presenter 10 s after the last one (`[window] present_gpu off: GDI (no app frames to show)`) and
+makes it again for the next app. Probe app launched twice and stopped, 30 s later, two ABBA pairs:
+the system host 712 / 725 MB against 845 / 845 MB kept (`OMNI_PRESENT_EAGER=1`); launches the same.
+
+## s20 -- the idle loops wait without starting a process (KEPT, f13cb32f)
+
+`OMNI_MEM_TRACE=30` on an idle device: 47 guest processes in the system host, two of them `sleep`
+with ~6 MiB of translated code each. `omni_autogrant.sh` polled `/data/app` with `sleep 2` forever
+-- a guest process every 2 s, its linker, libc and toybox translated afresh -- and `omni_lean.sh`
+looped on `sleep 30`. Both now wait with `read -t <s> -u3` on a `cat |&` coprocess that never
+writes (one process for the session; omni-linux has no mkfifo). `persist.omni.tick=sleep` is the
+old way.
+
+First try also ended omni_lean's loop on the kiosk device (its home is not Settings): that kept
+android.process.media (+75 MB) cached after boot, as on 2026-10-1x -- the loop's `cmd activity kill`
+is what has ActivityManager apply the cached-process limit. The loop stays, waiting the new way.
+
+| 60-120 s after ready, 4 ABBA pairs | idle CPU, all hosts | system host CPU | private, all hosts | warm ready |
+|---|---|---|---|---|
+| `sleep` (S1-S4) | 7.34 / 9.21 / 8.45 / 8.01 % | 6.35-8.05 % | 998-1008 MB | 11.6-12.7 s |
+| tick (T1-T4) | 2.74 / 2.71 / 2.39 / 2.76 % | 1.61-2.19 % | 988-991 MB | 11.5-11.9 s |
+
+**Idle CPU -5.3 points of a core per warm device** (two thirds of what it used), -13 MB.
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the
