@@ -1,13 +1,18 @@
 //! **The app's MCP server** for coding agents: off by default (`mcp_enabled`), and when on, served
 //! on `http://127.0.0.1:<mcp_port>/mcp` from the moment the app opens -- so every agent on this
 //! computer drives the same pool. The pool's tools are answered without a lock (a `wait_instance`
-//! does not hold the others up); the lab's go one at a time through `omni-mcp`'s server.
+//! does not hold the others up); the lab's go one at a time to **`omni-mcp --lab`**, a process of
+//! their own started at the first lab call ([`LabChild`]) -- so this executable carries no CPU
+//! backend (dynarmic was 3.65 of its 7.8 MB, 2026-10-22). It is found beside this one
+//! (`OMNI_MCP_BIN` names another).
 //!
 //! **Registered for the agents** (`mcp register`, and when MCP is turned on): Claude Code
 //! (`claude mcp add --transport http --scope user omnidroid <url>`) and Omni Agent's pi
 //! (`~/.pi/agent/omni-agent.json` -> `omniMcp`: `omni-mcp --connect <url>`, the stdio bridge).
 //! Any other agent takes the URL, or the bridge as a stdio server.
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -21,32 +26,139 @@ use super::live::PoolLive;
 /// What answers the app's MCP requests.
 pub struct AppDispatch {
     pool: Arc<omni_pool::Pool>,
-    /// The lab's tools (and the protocol's own methods, the tool list).
-    lab: Mutex<omni_mcp::Server>,
+    /// The lab's tools: `omni-mcp --lab`, once a lab tool is called.
+    lab: Mutex<Option<LabChild>>,
 }
 
 impl AppDispatch {
     #[must_use]
     pub fn new(pool: Arc<omni_pool::Pool>) -> Self {
-        let lab = omni_mcp::Server::with_live(omni_mcp::Config::from_env(), Box::new(PoolLive { pool: Arc::clone(&pool) }));
-        Self { pool, lab: Mutex::new(lab) }
+        Self { pool, lab: Mutex::new(None) }
+    }
+
+    /// A lab tool's call, in `omni-mcp --lab` (started now if it is not running; started again
+    /// once if it ended -- its sessions went with it).
+    fn lab_call(&self, params: &Json) -> Result<Json, RpcError> {
+        let mut lab = self.lab.lock();
+        for attempt in 0..2 {
+            if lab.is_none() {
+                *lab = Some(LabChild::start().map_err(RpcError::server)?);
+            }
+            match lab.as_mut().expect("started").request("tools/call", params) {
+                Ok(answer) => return answer,
+                // The process is gone: a new one, once.
+                Err(e) => {
+                    *lab = None;
+                    if attempt == 1 {
+                        return Err(RpcError::server(format!("the lab (omni-mcp --lab) ended: {e}")));
+                    }
+                }
+            }
+        }
+        unreachable!("returned in the loop")
     }
 }
 
 impl Dispatch for &AppDispatch {
     fn handle(&mut self, method: &str, params: &Json) -> Result<Json, RpcError> {
-        if method == "tools/call" {
-            let name = params.get("name").and_then(Json::as_str).unwrap_or("");
-            let empty = Json::Object(Default::default());
-            let arguments = params.get("arguments").unwrap_or(&empty);
-            // The pool's tools: a PoolLive of this call's own, so none waits for another.
-            let mut live = PoolLive { pool: Arc::clone(&self.pool) };
-            if let Some(answer) = live.call(name, arguments) {
-                self.pool.say(format!("mcp: {name}"));
-                return answer.map(omni_mcp::server::text_result);
+        match method {
+            "initialize" => Ok(json::obj([
+                ("protocolVersion", json::s(omni_mcp::server::PROTOCOL_VERSION)),
+                ("capabilities", json::obj([("tools", json::obj([]))])),
+                ("serverInfo", json::obj([("name", json::s("omni-mcp")), ("version", json::s(env!("CARGO_PKG_VERSION")))])),
+            ])),
+            "notifications/initialized" | "initialized" => Ok(Json::Null),
+            "ping" => Ok(json::obj([])),
+            "tools/list" => {
+                let mut tools = PoolLive { pool: Arc::clone(&self.pool) }.tools();
+                tools.extend(omni_mcp::server::lab_tools());
+                Ok(json::obj([("tools", Json::Array(tools))]))
             }
+            "tools/call" => {
+                let name = params.get("name").and_then(Json::as_str).unwrap_or("");
+                let empty = Json::Object(Default::default());
+                let arguments = params.get("arguments").unwrap_or(&empty);
+                // The pool's tools: a PoolLive of this call's own, so none waits for another.
+                let mut live = PoolLive { pool: Arc::clone(&self.pool) };
+                if let Some(answer) = live.call(name, arguments) {
+                    self.pool.say(format!("mcp: {name}"));
+                    return answer.map(omni_mcp::server::text_result);
+                }
+                if omni_mcp::server::LIVE_TOOLS.contains(&name) {
+                    return Err(RpcError { code: omni_mcp::mcp::code::METHOD_NOT_FOUND, message: format!("no tool named {name}") });
+                }
+                self.lab_call(params)
+            }
+            other => Err(RpcError { code: omni_mcp::mcp::code::METHOD_NOT_FOUND, message: format!("no method {other}") }),
         }
-        self.lab.lock().handle(method, params)
+    }
+}
+
+/// **`omni-mcp --lab`**, the lab's tools in a process of their own, spoken to over its stdio (MCP:
+/// one JSON-RPC message a line). Ended with the app.
+struct LabChild {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
+impl LabChild {
+    /// Where `omni-mcp` is: `OMNI_MCP_BIN`, else beside this executable.
+    fn program() -> PathBuf {
+        if let Some(bin) = std::env::var_os("OMNI_MCP_BIN") {
+            return PathBuf::from(bin);
+        }
+        let name = if cfg!(windows) { "omni-mcp.exe" } else { "omni-mcp" };
+        std::env::current_exe().map_or_else(|_| PathBuf::from(name), |exe| exe.with_file_name(name))
+    }
+
+    fn start() -> Result<Self, String> {
+        let program = Self::program();
+        let mut child = Command::new(&program)
+            .arg("--lab")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("the lab's tools run in {} (`cargo build --release -p omni-mcp`): {e}", program.display()))?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else { return Err("omni-mcp --lab: no stdio".into()) };
+        let mut lab = Self { child, stdin, stdout: BufReader::new(stdout), next_id: 1 };
+        let init = json::obj([("protocolVersion", json::s(omni_mcp::server::PROTOCOL_VERSION)), ("capabilities", json::obj([])), ("clientInfo", json::obj([("name", json::s("omnidroid"))]))]);
+        lab.request("initialize", &init)?.map_err(|e| e.message)?;
+        Ok(lab)
+    }
+
+    /// One request and its answer. The outer error: the process is gone (or spoke nonsense).
+    fn request(&mut self, method: &str, params: &Json) -> Result<Result<Json, RpcError>, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json::obj([("jsonrpc", json::s("2.0")), ("id", Json::Num(id as f64)), ("method", json::s(method)), ("params", params.clone())]);
+        writeln!(self.stdin, "{}", message.to_string()).and_then(|()| self.stdin.flush()).map_err(|e| e.to_string())?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if self.stdout.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                return Err("its output ended".into());
+            }
+            let Ok(answer) = json::parse(line.trim()) else { continue };
+            if answer.get("id").and_then(Json::as_f64) != Some(id as f64) {
+                continue;
+            }
+            if let Some(error) = answer.get("error") {
+                let code = error.get("code").and_then(Json::as_f64).map_or(omni_mcp::mcp::code::INTERNAL_ERROR, |c| c as i64);
+                let message = error.get("message").and_then(Json::as_str).unwrap_or("the lab failed").to_string();
+                return Ok(Err(RpcError { code, message }));
+            }
+            return Ok(Ok(answer.get("result").cloned().unwrap_or(Json::Null)));
+        }
+    }
+}
+
+impl Drop for LabChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -151,6 +263,40 @@ pub fn snippet(url: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lab's tools listed beside the pool's, and run in `omni-mcp --lab`: a library loaded and
+    /// a symbol resolved there, its session kept between calls. Needs `omni-mcp` built beside the
+    /// tests (`cargo build --release -p omni-mcp`); skipped without it.
+    #[test]
+    fn the_lab_runs_in_omni_mcp_and_keeps_its_session() {
+        let Some(bin) = std::env::current_exe().ok().and_then(|t| Some(t.parent()?.parent()?.join(if cfg!(windows) { "omni-mcp.exe" } else { "omni-mcp" }))).filter(|b| b.exists()) else {
+            eprintln!("omni-mcp not built beside the tests: skipped");
+            return;
+        };
+        std::env::set_var("OMNI_MCP_BIN", &bin);
+        let config = omni_pool::Config { warm_on_start: false, ..Default::default() };
+        let pool = omni_pool::Pool::start_alone(config, None, PathBuf::from("omnidroid"));
+        let app = AppDispatch::new(Arc::clone(&pool));
+        let mut d = &app;
+        let list = d.handle("tools/list", &Json::Null).expect("listed");
+        let names: Vec<String> = match list.get("tools") {
+            Some(Json::Array(t)) => t.iter().filter_map(|t| t.get("name").and_then(Json::as_str).map(str::to_string)).collect(),
+            _ => Vec::new(),
+        };
+        for n in ["start_instance", "wait_instance", "lab_load", "call_function", "resolve_symbol"] {
+            assert!(names.iter().any(|x| x == n), "{n} listed: {names:?}");
+        }
+        assert_eq!(names.iter().filter(|n| *n == "start_instance").count(), 1, "the pool's, once");
+        let libz = Path::new(env!("CARGO_MANIFEST_DIR")).join("../omni-debug/tests/fixtures/libz.so");
+        let call = |d: &mut &AppDispatch, name: &str, args: Json| d.handle("tools/call", &json::obj([("name", json::s(name)), ("arguments", args)]));
+        let loaded = call(&mut d, "lab_load", json::obj([("path", json::s(libz.display().to_string()))])).expect("loaded");
+        assert!(loaded.to_string().contains("libz"), "{}", loaded.to_string());
+        let resolved = call(&mut d, "resolve_symbol", json::obj([("name", json::s("crc32"))])).expect("resolved in the same session");
+        assert!(resolved.to_string().contains("address"), "{}", resolved.to_string());
+        assert!(call(&mut d, "no_such_tool", json::obj([])).is_err());
+        drop(app);
+        pool.shutdown(false);
+    }
 
     #[test]
     fn pi_s_config_keeps_its_other_keys_and_runs_the_bridge() {
