@@ -593,6 +593,9 @@ impl Init {
     /// `exec_start`: start a service and wait for it to end (at most [`EXEC_TIMEOUT`]). Its end,
     /// or `None` when it could not start.
     fn exec_service(&self, name: &str) -> Option<Option<crate::process::ExitStatus>> {
+        if self.not_run(name) {
+            return None;
+        }
         let service = self.services.get(name)?;
         if (self.skip)(service) {
             return None;
@@ -675,15 +678,26 @@ impl Init {
         started
     }
 
-    /// Start a service by name, unless it is running (or cannot run here). Whether it started.
-    pub fn start_service(&self, name: &str) -> bool {
-        // A service the device leaves out: what it would have said when done, at once.
+    /// Whether `name` is a service this device does not run (started or `exec_start`ed). A service
+    /// the device leaves out ([`crate::device::service_left_out`]) has what it would have said when
+    /// done set at once. The rooted device's module scripts (`/vendor/etc/init/omni_root.rc`) on a
+    /// device the host staged no root for would exit at once (no `/data/adb/omni/enabled`): a
+    /// process for nothing, 79 ms of init's critical path for `omni_root_pfd` (2026-10-22).
+    fn not_run(&self, name: &str) -> bool {
         if let Some(said) = crate::device::service_left_out(name) {
             if let Some(props) = self.properties() {
                 for (k, v) in said {
                     props.set(k, v);
                 }
             }
+            return true;
+        }
+        name.starts_with("omni_root_") && crate::vfs::host_path(&self.instance, b"data/adb/omni/enabled").is_some_and(|p| !p.exists())
+    }
+
+    /// Start a service by name, unless it is running (or cannot run here). Whether it started.
+    pub fn start_service(&self, name: &str) -> bool {
+        if self.not_run(name) {
             return false;
         }
         let Some(service) = self.services.get(name) else { return false };

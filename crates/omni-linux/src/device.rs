@@ -468,7 +468,14 @@ pub const KIOSK_IME: &str = "/product/app/LatinIME";
 /// for keystore2 at every boot, gave up ("Could not create keystore key") and set both
 /// properties on its way out (2026-10-01) -- while init waited on `odsign.key.done`. The outcome is
 /// the same without it, 5 s sooner. `OMNI_KEEP_SERVICES=odsign` runs it.
-pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")])];
+///
+/// `apexd-bootstrap` (`apexd --bootstrap`, init's first `exec_start`, before /data): it activates the
+/// bootstrap APEXes from loop and device-mapper devices, which this kernel does not have, and failed
+/// at every boot -- "Failed LOOP_CTL_ADD", "Failed to open device-mapper", then "Failed to create
+/// directory /apex/sharedlibs: Read-only file system", exit 1 -- having set no property and written
+/// nothing; the flattened APEXes are in the sysroot, and the `apexd` service that follows is the
+/// one whose `apexd.status` init waits for. 199 ms of init's critical path (2026-10-22).
+pub const SERVICES_LEFT_OUT: &[(&str, &[(&str, &str)])] = &[("odsign", &[("odsign.key.done", "1"), ("odsign.verification.done", "1")]), ("apexd-bootstrap", &[])];
 
 /// The properties `service` would have set, if the device leaves it out ([`SERVICES_LEFT_OUT`],
 /// less `OMNI_KEEP_SERVICES`, comma-separated).
