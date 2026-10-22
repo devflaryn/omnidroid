@@ -51,5 +51,10 @@ for c in \
         *) log -t omni_quiet "not disabled for user $u: $c" ;;
     esac
 done
+# The notification assistant (ExtServices' ranking and smart replies of notifications nobody sees
+# here): system_server keeps android.ext.services bound for it, a host process of its own (~72 MiB)
+# on every warm device and for every user. Without one it is not started (2026-10-22).
+cmd notification disallow_assistant android.ext.services/android.ext.services.notification.Assistant "$u" >/dev/null 2>&1 \
+    || log -t omni_quiet "notification assistant kept for user $u"
 [ -z "$1" ] && setprop persist.omni.quieted 1
 log -t omni_quiet "boot receivers disabled for user $u: $n"

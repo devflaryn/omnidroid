@@ -318,6 +318,27 @@ apexd aborted. The marker now lists them and each boot re-makes what is gone (`i
 The owner's pool's saved devices were among the gutted ones: set aside as `.gutted-20261022`
 (main still trusts the marker -- this commit is one to take first).
 
+## s17 -- no notification assistant (KEPT)
+
+After boot an idle warm device keeps app processes for the media provider, the network stack, the
+home, the spare -- and `android.ext.services`, bound by NotificationManager for its notification
+assistant (ranking, smart replies) and nothing else (`dumpsys activity services`). `omni_quiet.sh`
+now disallows the assistant for the user it quiets (`cmd notification disallow_assistant <comp>
+<user>`; the pool's new users too); WARM_SETUP 5, DEVICE_SETUP 4. Measured live first: the process
+ended within seconds of the command.
+
+| 240 s after warm ready | all hosts private | warm ready |
+|---|---|---|
+| with the assistant (s15/sl runs N1-N3, same build but this) | 1220.9 / 1214.8 / 1219.8 MB | 11.2-11.3 s |
+| without (B0-B2) | 1138.4 / 1137.3 / 1135.9 MB | 11.7 / 11.4 / 11.3 s |
+
+**-80 MB per warm Android** (and per pool user), the process gone.
+
+Also measured: an idle system host with the threads named (`omni-linux-<tid>` guest threads,
+helpers by name) 90-150 s after ready is 1.7% of a core -- the steady script's 60-90 s window still
+holds post-boot work. Its largest idle consumers: the zygote's connection threads, the working-set
+trimmer, the control channel's poll, omni_lean's `cmd` every 30 s -- each 1-2 ms a second.
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the
