@@ -165,6 +165,9 @@ pub struct LaunchInfo {
     pub package: String,
     /// `android:versionCode`, when the manifest has one.
     pub version_code: Option<u32>,
+    /// `split` (no namespace): this APK is that split of the package (`config.arm64_v8a`, a
+    /// feature's name), not its base. `None` for a base APK or a whole one.
+    pub split: Option<String>,
     /// The launcher Activity's class, whole (`com.example.app.MainActivity`), for
     /// `am start -n <package>/<class>`; `None` for an APK with no launcher icon.
     pub launcher: Option<String>,
@@ -195,7 +198,7 @@ impl LaunchInfo {
         let mut strings: Option<StringPool<'_>> = None;
         let mut resource_ids: &[u8] = &[];
         let mut at = usize::from(header);
-        let (mut package, mut version_code, mut launcher) = (None::<String>, None, None);
+        let (mut package, mut version_code, mut launcher, mut split) = (None::<String>, None, None, None::<String>);
         // `android.app.lib_name`: the launcher component's, and the application's.
         let (mut launcher_lib, mut app_lib, mut component_lib, mut is_launcher) = (None::<String>, None::<String>, None::<String>, false);
         // Inside a service, receiver or provider: its meta-data is not the application's.
@@ -221,6 +224,7 @@ impl LaunchInfo {
                         "manifest" if package.is_none() => {
                             package = element.string("package", None)?;
                             version_code = element.int("versionCode", ATTR_VERSION_CODE)?;
+                            split = element.string("split", None)?.filter(|s| !s.is_empty());
                         }
                         "activity" | "activity-alias" => {
                             let name = element.string("name", Some(ATTR_NAME))?.unwrap_or_default();
@@ -282,7 +286,7 @@ impl LaunchInfo {
                 c
             }
         });
-        Ok(LaunchInfo { package, version_code, launcher, native_lib: launcher_lib.or(app_lib).or(first_lib) })
+        Ok(LaunchInfo { package, version_code, split, launcher, native_lib: launcher_lib.or(app_lib).or(first_lib) })
     }
 }
 

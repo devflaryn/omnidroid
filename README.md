@@ -24,11 +24,20 @@ first launch starts at once. Type at its prompt:
 ```text
 run ~/apks/TalkingTom.apk           one instance, in a window of its own
 run ~/apks/TalkingTom.apk x3        three of them
+run ~/apks/Game.xapk                a bundle: base APK, splits and OBB files installed together
+run ~/apks/apps.zip --package com.a one package of a bundle that holds several
 close #2                            close an instance
 help                                everything else
 ```
 
 `omnidroid <apk> [xN]` opens the app and launches the APK straight away.
+
+**Bundles** (`.apkm`, `.xapk`, `.apks`, or any zip of APKs) run like an APK: each APK in the file
+says in its manifest which package and split it is, and a package's base APK and its splits are
+installed in one `pm install` (splits for ABIs other than arm64-v8a are left out); an `.xapk`'s
+OBB files go to the app's OBB directory. A bundle that holds several packages needs one named:
+`--package <name>` (at the prompt, on the command line, or `package` over MCP; the error lists
+them, and MCP's `apk_info` shows them first).
 
 ## The app
 
@@ -154,7 +163,8 @@ server. Agents drive the same pool you see in the app.
 
 The tools fall into four groups:
 
-- **Instances**: launch any APK (`start_instance {apk, count, options}`); wait for, list,
+- **Instances**: launch any APK or bundle (`start_instance {apk, package, count, options}`;
+  `apk_info` says what a file holds); wait for, list,
   screenshot, type into and close instances; manage the Androids; run shell commands.
 - **WebViews**: the `web_*` tools drive the web pages an app shows in its WebViews (sign-in
   forms, captchas), as a DevTools client does. `web_dom` lists every frame's elements with the

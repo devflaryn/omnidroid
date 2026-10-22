@@ -34,13 +34,40 @@ pub fn split_count(words: &[String]) -> (Option<String>, Vec<String>) {
     }
 }
 
-/// What the installed plugins make of `options` for a launch of `apk`. Nothing to do (and no
-/// plugin run) without options.
+/// `--package <name>` taken out of a launch's options: which package of a bundle of several to
+/// launch (`omni_warm::bundle`). The launcher's own option, not a plugin's.
+///
+/// # Errors
+/// `--package` with no name after it.
+pub fn take_package(options: &mut Vec<String>) -> Result<Option<String>, String> {
+    let Some(at) = options.iter().position(|o| o == "--package") else { return Ok(None) };
+    if at + 1 >= options.len() || options[at + 1].starts_with("--") {
+        return Err("--package needs a package's name".into());
+    }
+    let name = options.remove(at + 1);
+    options.remove(at);
+    Ok(Some(name))
+}
+
+/// Launch `count` instances of `apk` (an APK or a bundle of APKs) with `options`: the launcher's
+/// `--package`, and the installed plugins' options ([`extras`]).
+///
+/// # Errors
+/// As [`extras`] and `Pool::launch_package`.
+pub fn launch(pool: &Arc<omni_pool::Pool>, apk: &Path, count: u32, options: &[String]) -> Result<Vec<omni_pool::InstanceId>, String> {
+    let mut options = options.to_vec();
+    let package = take_package(&mut options)?;
+    let extras = extras(apk, package.as_deref(), &options)?;
+    pool.launch_package(apk, package.as_deref(), count, extras)
+}
+
+/// What the installed plugins make of `options` for a launch of `apk` (of `package`, from a bundle
+/// of several). Nothing to do (and no plugin run) without options.
 ///
 /// # Errors
 /// An option no installed plugin adds, a plugin's refusal (a cookie not found, an APK it is not
 /// for), or the cookie store could not be made.
-pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
+pub fn extras(apk: &Path, package: Option<&str>, options: &[String]) -> Result<Extras, String> {
     if options.is_empty() {
         return Ok(Extras::default());
     }
@@ -50,7 +77,7 @@ pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
     if let Some(unknown) = rest.first() {
         return Err(crate::with_hint(format!("unknown option `{unknown}` (a plugin's: `plugins` lists them)")));
     }
-    let app = omni_warm::Apk::read(apk)?;
+    let app = omni_warm::Apk::read_package(apk, package)?;
     let info = plugin::SessionInfo { command: "aosp", fresh: false, given_data_dir: None, apk: Some(apk), package: Some(&app.package) };
     let session = plugin::start(&plugins, &given, &info, &crate::plugin_base())?;
     let var = |key: &str| session.var(key).map(str::trim).filter(|v| !v.is_empty()).map(str::to_string);
@@ -63,7 +90,7 @@ pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
         _ => None,
     };
     // The same APK and options again, for a restart: the plugin's session-start answers anew.
-    let (apk, options) = (apk.to_path_buf(), options.to_vec());
+    let (apk, package, options) = (apk.to_path_buf(), package.map(str::to_string), options.to_vec());
     Ok(Extras {
         cookie_store,
         link,
@@ -71,7 +98,7 @@ pub fn extras(apk: &Path, options: &[String]) -> Result<Extras, String> {
         signed_in: var("OMNI_R_SIGNED_IN"),
         link_taken: var("OMNI_R_LINK_TAKEN"),
         said: session.said,
-        remake: Some(Arc::new(move || extras(&apk, &options))),
+        remake: Some(Arc::new(move || extras(&apk, package.as_deref(), &options))),
     })
 }
 
@@ -111,7 +138,18 @@ mod tests {
 
     #[test]
     fn no_options_run_no_plugin() {
-        let e = extras(Path::new("/nowhere.apk"), &[]).expect("nothing to do");
+        let e = extras(Path::new("/nowhere.apk"), None, &[]).expect("nothing to do");
         assert!(!e.any());
+    }
+
+    #[test]
+    fn package_is_the_launchers_own_option() {
+        let w = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let mut o = w(&["--cookie", "a", "--package", "com.a", "--place", "1"]);
+        assert_eq!(take_package(&mut o), Ok(Some("com.a".to_string())));
+        assert_eq!(o, w(&["--cookie", "a", "--place", "1"]), "the plugins' options left");
+        let mut none = w(&["--place", "1"]);
+        assert_eq!(take_package(&mut none), Ok(None));
+        assert!(take_package(&mut w(&["--package"])).is_err() && take_package(&mut w(&["--package", "--place"])).is_err());
     }
 }

@@ -112,6 +112,12 @@ pub fn words(text: &str) -> Vec<String> {
     out
 }
 
+/// Whether a file name is an APK's or a bundle of APKs' (`.apkm`, `.xapk`, `.apks`).
+fn names_app(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    [".apk", ".apkm", ".xapk", ".apks"].iter().any(|x| name.ends_with(x))
+}
+
 /// `run`'s argument: the path (which may hold spaces), a count (`x3`, `3`), and the plugins'
 /// options from the first ` --` on.
 fn run_args(rest: &str) -> Result<(PathBuf, u32, Vec<String>), String> {
@@ -197,8 +203,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "quit" | "q" | "exit" => Ok(Command::Quit),
         "" => Err(String::new()),
         other => {
-            // A path to an APK typed alone runs it.
-            if other.to_ascii_lowercase().ends_with(".apk") || line.to_ascii_lowercase().contains(".apk") {
+            // A path to an APK (or a bundle of APKs) typed alone runs it.
+            if names_app(other) || [".apk", ".xapk"].iter().any(|x| line.to_ascii_lowercase().contains(x)) {
                 return run_args(line).map(|(p, n, o)| Command::Run(p, n, o));
             }
             Err(format!("unknown command `{other}` (help lists them)"))
@@ -227,7 +233,7 @@ pub fn complete(line: &str) -> Option<String> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
             let is_dir = e.file_type().ok()?.is_dir();
-            (name.starts_with(&stem) && (is_dir || name.to_ascii_lowercase().ends_with(".apk")) && !name.starts_with('.')).then_some((name, is_dir))
+            (name.starts_with(&stem) && (is_dir || names_app(&name)) && !name.starts_with('.')).then_some((name, is_dir))
         })
         .collect();
     names.sort();
@@ -250,6 +256,8 @@ mod tests {
         assert_eq!(parse("run game.apk 5"), Ok(Command::Run(PathBuf::from("game.apk"), 5, vec![])));
         assert_eq!(parse("run \"/x/y.apk\""), Ok(Command::Run(PathBuf::from("/x/y.apk"), 1, vec![])));
         assert_eq!(parse("/x/y.apk x2"), Ok(Command::Run(PathBuf::from("/x/y.apk"), 2, vec![])), "a path alone runs it");
+        assert_eq!(parse("/x/Game.xapk"), Ok(Command::Run(PathBuf::from("/x/Game.xapk"), 1, vec![])), "a bundle too");
+        assert_eq!(parse("run /x/apps.zip --package com.a"), Ok(Command::Run(PathBuf::from("/x/apps.zip"), 1, vec!["--package".into(), "com.a".into()])));
         let o = |a: &[&str]| a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
         assert_eq!(
             parse("run /a b/Roblox.apk x2 --cookie farm4 --place 8737899170"),

@@ -23,6 +23,8 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
+pub mod bundle;
+
 /// The prefix of a warm device's directory in the temp directory.
 pub const PREFIX: &str = "omni-warm-";
 const LOCK: &str = "omni-warm.lock";
@@ -392,24 +394,85 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// An APK as the device will know it.
-#[derive(Debug, Clone)]
+/// An APK as the device will know it: one APK, or one package of a bundle ([`bundle`]: the base
+/// APK, its splits and OBB files).
+#[derive(Debug, Clone, Default)]
 pub struct Apk {
+    /// The APK; a bundle's package's base APK (extracted).
     pub path: PathBuf,
+    /// The SHA-256 of `path`'s bytes: what the device's installed `base.apk` is compared with.
     pub sha256: String,
     pub package: String,
     pub launcher: Option<String>,
     pub version_code: Option<u32>,
+    /// A bundle's package: its splits, installed with the base APK in one session (extracted).
+    pub splits: Vec<PathBuf>,
+    /// A bundle's package: its OBB files, put in its OBB directory once it is installed.
+    pub obbs: Vec<PathBuf>,
+    /// The bundle it came from (`None`: an APK of its own).
+    pub bundle: Option<PathBuf>,
 }
 
 impl Apk {
-    /// Read `path`: its bytes' hash and its manifest's package and launcher.
+    /// Read `path`: its bytes' hash and its manifest's package and launcher. A bundle of APKs
+    /// (`.apkm`, `.xapk`, `.apks`, a zip of APKs) is read as its only package.
     ///
     /// # Errors
-    /// The file cannot be read or is not an APK.
+    /// The file cannot be read, is neither an APK nor a bundle, or is a bundle of several packages
+    /// (the error names them: [`read_package`](Self::read_package) takes one).
     pub fn read(path: &Path) -> Result<Self, String> {
+        Self::read_package(path, None)
+    }
+
+    /// [`read`](Self::read), choosing `package` from a bundle of several (for a single APK, the
+    /// APK's own package, which `package` must be when given).
+    ///
+    /// # Errors
+    /// As `read`; `package` not in the file.
+    pub fn read_package(path: &Path, package: Option<&str>) -> Result<Self, String> {
+        if bundle::is_bundle(path)? {
+            let b = bundle::Bundle::open(path)?;
+            let set = b.choose(package)?;
+            return Ok(Self {
+                path: set.base.clone(),
+                sha256: sha256_file(&set.base)?,
+                package: set.package.clone(),
+                launcher: set.launcher.clone(),
+                version_code: set.version_code,
+                splits: set.splits.iter().map(|(_, f)| f.clone()).collect(),
+                obbs: set.obbs.clone(),
+                bundle: Some(path.to_path_buf()),
+            });
+        }
         let info = omni_apk::launch_info_of(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Self { path: path.to_path_buf(), sha256: sha256_file(path)?, package: info.package, launcher: info.launcher, version_code: info.version_code })
+        if let Some(p) = package.filter(|p| *p != info.package) {
+            return Err(format!("{} is {}, not {p}", path.display(), info.package));
+        }
+        Ok(Self { path: path.to_path_buf(), sha256: sha256_file(path)?, package: info.package, launcher: info.launcher, version_code: info.version_code, ..Self::default() })
+    }
+
+    /// What it is, for a log: the package, and its splits and OBB files when it has some.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.splits.is_empty() {
+            parts.push(format!("{} split{}", self.splits.len(), if self.splits.len() == 1 { "" } else { "s" }));
+        }
+        if !self.obbs.is_empty() {
+            parts.push(format!("{} OBB file{}", self.obbs.len(), if self.obbs.len() == 1 { "" } else { "s" }));
+        }
+        if parts.is_empty() {
+            self.package.clone()
+        } else {
+            format!("{} ({})", self.package, parts.join(", "))
+        }
+    }
+
+    /// The file names its OBB files have in its OBB directory (the extraction's `<n>-<dir>__`
+    /// prefix off: the names the app looks for).
+    #[must_use]
+    pub fn obb_names(&self) -> Vec<String> {
+        self.obbs.iter().map(|obb| bundle::own_name(obb)).collect()
     }
 }
 
@@ -472,12 +535,41 @@ pub fn install_then(device: &Device, apk: &Apk, then: &str, keep_others: bool) -
             }
         }
     }
-    // Handed to the device by its hash, and gone once installed.
+    // Handed to the device by its hash, and gone once installed: the APK, a bundle's splits (one
+    // install session with the base: `pm install base split...`) and its OBB files.
     let drop = device.dir.join(DROP);
     std::fs::create_dir_all(&drop).map_err(|e| format!("{}: {e}", drop.display()))?;
-    let name = format!("{}.apk", &apk.sha256[..16]);
-    std::fs::copy(&apk.path, drop.join(&name)).map_err(|e| format!("the APK to the device: {e}"))?;
-    let guest = format!("/data/local/tmp/omni-apk/{name}");
+    let stem = &apk.sha256[..16];
+    let mut handed: Vec<String> = Vec::new();
+    let mut hand = |from: &Path, name: String| -> Result<String, String> {
+        std::fs::copy(from, drop.join(&name)).map_err(|e| format!("{} to the device: {e}", from.display()))?;
+        handed.push(name.clone());
+        Ok(format!("/data/local/tmp/omni-apk/{name}"))
+    };
+    let handing = (|| -> Result<(String, Vec<(String, String)>), String> {
+        let mut guest = hand(&apk.path, format!("{stem}.apk"))?;
+        for (i, split) in apk.splits.iter().enumerate() {
+            guest.push(' ');
+            guest.push_str(&hand(split, format!("{stem}-split{i}.apk"))?);
+        }
+        let mut obbs = Vec::new();
+        for (obb, own) in apk.obbs.iter().zip(apk.obb_names()) {
+            obbs.push((hand(obb, format!("{stem}-{own}"))?, own));
+        }
+        Ok((guest, obbs))
+    })();
+    let clean = |handed: &[String]| {
+        for name in handed {
+            let _ = std::fs::remove_file(drop.join(name));
+        }
+    };
+    let (guest, obbs) = match handing {
+        Ok(h) => h,
+        Err(e) => {
+            clean(&handed);
+            return Err(e);
+        }
+    };
     let flags = pm_install_flags();
     // Other test apps go first, in the same command.
     let first: String = others.iter().map(|p| format!("pm uninstall {p} >/dev/null 2>&1; ")).collect();
@@ -501,11 +593,45 @@ pub fn install_then(device: &Device, apk: &Apk, then: &str, keep_others: bool) -
         let (c, s) = device.shell_as(&format!("pm uninstall {} >/dev/null 2>&1; pm install {flags} {guest}{grant}", apk.package), uid, limit)?;
         (code, said, action) = (c, s, "reinstalled-after-uninstall");
     }
-    let _ = std::fs::remove_file(drop.join(&name));
     if code != 0 || !said.contains("Success") {
-        return Err(format!("pm install {}: {}", apk.path.display(), said.trim()));
+        clean(&handed);
+        return Err(format!("pm install {}: {}", apk.bundle.as_ref().unwrap_or(&apk.path).display(), said.trim()));
     }
+    let placed = if obbs.is_empty() { Ok(()) } else { place_obbs(device, &apk.package, &obbs, limit) };
+    clean(&handed);
+    placed?;
     Ok(Installed { action, uninstalled: others, seconds: t.elapsed().as_secs_f64(), pm: said.trim().to_string() })
+}
+
+/// The command (as root) that makes `package`'s OBB directory of `user` (guest
+/// `/data/media/<user>/Android/obb/<package>`, as vold makes it: the app's uid, group `ext_obb_rw`,
+/// setgid) and moves (`keep`: copies, once) `obbs` (guest path, file name) into it.
+fn obb_script(package: &str, user: u32, obbs: &[(String, String)], keep: bool) -> String {
+    let dir = format!("/data/media/{user}/Android/obb/{package}");
+    // A copy for another user is made once: a file there already is kept.
+    let files: String = obbs.iter().map(|(from, name)| if keep { format!(" && {{ [ -e {dir}/{name} ] || cp {from} {dir}/{name}; }}") } else { format!(" && mv {from} {dir}/{name}") }).collect();
+    format!("mkdir -p {dir}{files} && u=$(stat -c %u /data/user/{user}/{package}) && chown -R $u:1079 {dir} && chmod 2770 {dir} && chmod 660 {dir}/*")
+}
+
+/// Put an installed package's OBB files (`obbs`: guest path, file name) in user 0's OBB directory.
+fn place_obbs(device: &Device, package: &str, obbs: &[(String, String)], limit: Duration) -> Result<(), String> {
+    let (code, said) = device.shell_as(&obb_script(package, 0, obbs, false), Some(0), limit)?;
+    if code != 0 {
+        return Err(format!("the OBB files of {package}: {}", said.trim()));
+    }
+    Ok(())
+}
+
+/// The command (as root) that gives `user` a copy of `apk`'s OBB files from user 0's: each Android
+/// user has an OBB directory of its own. Empty when there is nothing to copy.
+#[must_use]
+pub fn obbs_for_user(apk: &Apk, user: u32) -> String {
+    if apk.obbs.is_empty() || user == 0 {
+        return String::new();
+    }
+    let from = format!("/data/media/0/Android/obb/{}", apk.package);
+    let names: Vec<(String, String)> = apk.obb_names().into_iter().map(|n| (format!("{from}/{n}"), n)).collect();
+    obb_script(&apk.package, user, &names, true)
 }
 
 /// How a start went: `am start -W`'s answer (the Activity displayed).
