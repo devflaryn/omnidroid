@@ -36,6 +36,8 @@ Every number below is from an interleaved A/B on this PC; the ledger
 | idle warm Android, private bytes, all hosts | ~1,470-1,520 MB | **~1,077-1,081 MB** at 60 s after ready (was 1,211-1,215 before s18) |
 | disk per saved / running device | 248 MB | **~10 MB** (APEXes linked) |
 | system host after 8 app launches | +~110 MB and climbing | flat |
+| idle CPU of a warm Android (60-120 s after ready) | ~7-9 % of a core | **~2.4-2.8 %** |
+| omnidroid.exe (the app) | 7.8 MB | **2.9 MB** (the lab in `omni-mcp --lab`) |
 
 ## What changed (each its own commit)
 
@@ -56,6 +58,8 @@ Every number below is from an interleaved A/B on this PC; the ledger
   per idle warm device (the boot animation's Vulkan frames had the presenter made, and it stayed).
 - s19 that presenter dropped 10 s after the app's frames stop: a pool device whose app closed gives
   ~120-130 MB back (712-725 against 845 MB).
+- s22 the app's lab tools run in `omni-mcp --lab`, started at the first lab call: omnidroid.exe
+  7.8 -> 2.9 MB (it carried dynarmic for them). Build `-p omnidroid -p omni-mcp` as the README says.
 - s20 the device's idle shell loops wait without starting a process (`sleep 2` was a new guest
   process every 2 s, translated afresh): **idle CPU 7.3-9.2 -> 2.4-2.8 % of a core**, -13 MB.
 

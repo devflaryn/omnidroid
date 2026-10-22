@@ -406,6 +406,20 @@ truncating write, and one starting meanwhile wrote back what little it had read.
 by the boot's first process; WARM_SETUP 6 / DEVICE_SETUP 5. Boots from the new saved device: no
 failures, AppDataPrepare 716-735 ms, warm ready 11.1-11.4 s (the v5 ones 11.5-11.8 s).
 
+## s22 -- the app without the lab's CPU backend: omnidroid.exe 7.8 -> 2.9 MB (KEPT, 8e829458)
+
+PDB section contributions: dynarmic was 3.65 of omnidroid.exe's 7.79 MB -- the app's MCP server ran
+the lab's tools in-process (`omni_mcp::Server`). The lab now runs in `omni-mcp --lab` (stdio, started
+at the first lab call, its sessions kept), the app lists the lab's tools from their table and
+forwards their calls: **omnidroid.exe 2.91 MB (-63%)**. omni-linux-run.exe (12.4 MB): omni-linux
+7.56 MB, dynarmic 3.71 MB, the rest small; `panic = "abort"` not tried (dynarmic's callbacks catch
+panics to record them).
+
+User creation, measured on a warm device: `pm create-user` 1.6-1.7 s, the first `start-user`
+2.9-4.0 s (RoleService grants default roles through a PermissionController process of the user,
+2.7 s); a start after the app's `install-existing` 1.07 s (the grant 66 ms) -- the pool makes and
+starts a user ahead, so nothing to take there.
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the
