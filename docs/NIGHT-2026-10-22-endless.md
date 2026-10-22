@@ -247,6 +247,21 @@ leaves out, the APEX list, the device's own files); a matching stamp skips it.
 
 **-410 ms of init (3/3)**; warm ready 2 of 3 pairs sooner (B2 an outlier).
 
+## s14 -- the BPF loader beside the boot (NOT KEPT, reverted)
+
+`exec_start bpfloader` (360 ms) run on a thread of its own, joined before `class_start` (netd waits
+for `bpf.progs_loaded` itself):
+
+| | init's boot commands | `[r] boot_completed` | warm ready |
+|---|---|---|---|
+| waited for (A1-A3) | 1520 / 1530 / 1530 ms | 11.3 / 11.3 / 11.3 s | 11.7 / 11.6 / 11.6 s |
+| beside (B1-B3) | 1175 / 1178 / 1171 ms | 11.3 / 11.4 / 11.4 s | 11.6 / 11.7 / 11.7 s |
+
+Init 350 ms shorter, the boot not: the critical path is past init now. Where it is (`[boot-ms]`,
+s14's logs): system_server's program starts at 1.75 s, ART is up at ~3.0 s, its class preload
+1.1 s, system_server's services 5.2 s (PackageManager 1.8 s), the home (in its spare) +0.2 s,
+then the user's unlock ~1.1 s to boot_completed at 11.2 s.
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a
