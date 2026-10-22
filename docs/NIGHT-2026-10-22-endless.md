@@ -339,6 +339,30 @@ helpers by name) 90-150 s after ready is 1.7% of a core -- the steady script's 6
 holds post-boot work. Its largest idle consumers: the zygote's connection threads, the working-set
 trimmer, the control channel's poll, omni_lean's `cmd` every 30 s -- each 1-2 ms a second.
 
+## s18 -- no boot animation; the window's GPU presenter only for an app's frames (KEPT, f13abe10)
+
+`OMNI_PRESENT_ZERO=0` against the default showed the system host 118 MB lighter on an idle warm
+device (708 against 826-829 MB, two pairs). `=ready` -- devices still exporting share images, the
+lever off -- was as light as `=0` (705-707 MB, two triples), so it is not the exports (three
+1280x720 images, 11 MB of device memory: `OMNI_SHARE_TRACE=1`) but what the lever turns on: the
+display window's Vulkan presenter, made at the window's start and kept.
+
+The presenter is now made once the composer has a frame of share images and no sink. That alone
+saved nothing (L/E pairs 1212-1217 MB both): the boot animation draws through ANGLE's Vulkan, its
+frames are share images, and the presenter was made for it -- and stayed. So the boot animation is
+off too (`debug.sf.nobootanimation=1` in omnidroid's property overlay; on 2026-10-01, at ~46 s
+boots, ready was later without it, not now):
+
+| 60 s after warm ready, 4 ABBA pairs | all hosts private | system host | warm ready | boot CPU (live hosts) |
+|---|---|---|---|---|
+| boot animation (B1-B4) | 1214.7 / 1211.3 / 1215.0 / 1213.3 MB | 823.6-829.2 MB | 11.4 / 12.4 / 11.3 / 11.3 s | 68.0 / 64.2 / 67.9 / 64.9 s |
+| none (N1-N4) | 1080.5 / 1078.7 / 1080.3 / 1077.0 MB | 691.1-695.7 MB | 11.5 / 11.3 / 11.4 / 11.2 s | 64.5 / 66.4 / 66.1 / 62.2 s |
+
+**-134 MB per idle warm device**, ready the same. The probe app's launch makes the presenter and
+is shown from its share images as before. `OMNI_PRESENT_EAGER=1` / `OMNI_R_SETPROPS=
+debug.sf.nobootanimation=0` restore either half. (The `E/SystemServiceRegistry` stack under
+`bootAnimationComplete` -- no USB manager -- is in the runs with the animation too.)
+
 ## Found, not acted on (yet)
 
 - **Idle code-cache invalidations**: `[jit-time]` counts 2,000-9,000 invalidations / 30 s in the
