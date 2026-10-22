@@ -14,6 +14,7 @@
 //! **A frame may be BGRA** (`present_bgra`, [`super::compose::BGRA_OUT`]): the window takes it as
 //! it is ([`Framebuffer::frame_raw`]); every other reader -- [`Framebuffer::frame`],
 //! [`Framebuffer::pixels`], the PNG -- still gets RGBA.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,9 @@ pub struct Framebuffer {
     /// Where the composer can write a frame's pixels itself (`CpuSink`): the display window's
     /// image, while it has one that takes rows (macOS's `IOSurface`).
     cpu_sink: Mutex<Option<Arc<dyn CpuSink>>>,
+    /// The composer had a frame of share images to show and no [`sink`](Self::sink) to show it on:
+    /// the display window makes its swapchain then, not before ([`want_sink`](Self::want_sink)).
+    sink_wanted: AtomicBool,
 }
 
 /// **A window the composer writes a frame's rows into directly**: one pass from the layer's region
@@ -84,6 +88,7 @@ impl Framebuffer {
             spares: Mutex::new(Vec::new()),
             sink: Mutex::new(None),
             cpu_sink: Mutex::new(None),
+            sink_wanted: AtomicBool::new(false),
         }
     }
 
@@ -107,6 +112,20 @@ impl Framebuffer {
     #[must_use]
     pub fn sink(&self) -> Option<Arc<dyn ZeroSink>> {
         self.sink.lock().clone()
+    }
+
+    /// **Ask the display window for a [`sink`](Self::sink)** (`present_zero`): a frame of the app's
+    /// share images came with none. The window's swapchain (a Vulkan device and its images, ~118 MB
+    /// of the system host on an idle warm device, 2026-10-22) is made once a display shows an app's
+    /// Vulkan frames, not for the home and system windows the CPU composes anyway.
+    pub fn want_sink(&self) {
+        self.sink_wanted.store(true, Ordering::Relaxed);
+    }
+
+    /// See [`want_sink`](Self::want_sink).
+    #[must_use]
+    pub fn sink_wanted(&self) -> bool {
+        self.sink_wanted.load(Ordering::Relaxed)
     }
 
     /// **A frame the composer showed from share images** (`present_zero`): counted, waited on and

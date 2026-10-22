@@ -926,6 +926,9 @@ impl Client {
                     if present_shared(&st, screen, &order, &*sink) {
                         return;
                     }
+                } else if !screen.framebuffer.sink_wanted() && any_shared(&st, &order) {
+                    // The window's swapchain is made now; this frame is composed on the CPU.
+                    screen.framebuffer.want_sink();
                 }
             }
             let bgra = super::compose::BGRA_OUT.load(Ordering::Relaxed);
@@ -1176,6 +1179,15 @@ static ZERO_WHY: Mutex<&str> = Mutex::new("");
 /// plane alpha 1 and untransformed, the window's GPU composes them (`sink`) and the framebuffer
 /// gets the frame without its pixels -- composed on the CPU only if someone reads them. False, with
 /// nothing presented: the CPU composes this frame.
+/// Whether a visible layer's buffer has a share image (an app's Vulkan frames, `present_zero`).
+fn any_shared(st: &State, order: &[(i32, i64)]) -> bool {
+    order.iter().any(|&(_, l)| {
+        st.device.get(&l).is_some_and(|d| {
+            !st.hidden.contains(&l) && d.frame.is_some() && d.slot.and_then(|s| d.buffers.get(&s)).is_some_and(|b| crate::gpu::share::ShareDesc::read(&b.shm).is_some())
+        })
+    })
+}
+
 fn present_shared(st: &State, screen: &Screen, order: &[(i32, i64)], sink: &dyn super::framebuffer::ZeroSink) -> bool {
     use crate::gpu::share::{self, ShareBlend, ShareDesc, ShareLayer};
     let why = (|| -> Result<(Vec<ShareLayer>, Vec<OwnedLayer>), &'static str> {

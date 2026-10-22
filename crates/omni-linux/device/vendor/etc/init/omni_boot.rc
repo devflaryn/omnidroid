@@ -1,8 +1,6 @@
 # The device's boot, as its vendor sets it up.
 #
-# (The boot animation stays. Left out -- debug.sf.nobootanimation=1 -- a saved warm device was
-# ready later, not sooner: 52.3/49.6/69.8 s against 46.3/46.1/49.9 s with it, three ABBA pairs,
-# 2026-10-01. Its default animation is drawn by SurfaceFlinger's client for ~25 s of the boot.)
+# (No boot animation: `debug.sf.nobootanimation=1`, omnidroid's property overlay, `props.rs`.)
 on early-init
     # No dexopt when an app is installed. ART Service's artd (a lazy service, started for the
     # install) cannot chown the oat directory here ("Failed to chown .../oat: Operation not
