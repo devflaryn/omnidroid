@@ -25,8 +25,8 @@ Every number below is from an interleaved A/B on this PC; the ledger
 
 | | main (start of the night) | branch now |
 |---|---|---|
-| warm ready (boot from saved device) | 15.3 / 17.2 / 16.7 s | **~11.3-11.9 s** |
-| idle warm Android, private bytes, all hosts | ~1,470-1,520 MB | **~1,136 MB** (4 min after ready) |
+| warm ready (boot from saved device) | 15.3 / 17.2 / 16.7 s | **~11.2-11.5 s** |
+| idle warm Android, private bytes, all hosts | ~1,470-1,520 MB | **~1,077-1,081 MB** at 60 s after ready (was 1,211-1,215 before s18) |
 | disk per saved / running device | 248 MB | **~10 MB** (APEXes linked) |
 | system host after 8 app launches | +~110 MB and climbing | flat |
 
@@ -45,6 +45,16 @@ Every number below is from an interleaved A/B on this PC; the ledger
 - s13 `/linkerconfig` made once per image: init -410 ms.
 - s16 binder references counted (above).
 - s17 no notification assistant: one app process (~80 MB) less a warm Android and a pool user.
+- s18 no boot animation, and the window's Vulkan presenter made only for an app's frames: -134 MB
+  per idle warm device (the boot animation's Vulkan frames had the presenter made, and it stayed).
+- s19 that presenter dropped 10 s after the app's frames stop: a pool device whose app closed gives
+  ~120-130 MB back (712-725 against 845 MB).
+
+**Also asked for during the night: bundles** -- `feat/bundles` (its own branch from `main`, worktree
+`C:\ob`, pushed, not merged): `.apkm`, `.xapk`, `.apks` and zips of APKs run like an APK (base and
+splits in one `pm install`, other ABIs' splits left out, OBB files placed); a bundle of several apps
+asks which (`--package`, MCP `package`; MCP `apk_info` lists them). Checked on a warm device by its
+ignored test (`tests/bundle_device.rs`), not yet through a live pool window.
 
 Not kept (measured, reverted): system_server without class preload (s5), idle vsync throttling
 (s10: vsync callbacks are cheap), the BPF loader beside the boot (s14: init shorter, boot not),
