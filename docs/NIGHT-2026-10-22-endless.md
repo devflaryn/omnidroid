@@ -232,6 +232,21 @@ staged no root for (they exited at once).
 
 **-140 ms of init (3/3)**; warm ready within noise.
 
+## s13 -- /linkerconfig made once per image (KEPT)
+
+Both of init's `perform_apex_config` ran the same `linkerconfig --target /linkerconfig` (~200 ms
+each, critical path) though its inputs are fixed by the image here, and a saved device keeps the
+output. It is now made once and stamped (`/linkerconfig/.omni-key`: the manifest, what the device
+leaves out, the APEX list, the device's own files); a matching stamp skips it.
+`OMNI_LINKERCONFIG_KEEP=0` runs it every time.
+
+| | linkerconfig | init's boot commands | warm ready |
+|---|---|---|---|
+| every time (A1-A3) | 249+217 / 284+200 / 262+211 ms | 1935 / 1961 / 1942 ms | 12.2 / 12.2 / 12.1 s |
+| once (B1-B3) | kept / kept / kept | 1537 / 1532 / 1555 ms | 11.8 / 12.7 / 11.9 s |
+
+**-410 ms of init (3/3)**; warm ready 2 of 3 pairs sooner (B2 an outlier).
+
 ## Found, not acted on (yet)
 
 - System host idle: ~2-7% of a core; `StorageManagerService` asks for `storaged` (left out) once a

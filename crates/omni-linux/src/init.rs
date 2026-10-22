@@ -152,6 +152,39 @@ pub(crate) fn uid_of(user: &str) -> u32 {
     }
 }
 
+/// **`/linkerconfig` made once per image** (`OMNI_LINKERCONFIG_KEEP=0`: at both of init's
+/// `perform_apex_config`s, as before). `linkerconfig` is a pure function of the image here -- the
+/// APEXes are the sysroot's, flattened, and `apex-info-list.xml` is the host's -- yet init ran it
+/// twice a boot into the same directory, ~200 ms each on the critical path (2026-10-22), and a saved
+/// device already holds its output. What it was made from is kept beside it (`.omni-key`): the
+/// sysroot's manifest, what the device leaves out, the APEX list and the device's own files.
+fn linkerconfig_kept() -> bool {
+    std::env::var("OMNI_LINKERCONFIG_KEEP").as_deref() != Ok("0")
+}
+
+/// What `/linkerconfig` is made from (`linkerconfig_kept`): once per host process.
+fn linkerconfig_key(sysroot_dir: &std::path::Path) -> String {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(std::fs::read(sysroot_dir.join("sysroot.manifest")).unwrap_or_default());
+        for gone in crate::device::left_out() {
+            h.update(gone.as_bytes());
+            h.update(b"\0");
+        }
+        if let Ok(sysroot) = Sysroot::open(sysroot_dir) {
+            h.update(crate::apex::apex_info_list(&sysroot));
+        }
+        for (path, bytes) in crate::device::FILES {
+            h.update(path.as_bytes());
+            h.update(Sha256::digest(bytes));
+        }
+        format!("{:x}", h.finalize())
+    })
+    .clone()
+}
+
 /// The boot phases init triggers unconditionally, in order: a `start` in their `on` blocks runs.
 /// late-init's order: `load_bpf_programs` between post-fs-data and zygote-start (the BPF loader
 /// before netd), `firmware_mounts_complete` after zygote-start.
@@ -522,7 +555,22 @@ impl Init {
                     if !bootstrap {
                         self.create_apex_data_dirs();
                     }
+                    // The configuration this image already has (`linkerconfig_key`): not made again.
+                    let stamp = crate::vfs::host_path(&self.instance, b"linkerconfig/.omni-key");
+                    let made = crate::vfs::host_path(&self.instance, b"linkerconfig/ld.config.txt").is_some_and(|p| p.exists());
+                    let key = linkerconfig_key(&self.sysroot);
+                    if linkerconfig_kept() && made && stamp.as_ref().is_some_and(|p| std::fs::read_to_string(p).ok().as_deref() == Some(key.as_str())) {
+                        if std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
+                            eprintln!("[init] perform_apex_config{}: linkerconfig kept (made for this image)", if *bootstrap { " --bootstrap" } else { "" });
+                        }
+                        continue;
+                    }
                     let status = self.exec(&["/apex/com.android.runtime/bin/linkerconfig", "--target", "/linkerconfig"], 0);
+                    if matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) {
+                        if let Some(stamp) = &stamp {
+                            let _ = std::fs::write(stamp, &key);
+                        }
+                    }
                     let ms = t.elapsed().as_millis();
                     if !matches!(status, Some(Some(crate::process::ExitStatus::Exited(0)))) || ms >= 50 || std::env::var("OMNI_INIT_TRACE").as_deref() == Ok("1") {
                         eprintln!("[init] perform_apex_config{}: linkerconfig {status:?} in {ms} ms", if *bootstrap { " --bootstrap" } else { "" });
