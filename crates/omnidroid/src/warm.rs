@@ -54,12 +54,13 @@ fn plant(package: &str, store: &str) -> String {
     )
 }
 
-/// A cookie store holding `cookie` (a file), made on the host by `tools/plant_cookie.py --new` --
-/// started here, waited for with [`store_made`] (it runs while the APK installs).
-fn make_store(repo: &Path, at: &Path, cookie: &Path) -> Result<std::process::Child, String> {
-    let python = if cfg!(windows) { "python" } else { "python3" };
-    Command::new(python)
-        .arg(repo.join("tools/plant_cookie.py"))
+/// A cookie store holding `cookie` (a file), made on the host by `omni-plant-cookie --new` (else
+/// `tools/plant_cookie.py --new`: `omni_linux::install::plant_cookie`) -- started here, waited for
+/// with [`store_made`] (it runs while the APK installs).
+fn make_store(at: &Path, cookie: &Path) -> Result<std::process::Child, String> {
+    let mut plant = omni_linux::install::plant_cookie();
+    let program = plant.get_program().to_string_lossy().into_owned();
+    plant
         .arg("--new")
         .arg(at)
         .arg(cookie)
@@ -67,7 +68,7 @@ fn make_store(repo: &Path, at: &Path, cookie: &Path) -> Result<std::process::Chi
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{python}: {e}"))
+        .map_err(|e| format!("{program}: {e}"))
 }
 
 /// `make_store`'s end.
@@ -82,7 +83,7 @@ fn store_made(child: std::process::Child) -> Result<(), String> {
 
 /// The session on `dev`: install, plant, start, open the link; then until `minutes` have passed,
 /// the app is stopped or the device is gone.
-pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Path>, app_session: &AppSession, minutes: u64) -> ExitCode {
+pub fn session(dev: &device::Device, apk: &Path, cookie: Option<&Path>, app_session: &AppSession, minutes: u64) -> ExitCode {
     let link_id = app_session.link_id.as_deref().filter(|_| app_session.link.is_some());
     let t = Instant::now();
     let say = |what: &str| println!("[warm] +{:.1}s {what}", t.elapsed().as_secs_f64());
@@ -95,7 +96,7 @@ pub fn session(dev: &device::Device, repo: &Path, apk: &Path, cookie: Option<&Pa
         Some(cookie) => match device::hand_over_path(dev, &format!("cookies-{}.db", std::process::id())).and_then(|(host, guest)| {
             let _ = std::fs::remove_file(&host);
             _store_file = Some(RemovedOnDrop(host.clone()));
-            make_store(repo, &host, cookie).map(|child| (child, guest))
+            make_store(&host, cookie).map(|child| (child, guest))
         }) {
             Ok(store) => Some(store),
             Err(e) => {

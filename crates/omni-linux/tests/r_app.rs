@@ -264,9 +264,10 @@ fn golden_dir_rooted(root: &Path, apk: &Path, cookie: Option<&Path>, kiosk: bool
     root.join(name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect::<String>())
 }
 
-/// The repository this test was built from.
+/// The repository this test was built from -- or, prebuilt and run from an install
+/// (`omni_linux::install`: `omnidroid aosp` there runs this gate as `omni-r-app`), the install.
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).parent().and_then(Path::parent).expect("crates/omni-linux has two ancestors").to_path_buf()
+    omni_linux::install::repo_root()
 }
 
 /// The rooted device `OMNI_R_ROOT` / `OMNI_R_MODULES` / `OMNI_R_SU` ask for, if any. Missing Magisk
@@ -483,16 +484,14 @@ fn the_apk_is_installed_started_and_draws() {
         std::fs::create_dir_all(&tmp).expect("/data/local/tmp");
         std::fs::copy(&apk, tmp.join("app.apk")).expect("the APK");
         if plant_first {
-            // The app's cookie store, made as its WebView makes it, holding the account's cookie.
-            let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
-            let python = if cfg!(windows) { "python" } else { "python3" };
-            let made = std::process::Command::new(python)
-                .arg(&tool)
+            // The app's cookie store, made as its WebView makes it, holding the account's cookie
+            // (`omni-plant-cookie`, else `tools/plant_cookie.py`: `omni_linux::install::plant_cookie`).
+            let made = omni_linux::install::plant_cookie()
                 .arg("--new")
                 .arg(tmp.join("cookies.db"))
                 .arg(cookie.as_deref().expect("a cookie file"))
                 .output()
-                .expect("python, for tools/plant_cookie.py");
+                .expect("omni-plant-cookie, or python for tools/plant_cookie.py");
             assert!(made.status.success(), "the cookie store: {}", String::from_utf8_lossy(&made.stderr).trim());
             eprintln!("[r] cookie store made, to be planted before the first start");
         }
@@ -553,15 +552,14 @@ fn the_apk_is_installed_started_and_draws() {
         if line.contains("[r] cookie-stop") {
             if let Some(file) = &cookie {
                 std::thread::sleep(Duration::from_secs(3));
-                let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/plant_cookie.py");
-                // Windows installs `python`; macOS and most Linux hosts have no `python`, only
-                // `python3` (Ubuntu ships no `python` at all; MEASURED on the M1). On Windows,
-                // `python3` can be the Store's stub, so prefer `python` there.
-                let python = if cfg!(windows) { "python" } else { "python3" };
-                let planted = std::process::Command::new(python).arg(&tool).arg(&store).arg(file).output();
+                // `omni-plant-cookie`, else `tools/plant_cookie.py` under Python
+                // (`omni_linux::install::plant_cookie` says which, and which Python).
+                let mut plant = omni_linux::install::plant_cookie();
+                let program = plant.get_program().to_string_lossy().into_owned();
+                let planted = plant.arg(&store).arg(file).output();
                 let said = match &planted {
                     Ok(o) => format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => format!("python: {e}"),
+                    Err(e) => format!("{program}: {e}"),
                 };
                 eprintln!("[r] {}", said.trim());
                 let ok = planted.is_ok_and(|o| o.status.success());

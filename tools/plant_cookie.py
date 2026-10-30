@@ -10,7 +10,8 @@ Netscape `cookies.txt`. The value is never printed. The app must not be running 
 the database is changed in place, without a journal file, so the files the app owns stay the app's.
 `--new` makes the database first, as the device's WebView makes it (its schema, version 21) -- a
 store put into an app's data before its first start, which then starts signed in.
-Stdlib only.
+Stdlib only. Ported to Rust as `omni-plant-cookie` (crates/omni-cookie), which an install runs where
+there is no Python: the two are kept in step.
 """
 import sqlite3
 import sys

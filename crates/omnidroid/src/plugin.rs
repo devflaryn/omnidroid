@@ -20,6 +20,12 @@
 //!   shown as it is, and a hook that fails stops the session.
 //! * **`commands`**: commands of its own (`omnidroid login`), run with the arguments after them.
 //!
+//! **An install's own plugins.** Run from an install (`omni_linux::install`: the prebuilt bundle the
+//! desktop app ships, with no checkout to `plugins add --link` from), the plugins in its `plugins/`
+//! come with it and are on without being added -- after this user's own, which win by name (a
+//! plugin added with the same name replaces the install's). `plugins disable <name>` turns one off
+//! as it does an added one; `plugins remove` cannot take it away (it is the install's).
+//!
 //! Every program a plugin runs gets `OMNI_PLUGIN_NAME`, `OMNI_PLUGIN_DIR`, `OMNI_REPO`,
 //! `OMNI_COMMAND` and `OMNI_APP_DATA_DIR`, and a session's hooks also `OMNI_FRESH` (`1`/`0`),
 //! `OMNI_GIVEN_DATA_DIR` (`--data-dir`), `OMNI_APK` and `OMNI_APK_PACKAGE`, and `session-end`'s
@@ -308,6 +314,8 @@ pub struct Entry {
     pub name: String,
     pub dir: PathBuf,
     pub linked: bool,
+    /// One of the install's own (`<install>/plugins/<name>`), not added by this user.
+    pub bundled: bool,
     pub enabled: bool,
     pub plugin: Result<Plugin, String>,
 }
@@ -358,15 +366,34 @@ impl Registry {
                         Err(format!("installed as `{name}`, but its manifest names `{}`", p.name))
                     }
                 });
-                entries.push(Entry { enabled: !disabled.contains(&name), name, dir: plugin_dir, linked, plugin });
+                entries.push(Entry { enabled: !disabled.contains(&name), name, dir: plugin_dir, linked, bundled: false, plugin });
             }
         }
         Registry { dir: dir.map(Path::to_path_buf), entries }
     }
 
-    /// This user's plugins.
+    /// This user's plugins -- and, run from an install, the install's own (`<install>/plugins`)
+    /// that this user has none of the same name for, switched off by this user's `disabled.txt`.
     pub fn installed() -> Self {
-        Self::discover(user_dir().as_deref())
+        let mut registry = Self::discover(user_dir().as_deref());
+        if let Some(home) = omni_linux::install::home() {
+            registry.add_bundled(&home.join("plugins"));
+        }
+        registry
+    }
+
+    /// The plugins in `dir` (an install's) as [`Entry::bundled`] ones, after this registry's own:
+    /// each whose name this registry has not, on unless its own `disabled.txt` names it.
+    fn add_bundled(&mut self, dir: &Path) {
+        let disabled = self.dir.as_deref().map(disabled_names).unwrap_or_default();
+        for mut entry in Self::discover(Some(dir)).entries {
+            if self.entries.iter().any(|e| e.name == entry.name) {
+                continue;
+            }
+            entry.bundled = true;
+            entry.enabled = !disabled.contains(&entry.name);
+            self.entries.push(entry);
+        }
     }
 
     /// The plugins that are on, checked against each other: a broken one, or two that take the same
@@ -641,7 +668,7 @@ pub fn add(registry: &Registry, from: &Path, link: bool) -> Result<String, Strin
     let dir = registry.dir.as_deref().ok_or("this host names no plugin directory; set OMNI_PLUGINS")?;
     let from = std::fs::canonicalize(from).map_err(|e| format!("{}: {e}", from.display()))?;
     let plugin = Plugin::load(&from)?;
-    if registry.entries.iter().any(|e| e.name == plugin.name) {
+    if registry.entries.iter().any(|e| e.name == plugin.name && !e.bundled) {
         return Err(format!("a plugin named `{}` is installed already (omnidroid plugins remove {} first)", plugin.name, plugin.name));
     }
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -665,6 +692,9 @@ pub fn add(registry: &Registry, from: &Path, link: bool) -> Result<String, Strin
 /// `omnidroid plugins remove <name>`: a copy is deleted, a link forgotten (its directory stays).
 pub fn remove(registry: &Registry, name: &str) -> Result<String, String> {
     let entry = registry.entries.iter().find(|e| e.name == name).ok_or_else(|| format!("no plugin `{name}` is installed"))?;
+    if entry.bundled {
+        return Err(format!("`{name}` comes with this install ({}): `plugins disable {name}` turns it off", entry.dir.display()));
+    }
     let dir = registry.dir.as_deref().ok_or("no plugin directory")?;
     if entry.linked {
         let file = dir.join(format!("{name}.{LINK}"));
@@ -851,6 +881,30 @@ mod tests {
         remove(&Registry::discover(Some(&installed)), "demo").unwrap();
         assert!(Registry::discover(Some(&installed)).entries.is_empty());
         scaffold("mine", &root.join("mine")).expect("a new plugin loads");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An install's own plugins come after this user's: one of the same name is the user's, the
+    /// rest are on unless the user's `disabled.txt` names them, and none can be removed.
+    #[test]
+    fn an_install_s_plugins_are_on_unless_the_user_s_own_or_switched_off() {
+        let root = std::env::temp_dir().join(format!("omnidroid-bundled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (user, bundle) = (root.join("user"), root.join("bundle"));
+        for (dir, name) in [(user.join("demo"), "demo"), (bundle.join("demo"), "demo"), (bundle.join("other"), "other")] {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(MANIFEST), format!(r#"{{"name": "{name}"}}"#)).unwrap();
+        }
+        let mut registry = Registry::discover(Some(&user));
+        registry.add_bundled(&bundle);
+        let seen: Vec<_> = registry.entries.iter().map(|e| (e.name.as_str(), e.bundled, e.enabled)).collect();
+        assert_eq!(seen, [("demo", false, true), ("other", true, true)]);
+        assert_eq!(registry.entries[0].dir, user.join("demo"), "the user's own wins by name");
+        assert!(remove(&registry, "other").unwrap_err().contains("plugins disable other"));
+        set_enabled(&registry, "other", false).unwrap();
+        let mut registry = Registry::discover(Some(&user));
+        registry.add_bundled(&bundle);
+        assert_eq!(registry.active().unwrap().iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["demo"]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

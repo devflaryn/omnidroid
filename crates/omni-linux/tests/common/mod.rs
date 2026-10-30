@@ -18,10 +18,11 @@ pub fn sysroot() -> Option<PathBuf> {
 }
 
 /// The pinned sysroot, for a device session (`r_app`'s, the pool's): its shifted files in the
-/// temp's cache, with every other session's.
+/// temp's cache, with every other session's. `OMNI_SYSROOT`, else an install's
+/// (`omni_linux::install`: this gate prebuilt and run from one), else the checkout's.
 pub fn device_sysroot() -> Option<PathBuf> {
     let dir = std::env::var_os("OMNI_SYSROOT").map_or_else(
-        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35"),
+        || omni_linux::install::home().map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sysroot/aosp-35"), |h| h.join(omni_linux::install::SYSROOT)),
         PathBuf::from,
     );
     dir.join("sysroot.manifest").exists().then_some(dir)

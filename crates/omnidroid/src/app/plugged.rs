@@ -16,7 +16,7 @@
 //!
 //! The device's language (`OMNI_R_LOCALE`) is not applied: a pool device has booted already.
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -109,15 +109,16 @@ fn cookie_store(cookie: &Path) -> Result<TempFile, String> {
     let at: PathBuf = std::env::temp_dir().join(format!("omni-pool-cookies-{}-{}.db", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let _ = std::fs::remove_file(&at);
     let store = TempFile::new(at);
-    let python = if cfg!(windows) { "python" } else { "python3" };
-    let out = Command::new(python)
-        .arg(crate::repo_root().join("tools/plant_cookie.py"))
+    // `omni-plant-cookie` beside this launcher (an install's), else `tools/plant_cookie.py`.
+    let mut plant = omni_linux::install::plant_cookie();
+    let program = plant.get_program().to_string_lossy().into_owned();
+    let out = plant
         .arg("--new")
         .arg(store.path())
         .arg(cookie)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("the cookie store: {python}: {e}"))?;
+        .map_err(|e| format!("the cookie store: {program}: {e}"))?;
     if !out.status.success() {
         return Err(format!("the cookie store: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim()));
     }
