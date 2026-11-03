@@ -67,6 +67,15 @@ def one(found, name):
 
 def build(jobs):
     """Every program the bundle holds, built in release: {name in the bundle: built path}."""
+    # Compiled code records where it was built, home folder and all, and this bundle is public.
+    home = os.path.expanduser("~")
+    flags = [f"--remap-path-prefix={home}=" + ("C:\build" if os.name == "nt" else "/build")]
+    if os.name == "nt":
+        flags += ["-C", "link-arg=/PDBALTPATH:%_PDB%"]
+    else:
+        for var in ("CFLAGS", "CXXFLAGS"):
+            os.environ[var] = f"{os.environ.get(var, '')} -ffile-prefix-map={home}=/build".strip()
+    os.environ["RUSTFLAGS"] = " ".join([os.environ.get("RUSTFLAGS", "")] + flags).strip()
     j = ["-j", str(jobs)] if jobs else []
     args = ["build", "--release"] + j
     for package, binary in BINARIES:
