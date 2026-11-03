@@ -251,6 +251,16 @@ def main():
             f.write(bundled_manifest(name, text, program))
         say(f"plugins/{name}: {program} and its manifest")
     copy_sysroot(a.sysroot, os.path.join(out, SYSROOT))
+    # Some programs compile in the folder they were built from, so build a release from a checkout
+    # outside the home folder (C:\od-src, /tmp/omni-src), and refuse anything that names it.
+    home = os.path.expanduser("~").encode()
+    for root, dirs, files in os.walk(out):
+        dirs[:] = [d for d in dirs if d != "sysroot"]
+        for name in files:
+            with open(os.path.join(root, name), "rb") as f:
+                data = f.read()
+            if home in data or home.replace(b"\\", b"/") in data:
+                sys.exit(f"make_bundle: {name} contains the home folder; build from a checkout outside it")
     info = {"version": git_version(), "built": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"), "platform": platform_name()}
     with open(os.path.join(out, "BUNDLE.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(info, f, indent=2)
