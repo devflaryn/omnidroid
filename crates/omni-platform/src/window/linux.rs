@@ -136,6 +136,16 @@ const XA_STRING: xlib::Atom = 31;
 const XA_CARDINAL: xlib::Atom = 6;
 /// `XA_WM_NAME`.
 const XA_WM_NAME: xlib::Atom = 39;
+/// The app's icon as `_NET_WM_ICON` holds it: width, height and ARGB pixels, repeated for each size.
+/// Format-32 property data is an array of `long`, whatever the width of `long`, so the file's
+/// 32-bit values are widened here.
+fn icon_property() -> Vec<c_long> {
+    include_bytes!("../../icon/omnidroid.x11")
+        .chunks_exact(4)
+        .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]) as c_long)
+        .collect()
+}
+
 /// `XA_WM_CLASS`.
 const XA_WM_CLASS: xlib::Atom = 67;
 /// `QueuedAfterFlush`, `X11/Xlib.h`.
@@ -218,6 +228,7 @@ struct Atoms {
     wm_state: xlib::Atom,
     net_wm_name: xlib::Atom,
     net_wm_pid: xlib::Atom,
+    net_wm_icon: xlib::Atom,
     net_active_window: xlib::Atom,
     utf8_string: xlib::Atom,
     /// `WM_S<screen>`, whose owner is the window manager (ICCCM 2.8).
@@ -497,6 +508,7 @@ impl Window {
             wm_state: intern("WM_STATE"),
             net_wm_name: intern("_NET_WM_NAME"),
             net_wm_pid: intern("_NET_WM_PID"),
+            net_wm_icon: intern("_NET_WM_ICON"),
             net_active_window: intern("_NET_ACTIVE_WINDOW"),
             utf8_string: intern("UTF8_STRING"),
             wm_selection: intern(&format!("WM_S{screen}")),
@@ -703,6 +715,7 @@ impl Window {
             let class = b"omnidroid\0Omnidroid\0";
             let pid = [c_long::from(std::process::id() as i32)];
             let mut protocols = [atoms.wm_delete_window];
+            let icon = icon_property();
             // SAFETY: a zeroed `XWMHints` is valid; only the flagged fields are read.
             let mut hints: xlib::XWMHints = unsafe { core::mem::zeroed() };
             hints.flags = xlib::InputHint | xlib::StateHint;
@@ -742,6 +755,16 @@ impl Window {
                     xlib::PropModeReplace,
                     pid.as_ptr().cast(),
                     1,
+                );
+                (xl.XChangeProperty)(
+                    display,
+                    window,
+                    atoms.net_wm_icon,
+                    XA_CARDINAL,
+                    32,
+                    xlib::PropModeReplace,
+                    icon.as_ptr().cast(),
+                    icon.len() as c_int,
                 );
                 (xl.XSetWMProtocols)(display, window, protocols.as_mut_ptr(), 1);
                 (xl.XSetWMHints)(display, window, &raw mut hints);
