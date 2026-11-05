@@ -290,6 +290,10 @@ fn main() -> ExitCode {
     if command.as_deref() == Some("plugins") {
         return plugins_command(&rest);
     }
+    // The built-in plugin `close-prompt`'s `window-close` hook.
+    if command.as_deref() == Some("close-prompt") {
+        return close_prompt();
+    }
     // For the pool running on this computer, as typed at a window's prompt (`app::host::one_shot`).
     if let Some(word @ ("restart" | "autorestart")) = command.as_deref() {
         if let Some(refusal) = one_shot_refusal(word, &rest) {
@@ -374,7 +378,13 @@ fn plugins_lines(args: &[String]) -> Result<Vec<String>, String> {
             }
             for entry in &registry.entries {
                 let state = if entry.enabled { "on" } else { "off" };
-                let from = if entry.linked { format!("linked to {}", entry.dir.display()) } else { entry.dir.display().to_string() };
+                let from = if entry.builtin {
+                    "comes with omnidroid".to_string()
+                } else if entry.linked {
+                    format!("linked to {}", entry.dir.display())
+                } else {
+                    entry.dir.display().to_string()
+                };
                 lines.push(match &entry.plugin {
                     Ok(p) => format!("{}\t{}\t{state}\t{}\t{from}", p.name, p.version, p.description),
                     Err(error) => format!("{}\t?\t{state}\tBROKEN: {error}\t{from}", entry.name),
@@ -392,6 +402,22 @@ fn plugins_lines(args: &[String]) -> Result<Vec<String>, String> {
         _ => return Err("plugins [list | add [--link] <dir> | remove <name> | enable <name> | disable <name> | new <name> [<dir>]]".into()),
     };
     done.map(|m| if m.is_empty() { Vec::new() } else { m.lines().map(str::to_string).collect() })
+}
+
+/// `omnidroid close-prompt`: ask the person what becomes of an instance whose window they closed,
+/// and answer as a `window-close` hook does. Fails when no dialog could be shown.
+fn close_prompt() -> ExitCode {
+    let var = |key: &str| std::env::var(key).unwrap_or_default();
+    let text = plugin::close_prompt_text(&var("OMNI_INSTANCE_ID"), &var("OMNI_APK_PACKAGE"));
+    match omni_platform::dialog::ask("Omnidroid", &text, "Shut down", "Keep running") {
+        Some(true) => println!("close"),
+        Some(false) => println!("headless"),
+        None => {
+            eprintln!("no dialog could be shown");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn plugins_command(args: &[String]) -> ExitCode {

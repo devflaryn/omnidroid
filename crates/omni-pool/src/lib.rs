@@ -19,4 +19,4 @@ pub mod pool;
 pub use config::Config;
 pub use extras::{Extras, Remake};
 pub use plan::DeviceId;
-pub use pool::{DeviceInfo, DeviceState, InstanceId, InstanceInfo, InstanceState, Pool, RESTART_DELAY};
+pub use pool::{CloseAsk, DeviceInfo, DeviceState, InstanceId, InstanceInfo, InstanceState, Pool, WindowClosed, RESTART_DELAY};

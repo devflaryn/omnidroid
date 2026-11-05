@@ -87,7 +87,7 @@ fn instance_state(i: &InstanceInfo) -> (String, Color) {
         InstanceState::Restarting => (restart_text(i.restart_in), Color::Yellow),
         InstanceState::Ended(why) => return (format!("ended: {why}"), Color::DarkGray),
     };
-    let tags: Vec<String> = i.auto_restart.then(|| "auto".to_string()).into_iter().chain((i.restarts > 0).then(|| format!("{} restart{}", i.restarts, if i.restarts == 1 { "" } else { "s" }))).collect();
+    let tags: Vec<String> = i.headless.then(|| "headless".to_string()).into_iter().chain(i.auto_restart.then(|| "auto".to_string())).chain((i.restarts > 0).then(|| format!("{} restart{}", i.restarts, if i.restarts == 1 { "" } else { "s" }))).collect();
     if tags.is_empty() {
         (state, color)
     } else {
@@ -413,6 +413,7 @@ mod tests {
             auto_restart: true,
             restarts: 1,
             restart_in: Some(Duration::from_millis(2300)),
+            headless: false,
         };
         assert_eq!(instance_state(&i).0, "restarting in 3 s (auto, 1 restart)");
         let done = InstanceInfo { restart_in: Some(Duration::ZERO), ..i.clone() };

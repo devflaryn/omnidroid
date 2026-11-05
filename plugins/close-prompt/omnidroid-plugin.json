@@ -1,0 +1,8 @@
+{
+  "name": "close-prompt",
+  "version": "1.0.0",
+  "description": "Closing an instance's window asks: shut it down, or keep it running headless",
+  "hooks": {
+    "window-close": ["${OMNIDROID}", "close-prompt"]
+  }
+}

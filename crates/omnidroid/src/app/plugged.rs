@@ -49,6 +49,19 @@ pub fn take_package(options: &mut Vec<String>) -> Result<Option<String>, String>
     Ok(Some(name))
 }
 
+/// What becomes of instance `id`, whose window the person closed: what the plugins that are on say
+/// (`close-prompt`, built in, asks the person), read anew each time so switching one takes effect at
+/// once. A broken plugin is no reason to lose the answer of another.
+///
+/// # Errors
+/// A hook's failure: said by the caller, and the instance closes -- nothing is left running unseen
+/// because a question could not be asked.
+pub fn window_close(id: u32, package: &str, apk: &Path) -> Result<omni_pool::WindowClosed, String> {
+    let registry = plugin::Registry::installed();
+    let plugins: Vec<&plugin::Plugin> = registry.entries.iter().filter(|e| e.enabled).filter_map(|e| e.plugin.as_ref().ok()).collect();
+    Ok(plugin::window_close(&plugins, id, package, apk, &crate::plugin_base())?.unwrap_or(omni_pool::WindowClosed::Close))
+}
+
 /// Launch `count` instances of `apk` (an APK or a bundle of APKs) with `options`: the launcher's
 /// `--package`, and the installed plugins' options ([`extras`]).
 ///

@@ -117,7 +117,23 @@ pub struct InstanceInfo {
     pub restarts: u32,
     /// While [`InstanceState::Restarting`]: how long until its app starts again.
     pub restart_in: Option<Duration>,
+    /// Its window was closed and the person chose to keep it running: no window, its display and
+    /// app going on ([`WindowClosed::KeepHeadless`]).
+    pub headless: bool,
 }
+
+/// What the person wants of an instance whose window they closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowClosed {
+    /// Close the instance, as [`Pool::close`] does.
+    Close,
+    /// Keep its app running with no window, until something closes it.
+    KeepHeadless,
+}
+
+/// Who answers for a window the person closed ([`Pool::set_close_ask`]): told the instance, its
+/// package and its APK. It may take as long as the person does, on a thread of its own.
+pub type CloseAsk = Arc<dyn Fn(InstanceId, &str, &Path) -> WindowClosed + Send + Sync>;
 
 struct DeviceRec {
     dir: PathBuf,
@@ -247,6 +263,11 @@ struct InstanceRec {
     /// The pids of its app's main process the device's log named since its start (`[zygote]
     /// launching <package> as pid <P> uid <U>`, U its user's), for [`Pool::follow_logs`].
     pids: Vec<u32>,
+    /// Its window was closed and [`CloseAsk`] has not answered yet.
+    asking: bool,
+    /// Its window was closed and it runs on without one ([`WindowClosed::KeepHeadless`]). A card
+    /// could never be closed: an end of its app removes its display.
+    headless: bool,
 }
 
 impl InstanceRec {
@@ -275,6 +296,8 @@ impl InstanceRec {
             closed: false,
             halting: 0,
             pids: Vec::new(),
+            asking: false,
+            headless: false,
         }
     }
 
@@ -730,6 +753,8 @@ pub struct Pool {
     link_turns: Mutex<std::collections::BTreeSet<(DeviceId, String)>>,
     /// Where the ticker is in each ready device's log ([`Pool::follow_logs`]).
     tails: Mutex<BTreeMap<DeviceId, omni_warm::LogTail>>,
+    /// Who answers for a window the person closed; none: its instance closes.
+    close_ask: Mutex<Option<CloseAsk>>,
 }
 
 /// An instance's turn at its link on its device ([`Pool::follow_link`]), given back when dropped.
@@ -786,6 +811,7 @@ impl Pool {
             stopping: std::sync::atomic::AtomicBool::new(false),
             link_turns: Mutex::default(),
             tails: Mutex::default(),
+            close_ask: Mutex::new(None),
         }
     }
 
@@ -903,6 +929,7 @@ impl Pool {
                     details: i.details.clone(),
                     auto_restart: i.auto_restart.unwrap_or(auto_restart),
                     restarts: i.restarts,
+                    headless: i.headless,
                     restart_in: i.countdown.filter(|_| i.state == InstanceState::Restarting).map(|c| c.at.saturating_duration_since(Instant::now())),
                 }
             })
@@ -1171,6 +1198,10 @@ impl Pool {
         };
         if let Some(i) = self.state.lock().instances.get_mut(&id) {
             (i.hwc, i.display) = (Some(hwc), Some(display));
+            // A new display opens a new window; a restart on its kept one stays as it was.
+            if kept.is_none() {
+                i.headless = false;
+            }
         }
         // The launch's cookie store, handed over to the device for this user's app: the host's copy
         // removed once the start is done, whatever happens (the guest's goes with the plant).
@@ -1444,6 +1475,8 @@ impl Pool {
             Closed(Option<i64>),
             /// Ended: its card shown on its display.
             Card(Option<i64>, CardText),
+            /// Ended with no window to show a card in: its display (taken from its record) removed.
+            Headless(Option<i64>),
             /// Restarting: the countdown's, on its display.
             Restart(u64, Option<i64>),
         }
@@ -1480,7 +1513,11 @@ impl Pool {
                             Then::Restart(countdown, i.hwc.filter(|_| alive))
                         } else {
                             i.state = InstanceState::Ended(d.summary.clone());
-                            Then::Card(i.hwc.filter(|_| alive), card)
+                            if i.headless {
+                                Then::Headless(i.hwc.take())
+                            } else {
+                                Then::Card(i.hwc.filter(|_| alive), card)
+                            }
                         }
                     };
                     (then, halt)
@@ -1503,6 +1540,12 @@ impl Pool {
                 self.say(format!("#{id} ended: {}", d.summary));
                 if let Some(h) = hwc {
                     self.show(id, &dev, h, &card.with(None));
+                }
+            }
+            Then::Headless(hwc) => {
+                self.say(format!("#{id} ended: {} (it ran headless: no card, `list_instances` has the details)", d.summary));
+                if let Some(h) = hwc {
+                    remove_display(&dev, h);
                 }
             }
             Then::Restart(countdown, _) => {
@@ -1550,6 +1593,38 @@ impl Pool {
         }
         if let Some(i) = self.state.lock().instances.get_mut(&id) {
             i.halting = i.halting.saturating_sub(1);
+        }
+    }
+
+    /// Who answers when the person closes an instance's window. Unset: it closes.
+    pub fn set_close_ask(&self, ask: CloseAsk) {
+        *self.close_ask.lock() = Some(ask);
+    }
+
+    /// The answer for instance `id`, whose window the person closed. Kept running: its window's
+    /// marker goes, so the ticker does not take it for closed again. Not if it ended or was closed
+    /// while the person thought: that stands.
+    fn window_closed(self: &Arc<Self>, id: InstanceId, answer: WindowClosed) {
+        let kept = {
+            let mut s = self.state.lock();
+            let State { devices, instances, .. } = &mut *s;
+            let Some(i) = instances.get_mut(&id) else { return };
+            i.asking = false;
+            let live = !i.closed && !matches!(i.state, InstanceState::Closing | InstanceState::Ended(_));
+            match (answer, devices.get(&i.device).map(DeviceRec::device).zip(i.hwc)) {
+                (WindowClosed::KeepHeadless, Some((dev, h))) if live => {
+                    let _ = std::fs::remove_file(closed_marker(&dev, h));
+                    i.headless = true;
+                    true
+                }
+                (WindowClosed::KeepHeadless, _) => return,
+                (WindowClosed::Close, _) => false,
+            }
+        };
+        if kept {
+            self.say(format!("#{id}: kept running headless, with no window (`close {id}` or `stop_instance` ends it)"));
+        } else {
+            let _ = self.close(id);
         }
     }
 
@@ -2074,45 +2149,7 @@ impl Pool {
             }
         }
         self.mark_idle();
-        // Windows closed by the person: their instances close -- an ended one's, showing its card,
-        // has its display removed (taken from it here, so the next tick does not again); one on its
-        // way up or restarting on its window closes as a running one does. And an ended one's card
-        // clicked: restarted at once (a countdown's card is its countdown's to watch).
-        let (closed, cards, clicked) = {
-            let mut s = self.state.lock();
-            let State { devices, instances, .. } = &mut *s;
-            let (mut closed, mut cards, mut clicked) = (Vec::new(), Vec::new(), Vec::new());
-            for (id, i) in instances.iter_mut() {
-                let Some((dev, h)) = devices.get(&i.device).map(DeviceRec::device).zip(i.hwc) else { continue };
-                if closed_marker(&dev, h).exists() {
-                    match i.state {
-                        InstanceState::Closing => {}
-                        InstanceState::Ended(_) => {
-                            i.hwc = None;
-                            cards.push((*id, dev, h));
-                        }
-                        _ => closed.push(*id),
-                    }
-                } else if matches!(i.state, InstanceState::Ended(_)) && std::fs::remove_file(restart_marker(&dev, h)).is_ok() {
-                    clicked.push(*id);
-                }
-            }
-            (closed, cards, clicked)
-        };
-        for id in closed {
-            self.say(format!("#{id}: its window was closed"));
-            let _ = self.close(id);
-        }
-        for (id, _, _) in &cards {
-            self.say(format!("#{id}: its card's window was closed"));
-        }
-        remove_cards(cards.into_iter().map(|(_, dev, h)| (dev, h)).collect());
-        for id in clicked {
-            self.say(format!("#{id}: restart clicked on its card"));
-            if let Err(e) = self.restart(id, Duration::ZERO) {
-                self.say(format!("#{id}: {e}"));
-            }
-        }
+        self.follow_windows();
         // App processes the devices' logs say died: their instances ended at once.
         self.follow_logs();
         // Apps that ended on their own otherwise (every 5 s; each second where a window of one went
@@ -2147,6 +2184,65 @@ impl Pool {
             for _ in 0..plan::to_warm(&views, config.keep_warm, config.max_devices) {
                 let Some(id) = self.add_device(true) else { break };
                 self.say(format!("device D{id}: warming one, so the next launch starts at once"));
+            }
+        }
+    }
+
+    /// Windows closed by the person: their instances close, or [`CloseAsk`] says what becomes of them
+    /// -- an ended one's, showing its card, has its display removed (taken from it here, so the next
+    /// tick does not again); one on its way up or restarting on its window is asked about as a
+    /// running one is. And an ended one's card clicked: restarted at once (a countdown's card is its
+    /// countdown's to watch).
+    fn follow_windows(self: &Arc<Self>) {
+        let ask = self.close_ask.lock().clone();
+        let (closed, cards, clicked) = {
+            let mut s = self.state.lock();
+            let State { devices, instances, .. } = &mut *s;
+            let (mut closed, mut cards, mut clicked) = (Vec::new(), Vec::new(), Vec::new());
+            for (id, i) in instances.iter_mut() {
+                let Some((dev, h)) = devices.get(&i.device).map(DeviceRec::device).zip(i.hwc) else { continue };
+                if closed_marker(&dev, h).exists() {
+                    match i.state {
+                        InstanceState::Closing => {}
+                        InstanceState::Ended(_) => {
+                            i.hwc = None;
+                            cards.push((*id, dev, h));
+                        }
+                        _ if i.asking => {}
+                        _ => {
+                            i.asking = ask.is_some();
+                            closed.push((*id, i.apk.package.clone(), i.apk.bundle.clone().unwrap_or_else(|| i.apk.path.clone())));
+                        }
+                    }
+                } else if matches!(i.state, InstanceState::Ended(_)) && std::fs::remove_file(restart_marker(&dev, h)).is_ok() {
+                    clicked.push(*id);
+                }
+            }
+            (closed, cards, clicked)
+        };
+        for (id, package, apk) in closed {
+            self.say(format!("#{id}: its window was closed"));
+            let Some(ask) = ask.clone() else {
+                let _ = self.close(id);
+                continue;
+            };
+            let pool = Arc::clone(self);
+            let asked = std::thread::Builder::new().name(format!("omni-pool-ask-{id}")).spawn(move || {
+                let answer = ask(id, &package, &apk);
+                pool.window_closed(id, answer);
+            });
+            if asked.is_err() {
+                self.window_closed(id, WindowClosed::Close);
+            }
+        }
+        for (id, _, _) in &cards {
+            self.say(format!("#{id}: its card's window was closed"));
+        }
+        remove_cards(cards.into_iter().map(|(_, dev, h)| (dev, h)).collect());
+        for id in clicked {
+            self.say(format!("#{id}: restart clicked on its card"));
+            if let Err(e) = self.restart(id, Duration::ZERO) {
+                self.say(format!("#{id}: {e}"));
             }
         }
     }
@@ -2682,6 +2778,110 @@ mod tests {
         assert_eq!(read_lines(&segments, 30, 14), ["start proc", "[omnidroid: 0.0 MB of the log left out here]", "line 6", "fatal"]);
         assert!(read_lines(&[(root.join("none.log"), 0, 10)], 1000, 10).is_empty(), "a file not there gives nothing");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Closing a window asks; the answer decides, the instance runs meanwhile, and it is asked once.
+    #[test]
+    fn a_closed_window_asks_and_the_answer_decides() {
+        let dir = std::env::temp_dir().join(format!("omni-pool-ask-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = pool(&dir, 1);
+        let dev = p.device(1).unwrap();
+        std::fs::create_dir_all(dev.ctl()).unwrap();
+        let apk = Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), ..Default::default() });
+        let running = |hwc| InstanceRec { user: Some(10), hwc: Some(hwc), display: Some(3), state: InstanceState::Running, ..InstanceRec::new(1, Arc::clone(&apk), Extras::default()) };
+        {
+            let mut s = p.state.lock();
+            s.instances.insert(1, running(2));
+            s.instances.insert(2, running(5));
+        }
+        let (answers, asked) = (Arc::new(Mutex::new(vec![WindowClosed::KeepHeadless])), Arc::new(Mutex::new(Vec::new())));
+        let (a, b, gate) = (Arc::clone(&answers), Arc::clone(&asked), Arc::new(Mutex::new(())));
+        let hold = Arc::clone(&gate);
+        p.set_close_ask(Arc::new(move |id, package, _| {
+            b.lock().push((id, package.to_string()));
+            let _thinking = hold.lock();
+            a.lock().pop().unwrap_or(WindowClosed::Close)
+        }));
+        let settled = |p: &Arc<Pool>, id: InstanceId| {
+            let t = Instant::now();
+            while p.state.lock().instances[&id].asking && t.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // Asked once, however many ticks pass while the person thinks; it runs on meanwhile.
+        let thinking = gate.lock();
+        std::fs::write(closed_marker(&dev, 2), b"closed").unwrap();
+        p.follow_windows();
+        p.follow_windows();
+        let t = Instant::now();
+        while asked.lock().is_empty() && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(*asked.lock(), [(1, "com.a".to_string())], "told which instance, once");
+        assert_eq!(p.state.lock().instances[&1].state, InstanceState::Running, "running while asked");
+        // Kept: still running, no window's marker, and not asked again.
+        drop(thinking);
+        settled(&p, 1);
+        {
+            let s = p.state.lock();
+            let i = &s.instances[&1];
+            assert!(i.headless && i.state == InstanceState::Running && i.hwc == Some(2));
+        }
+        assert!(!closed_marker(&dev, 2).exists());
+        p.follow_windows();
+        assert_eq!(asked.lock().len(), 1);
+        let (_, listed) = p.snapshot();
+        assert!(listed[0].headless && !listed[1].headless, "the screen and the MCP server see it");
+        // The other answer closes it, as the window's close always did.
+        std::fs::write(closed_marker(&dev, 5), b"closed").unwrap();
+        p.follow_windows();
+        settled(&p, 2);
+        let t = Instant::now();
+        while !matches!(p.state.lock().instances[&2].state, InstanceState::Ended(_)) && t.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(p.state.lock().instances[&2].state, InstanceState::Closing | InstanceState::Ended(_)), "closed");
+        // An instance closed while the person thought stays closed: keeping it is no answer now.
+        p.state.lock().instances.get_mut(&1).unwrap().closed = true;
+        p.window_closed(1, WindowClosed::KeepHeadless);
+        // Nobody to ask: it closes at once.
+        let q = pool(&dir, 1);
+        let dev = q.device(1).unwrap();
+        std::fs::create_dir_all(dev.ctl()).unwrap();
+        q.state.lock().instances.insert(1, running(7));
+        std::fs::write(closed_marker(&dev, 7), b"closed").unwrap();
+        q.follow_windows();
+        assert!(!q.state.lock().instances[&1].asking);
+        assert_ne!(q.state.lock().instances[&1].state, InstanceState::Running, "closing");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A headless instance has no window to show a card in, nor to close one with: its app's end
+    /// removes its display, and nothing is left holding its device or the pool.
+    #[test]
+    fn a_headless_instance_that_ends_leaves_no_card_behind() {
+        let dir = std::env::temp_dir().join(format!("omni-pool-headless-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = pool(&dir, 1);
+        let apk = Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), ..Default::default() });
+        let rec = |headless| InstanceRec { user: Some(10), hwc: Some(2), display: Some(3), state: InstanceState::Running, auto_restart: Some(false), headless, ..InstanceRec::new(1, Arc::clone(&apk), Extras::default()) };
+        p.state.lock().instances.insert(1, rec(true));
+        p.ended_on_its_own(1, None);
+        {
+            let s = p.state.lock();
+            let i = &s.instances[&1];
+            assert!(matches!(i.state, InstanceState::Ended(_)), "{:?}", i.state);
+            assert_eq!(i.hwc, None, "its display taken away");
+        }
+        assert!(!p.shows_cards(), "no card that nothing could close");
+        // One with a window keeps its card, as ever.
+        p.state.lock().instances.insert(2, rec(false));
+        p.ended_on_its_own(2, None);
+        assert!(p.shows_cards(), "a window's card stays until the person closes it");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

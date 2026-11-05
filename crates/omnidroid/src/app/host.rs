@@ -535,6 +535,7 @@ fn instance_json(i: &InstanceInfo) -> Json {
         ("auto_restart", Json::Bool(i.auto_restart)),
         ("restarts", Json::Num(f64::from(i.restarts))),
         ("restart_in", i.restart_in.map_or(Json::Null, secs)),
+        ("headless", Json::Bool(i.headless)),
     ])
 }
 
@@ -604,6 +605,7 @@ fn instance_from(v: &Json) -> InstanceInfo {
         auto_restart: v.get("auto_restart").and_then(Json::as_bool).unwrap_or(false),
         restarts: num(v, "restarts").unwrap_or(0.0) as u32,
         restart_in: duration(v.get("restart_in")),
+        headless: v.get("headless").and_then(Json::as_bool).unwrap_or(false),
     }
 }
 
@@ -742,6 +744,16 @@ pub fn run(mode: Mode) -> ExitCode {
     for p in problems {
         pool.say(format!("settings: {p}"));
     }
+    // Who answers for a window the person closes: the plugins. Weak: the pool holds this.
+    let weak = Arc::downgrade(&pool);
+    pool.set_close_ask(Arc::new(move |id, package, apk| {
+        super::plugged::window_close(id, package, apk).unwrap_or_else(|e| {
+            if let Some(pool) = weak.upgrade() {
+                pool.say(format!("#{id}: {e}; it closes"));
+            }
+            omni_pool::WindowClosed::Close
+        })
+    }));
     let host = Host::new(Arc::clone(&pool));
     match mode {
         Mode::Serve(port) => host.mcp_start(port.unwrap_or(config.mcp_port)),
@@ -966,11 +978,12 @@ mod tests {
         let d = DeviceInfo { id: 2, dir: PathBuf::from("/x/omni-warm-1"), state: DeviceState::Gone("boot: no".into()), up_for: Duration::from_secs(5), idle_for: None, installed: [("a.b".to_string(), "ff".to_string())].into(), instances: 1 };
         let back = device_from(&json::parse(&device_json(&d).to_string()).unwrap());
         assert_eq!((back.id, back.state, back.installed, back.idle_for, back.dir), (2, d.state.clone(), d.installed.clone(), None, d.dir.clone()));
-        let i = InstanceInfo { id: 7, device: 2, package: "p".into(), sha256: "s".into(), apk: PathBuf::from("/a.apk"), user: Some(10), display: Some(3), screenshot: None, state: InstanceState::Ended("native crash: SIGSEGV".into()), up_for: Duration::from_millis(1500), details: vec!["SIGSEGV at 0x8".into(), String::new()], auto_restart: true, restarts: 2, restart_in: None };
+        let i = InstanceInfo { id: 7, device: 2, package: "p".into(), sha256: "s".into(), apk: PathBuf::from("/a.apk"), user: Some(10), display: Some(3), screenshot: None, state: InstanceState::Ended("native crash: SIGSEGV".into()), up_for: Duration::from_millis(1500), details: vec!["SIGSEGV at 0x8".into(), String::new()], auto_restart: true, restarts: 2, restart_in: None, headless: true };
         let back = instance_from(&json::parse(&instance_json(&i).to_string()).unwrap());
         assert_eq!((back.id, back.user, back.display, back.state, back.up_for), (7, Some(10), Some(3), i.state.clone(), Duration::from_millis(1500)));
         assert_eq!(back.details, i.details, "what happened, for every window");
         assert_eq!((back.auto_restart, back.restarts, back.restart_in), (true, 2, None));
+        assert!(back.headless, "a window sees an instance runs headless");
         let i = InstanceInfo { state: InstanceState::Restarting, restart_in: Some(Duration::from_secs(3)), ..i };
         let back = instance_from(&json::parse(&instance_json(&i).to_string()).unwrap());
         assert_eq!((back.state, back.restart_in), (InstanceState::Restarting, Some(Duration::from_secs(3))), "a restart's countdown");
