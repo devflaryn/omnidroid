@@ -233,6 +233,7 @@ fn one_shot_refusal(word: &str, rest: &[String]) -> Option<String> {
             Some(format!("autorestart {} <id>... | all (all: the pool's setting, for instances without their own; {BARE})", if on { "on" } else { "off" }))
         }
         Err(_) if word == "restart" && rest.is_empty() => Some(format!("restart <id>... | all ({BARE})")),
+        Err(_) if word == "show" && rest.is_empty() => Some(format!("show <id>... | all ({BARE})")),
         _ => None,
     }
 }
@@ -295,7 +296,7 @@ fn main() -> ExitCode {
         return close_prompt();
     }
     // For the pool running on this computer, as typed at a window's prompt (`app::host::one_shot`).
-    if let Some(word @ ("restart" | "autorestart")) = command.as_deref() {
+    if let Some(word @ ("restart" | "autorestart" | "show")) = command.as_deref() {
         if let Some(refusal) = one_shot_refusal(word, &rest) {
             eprintln!("omnidroid: {refusal}");
             return ExitCode::from(2);
@@ -1020,6 +1021,9 @@ mod tests {
         assert_eq!(one_shot_refusal("autorestart", &words(&["on", "3", "4"])), None);
         assert_eq!(one_shot_refusal("autorestart", &[]), None, "alone: the setting said");
         assert!(one_shot_refusal("restart", &[]).is_some_and(|r| r.contains("# as a comment")));
+        assert!(one_shot_refusal("show", &[]).is_some_and(|r| r.contains("# as a comment")));
+        assert_eq!(one_shot_refusal("show", &words(&["3"])), None);
+        assert_eq!(one_shot_refusal("show", &words(&["all"])), None);
         assert_eq!(one_shot_refusal("restart", &words(&["3"])), None);
         assert_eq!(one_shot_refusal("autorestart", &words(&["maybe"])), None, "the pool's own refusal says what is wrong");
     }

@@ -722,6 +722,17 @@ impl Window {
         self.inner.show();
     }
 
+    /// [`show`](Self::show), on the screen: a window that fits is moved fully onto it, and one too
+    /// big for it is maximised -- a window of the size a maximised one had is that again, its client
+    /// area unchanged, rather than running under the taskbar and off the screen's edge. Windows; as
+    /// `show` elsewhere.
+    pub fn show_on_screen(&self) {
+        #[cfg(windows)]
+        self.inner.show_on_screen();
+        #[cfg(not(windows))]
+        self.inner.show();
+    }
+
     /// Drain everything that has happened since the last call. **Never blocks.**
     ///
     /// Returns immediately with an empty iterator when nothing has happened, which is the common

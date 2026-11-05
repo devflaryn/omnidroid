@@ -78,7 +78,7 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLORONCOLOR, ClientToScreen, DIB_RGB_COLORS,
-    EndPaint, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MonitorFromWindow, PAINTSTRUCT,
+    EndPaint, GetMonitorInfoW, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
     SRCCOPY, ScreenToClient, SetStretchBltMode, StretchDIBits, UpdateWindow,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -100,7 +100,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
     RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SW_MINIMIZE,
-    SW_RESTORE, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetCursor, SetCursorPos,
+    SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetCursorPos,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage, WindowFromPoint, WM_CAPTURECHANGED, WM_CHAR,
     WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_INPUT, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
@@ -1096,6 +1096,41 @@ impl Window {
         // SAFETY: a live window handle and a command constant. The return value is the window's
         // *previous* visibility, not a success code, so there is nothing to check.
         unsafe { ShowWindow(self.hwnd, SW_SHOWNORMAL) };
+    }
+
+    /// See [`super::Window::show_on_screen`]. The client area decides, not the frame: `GetWindowRect`
+    /// counts invisible resize borders, which may hang off a screen's edge.
+    pub(super) fn show_on_screen(&self) {
+        let (mut frame, mut client) = (RECT { left: 0, top: 0, right: 0, bottom: 0 }, RECT { left: 0, top: 0, right: 0, bottom: 0 });
+        // SAFETY: a live window handle and an all-zero `MONITORINFO` with its size set; each call
+        // writes only the structure it is given.
+        let (known, work) = unsafe {
+            let mut monitor: MONITORINFO = core::mem::zeroed();
+            monitor.cbSize = size_of::<MONITORINFO>() as u32;
+            let known = GetWindowRect(self.hwnd, &raw mut frame) != 0
+                && GetClientRect(self.hwnd, &raw mut client) != 0
+                && GetMonitorInfoW(MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST), &raw mut monitor) != 0;
+            (known, monitor.rcWork)
+        };
+        if !known {
+            return self.show();
+        }
+        let (width, height) = (frame.right - frame.left, frame.bottom - frame.top);
+        let (work_width, work_height) = (work.right - work.left, work.bottom - work.top);
+        // Its title bar counts, a resize border below it does not.
+        let border = (width - client.right) / 2;
+        if client.right >= work_width || height - border >= work_height {
+            // SAFETY: a live window handle and a command constant.
+            unsafe { ShowWindow(self.hwnd, SW_SHOWMAXIMIZED) };
+            return;
+        }
+        let x = frame.left.min(work.right - width).max(work.left);
+        let y = frame.top.min(work.bottom - height).max(work.top);
+        if (x, y) != (frame.left, frame.top) {
+            // SAFETY: a live window handle and by-value coordinates; only its position changes.
+            unsafe { SetWindowPos(self.hwnd, core::ptr::null_mut(), x, y, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER) };
+        }
+        self.show();
     }
 
     /// Pump this window's messages and move everything the window procedure queued into `sink`.

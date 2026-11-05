@@ -61,6 +61,7 @@ Closing that window closes the instance.
 | `run <apk> [xN]` | launch N instances (1 to 64) of any APK; Tab completes the path, and a path typed alone runs it |
 | `run <apk> [xN] --<option> <value>...` | launch with a plugin's options (see [Plugins](#plugins)) |
 | `close <#id>... \| all` | close instances |
+| `show <#id>... \| all` | bring back the window of instances running headless (also `omnidroid show 3` from a shell) |
 | `warm` | boot one more Android now |
 | `kill <D#>... \| all` | stop Androids |
 | `shell <D#> <cmd>` | run a shell command on an Android, its output in the log |

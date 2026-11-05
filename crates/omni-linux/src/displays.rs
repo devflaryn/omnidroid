@@ -15,6 +15,7 @@
 //! | `display size <id> <w>x<h>` | its size now, as a window resized to it would make it |
 //! | `display card <id> <hex>` | -- (its window shows the card whose text is `<hex>`, [`crate::card::from_hex`], instead of its frames) |
 //! | `display show <id>` | -- (its window shows its frames again) |
+//! | `display window <id>` | `opened`, or `open` if it has one: a new window on a display whose window the person closed (the display went on without it) |
 //! | `display owners <id>` | a line `<pid> <uid>` per process whose buffers a layer of the display holds ([`Composer::owners`]: which app draws there) |
 //! | `display list` | a line `<id> <w>x<h> <android id>` per display beyond display 0 |
 //! | `apps` | a line `<pid> <uid> <process name>` per app process running ([`crate::zygote::apps`]) |
@@ -54,6 +55,11 @@ struct Extra {
     android: Arc<AtomicI32>,
     /// Set while the display shows a card: its window lets go of the app's keyboard and mouse.
     card: Arc<AtomicBool>,
+    framebuffer: Arc<crate::hal::framebuffer::Framebuffer>,
+    /// A window is on it, or waiting for its first frame: never two.
+    window: Arc<AtomicBool>,
+    /// What the app last asked Android for as its pointer, kept for its next window.
+    icon: Arc<AtomicI32>,
 }
 
 /// An extra display's screenshot: `<base stem>.d<id>.png` beside the device's `<base>`.
@@ -143,7 +149,8 @@ impl Displays {
     pub fn add(&self, w: u32, h: u32) -> Result<i64, String> {
         let (id, framebuffer) = self.composer.add_display(w, h)?;
         let (stop, android, card) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicI32::new(0)), Arc::new(AtomicBool::new(false)));
-        self.extra.lock().insert(id, Extra { stop: Arc::clone(&stop), android: Arc::clone(&android), card: Arc::clone(&card) });
+        let (window, icon) = (Arc::new(AtomicBool::new(self.windows)), crate::inject::new_icon());
+        let extra = Extra { stop: Arc::clone(&stop), android, card, framebuffer: Arc::clone(&framebuffer), window, icon };
         // A removed display's id is the next one's: what its window said, or was told, is not this
         // one's.
         if let Some(dir) = &self.closed_dir {
@@ -152,34 +159,9 @@ impl Displays {
             let _ = std::fs::remove_file(control_file(dir, id));
         }
         if self.windows {
-            let composer = Arc::clone(&self.composer);
-            let fb = Arc::clone(&framebuffer);
-            let options = Options {
-                title: "Omnidroid".into(),
-                control: self.closed_dir.as_deref().map(|d| control_file(d, id)),
-                input: self.input.is_some(),
-                display: id,
-                android_display: Some(Arc::clone(&android)),
-                shared_input: self.input.clone(),
-                stop: Some(Arc::clone(&stop)),
-                closed_marker: self.closed_dir.as_deref().map(|d| closed_marker(d, id)),
-                restart_marker: self.closed_dir.as_deref().map(|d| restart_marker(d, id)),
-                card: Some(card),
-            };
-            let stop = Arc::clone(&stop);
-            // **Its window opens when it first draws**: a display nothing is on yet has nothing to
-            // show.
-            let _ = std::thread::Builder::new().name(format!("omni-display-{id}-wait")).spawn(move || {
-                while !fb.wait_frame(1, Duration::from_secs(1)) {
-                    if stop.load(Ordering::Acquire) {
-                        return;
-                    }
-                }
-                if let Err(e) = crate::display_window::spawn(fb, composer, options) {
-                    eprintln!("[window] display {id}: {e}");
-                }
-            });
+            self.open_window(id, &extra, true);
         }
+        self.extra.lock().insert(id, extra);
         if let Some(base) = &self.screenshot {
             let to = screenshot_path(base, id);
             let (every, stop) = (self.screenshot_every, Arc::clone(&stop));
@@ -190,6 +172,70 @@ impl Displays {
             });
         }
         Ok(id)
+    }
+
+    /// A window on the display `id`, on a thread that says when it has gone: at once, or
+    /// (`first_frame`) **when it first draws**: a display nothing is on yet has nothing to show.
+    fn open_window(&self, id: i64, extra: &Extra, first_frame: bool) {
+        let composer = Arc::clone(&self.composer);
+        let fb = Arc::clone(&extra.framebuffer);
+        let options = Options {
+            title: "Omnidroid".into(),
+            control: self.closed_dir.as_deref().map(|d| control_file(d, id)),
+            input: self.input.is_some(),
+            display: id,
+            android_display: Some(Arc::clone(&extra.android)),
+            shared_input: self.input.clone(),
+            stop: Some(Arc::clone(&extra.stop)),
+            closed_marker: self.closed_dir.as_deref().map(|d| closed_marker(d, id)),
+            restart_marker: self.closed_dir.as_deref().map(|d| restart_marker(d, id)),
+            card: Some(Arc::clone(&extra.card)),
+            pointer_icon: Some(Arc::clone(&extra.icon)),
+        };
+        let (stop, window) = (Arc::clone(&extra.stop), Arc::clone(&extra.window));
+        let opened = std::thread::Builder::new().name(format!("omni-display-{id}-wait")).spawn(move || {
+            while first_frame && !fb.wait_frame(1, Duration::from_secs(1)) {
+                if stop.load(Ordering::Acquire) {
+                    window.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            match crate::display_window::spawn(fb, composer, options) {
+                Ok(open) => {
+                    let _ = open.join();
+                }
+                Err(e) => eprintln!("[window] display {id}: {e}"),
+            }
+            window.store(false, Ordering::Release);
+        });
+        if opened.is_err() {
+            extra.window.store(false, Ordering::Release);
+        }
+    }
+
+    /// **A new window on the display `id`**, whose window the person closed: the display went on
+    /// without it, so the app is simply seen again. What the last window said or was told is not
+    /// this one's: its commands would be run again from the top. Whether one was opened: not if it
+    /// has one.
+    ///
+    /// # Errors
+    /// Not one of the displays added here, or this device has no windows.
+    pub fn window(&self, id: i64) -> Result<bool, String> {
+        let extra = self.extra.lock();
+        let e = extra.get(&id).ok_or_else(|| format!("no display {id} was added"))?;
+        if !self.windows {
+            return Err("this device has no windows".into());
+        }
+        if e.window.swap(true, Ordering::AcqRel) {
+            return Ok(false);
+        }
+        if let Some(dir) = &self.closed_dir {
+            for file in [closed_marker(dir, id), restart_marker(dir, id), control_file(dir, id)] {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+        self.open_window(id, e, false);
+        Ok(true)
     }
 
     /// Remove the display `id`: its window closes, its screenshot goes.
@@ -280,6 +326,7 @@ impl Displays {
                 (Err(_), _) => Err(format!("not a display id: {id}")),
             },
             ["display", "show", id] => id.parse().map_err(|_| format!("not a display id: {id}")).and_then(|id| self.show(id)).map(|()| String::new()),
+            ["display", "window", id] => id.parse().map_err(|_| format!("not a display id: {id}")).and_then(|id| self.window(id)).map(|opened| if opened { "opened\n".to_string() } else { "open\n".to_string() }),
             ["display", "owners", id] => id
                 .parse()
                 .map_err(|_| format!("not a display id: {id}"))
@@ -319,7 +366,11 @@ mod tests {
         let displays = Displays::new(Arc::clone(&composer), false, None, None, Duration::from_secs(5), None);
         let (id, fb) = composer.add_display(400, 330).unwrap();
         let card = Arc::new(AtomicBool::new(false));
-        displays.extra.lock().insert(id, Extra { stop: Arc::default(), android: Arc::default(), card: Arc::clone(&card) });
+        displays.extra.lock().insert(id, Extra { stop: Arc::default(), android: Arc::default(), card: Arc::clone(&card), framebuffer: Arc::clone(&fb), window: Arc::default(), icon: crate::inject::new_icon() });
+        // A device with no windows opens none; a display that was not added has none to open.
+        assert!(displays.handle(&format!("display window {id}")).1.contains("no windows"));
+        assert_eq!(displays.handle("display window 99").0, 1);
+        assert_eq!(displays.handle("display window x").0, 1);
         let text = "Talking Tom stopped\nJava exception: java.lang.IllegalStateException: boom";
         let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
 

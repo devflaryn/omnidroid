@@ -180,6 +180,15 @@ pub fn show_display(dev: &Device, hwc: i64) -> Result<(), String> {
     host(dev, &format!("display show {hwc}")).map(|_| ())
 }
 
+/// A new window on the composer's display `hwc`, whose window the person closed (`#host display
+/// window`). Answers whether one was opened: not if it has one.
+///
+/// # Errors
+/// The device's.
+pub fn open_window(dev: &Device, hwc: i64) -> Result<bool, String> {
+    host(dev, &format!("display window {hwc}")).map(|said| said.trim() == "opened")
+}
+
 /// Lowercase hex of `text`'s UTF-8: one word on the control channel's line, whatever the text
 /// holds (spaces, line ends, any script), as `omni_linux::card::from_hex` reads it back.
 #[must_use]

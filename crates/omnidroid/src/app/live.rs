@@ -23,6 +23,7 @@ const TOOLS: &[ToolDef] = &[
     ("wait_instance", "Wait until an instance runs (its app's Activity displayed) or ends, at most `timeout` seconds (default 300); one restarting is waited through until it runs again (or ends). Answers its state, auto_restart, restarts and, while restarting, restart_in (seconds); an ended or restarting one's `details` too (what its Android's log says happened, as the card its window shows), and once restarted, `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[("instance_id", "number", true, "the id start_instance gave"), ("timeout", "number", false, "seconds (default 300)")]),
     ("list_instances", "Every instance: id, package, its Android (device), user, display, state (waiting, installing, starting, running, restarting, closing, ended: why), auto_restart (its own setting, else the pool's), restarts (how many so far), restart_in (seconds, while restarting), screenshot path; an ended or restarting one's `details` too -- when its app crashed, was killed, or did not start, what its Android's log says happened (exception and frames, signal and library, ANR...), the card its window shows until it is closed or restarted -- and a restarted one's `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[]),
     ("stop_instance", "Close an instance: its app stopped, its window gone (no card, no auto restart). Its Android stays warm. Never asks, and also ends one running headless.", &[("instance_id", "number", true, "the instance")]),
+    ("show_instance", "Bring back the window of an instance running headless (`headless` in list_instances), on the display it went on with; without instance_id, of every one. Answers the ids shown. Closing the window again asks again.", &[("instance_id", "number", false, "the instance (none: every headless one)")]),
     ("plugins", "The plugins: name, version, description, enabled, built_in. With `name` and `enabled`, switch one on or off, at once: `close-prompt` (built in, on by default) asks the person, when they close an instance's window, whether to shut the instance down or keep it running headless (`headless` in list_instances); off, closing the window shuts it down.", &[("name", "string", false, "a plugin"), ("enabled", "boolean", false, "switch it on or off")]),
     ("restart_instance", "Restart an instance's app on its window: its app stopped (a running one) and started again after `delay` seconds (default 5) while its window's card counts down (\"Restarting in 5 seconds\", \"Click here to restart now\"); a crashed one's card shows the countdown under its crash log. Same instance id. wait_instance waits for it to run again. Answers its state.", &[("instance_id", "number", true, "the instance"), ("delay", "number", false, "seconds before its app starts again (default 5; 0 now)")]),
     ("auto_restart", "Restart an app automatically when it crashes or ends on its own (its card says \"Automatically restarting in 5 seconds\"): for one instance, or without instance_id for every instance without its own setting (saved). After 3 ends in a row within a minute of starting, it stops restarting it. An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) is not restarted: its window closes. Answers the setting now.", &[("on", "boolean", true, "true: restart it when it crashes; false: leave it ended, its card shown"), ("instance_id", "number", false, "the instance (without: the pool's setting)")]),
@@ -364,6 +365,22 @@ impl PoolLive {
                 std::thread::spawn(move || pool.kill(id));
                 Ok(json::obj([("device", Json::Num(f64::from(id))), ("stopping", Json::Bool(true))]))
             }
+            "show_instance" => {
+                let shown = match arg_u64(args, "instance_id") {
+                    Some(id) => {
+                        let id = u32::try_from(id).map_err(|_| RpcError::params("no such instance"))?;
+                        pool.show_window(id).map_err(RpcError::params)?.then_some(id).into_iter().collect()
+                    }
+                    None => {
+                        let (shown, errors) = pool.show_all_windows();
+                        if let Some(e) = errors.first().filter(|_| shown.is_empty()) {
+                            return Err(RpcError::params(e.clone()));
+                        }
+                        shown
+                    }
+                };
+                Ok(json::obj([("shown", Json::Array(shown.into_iter().map(|id| Json::Num(f64::from(id))).collect()))]))
+            }
             "plugins" => plugins_tool(args),
             "settings" => {
                 if let (Some(key), Some(value)) = (args.get("key").and_then(Json::as_str), args.get("value").and_then(Json::as_str)) {
@@ -428,6 +445,7 @@ mod tests {
         assert_eq!(prop(&tool("restart_instance"), "delay").as_deref(), Some("number"));
         assert_eq!(prop(&tool("auto_restart"), "on").as_deref(), Some("boolean"));
         assert_eq!(prop(&tool("plugins"), "enabled").as_deref(), Some("boolean"));
+        assert_eq!(prop(&tool("show_instance"), "instance_id").as_deref(), Some("number"));
         assert_eq!(prop(&tool("start_instance"), "auto_restart").as_deref(), Some("boolean"));
         let on = live.call("auto_restart", &json::obj([("on", Json::Bool(true))])).expect("a tool").expect("the pool's setting");
         assert_eq!(on.get("auto_restart").and_then(Json::as_bool), Some(true));

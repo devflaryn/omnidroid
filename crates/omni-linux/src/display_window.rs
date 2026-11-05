@@ -154,6 +154,8 @@ pub const REPORT_EVERY: Duration = Duration::from_secs(5);
 pub struct Options {
     /// The title bar's text.
     pub title: String,
+    /// What the app last asked Android for as its pointer, beyond this window ([`crate::inject::Injector::with_icon`]).
+    pub pointer_icon: Option<Arc<AtomicI32>>,
     /// A file of commands (see this module's "Scripted resizes and input"), if any.
     pub control: Option<PathBuf>,
     /// The window's keyboard and mouse as the device's (see this module's "Keyboard and mouse").
@@ -220,6 +222,10 @@ pub fn spawn(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: Op
         let pointer = crate::inject::Injector::new(crate::binder::broker(crate::binder::Context::Binder));
         let pointer = match &options.android_display {
             Some(display) => pointer.with_display(Arc::clone(display)),
+            None => pointer,
+        };
+        let pointer = match &options.pointer_icon {
+            Some(icon) => pointer.with_icon(Arc::clone(icon)),
             None => pointer,
         };
         Devices { keyboard: shared.keyboard, mouse: shared.mouse, pointer }
@@ -422,7 +428,7 @@ fn run(framebuffer: Arc<Framebuffer>, composer: Arc<Composer>, options: &Options
             return;
         }
     };
-    window.show();
+    window.show_on_screen();
     eprintln!("[window] {width}x{height}: the display, live (a window resize resizes the display)");
     let mut input = Input::new(move_every_from_env());
     // The host's cursor over the window: the app's word by default (`OMNI_HOST_CURSOR=show|hide`

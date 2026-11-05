@@ -50,7 +50,7 @@ pub const SESSION_COMMANDS: &[&str] = &["play", "aosp"];
 /// The launcher's own commands: a plugin's command cannot take one of these names -- the ones
 /// `main` answers before a plugin's command is looked for (`serve`, `host`, `app`, `restart`,
 /// `autorestart`) too, or a plugin's of that name was accepted and never ran.
-const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release", "close-prompt", "serve", "host", "app", "restart", "autorestart"];
+const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release", "close-prompt", "serve", "host", "app", "restart", "autorestart", "show"];
 /// The launcher's own options: a plugin's option cannot take one of these.
 const CORE_FLAGS: &[&str] = &[
     "--apk", "--minutes", "--fresh", "--phone", "--data-dir", "--headless", "--no-window", "--control", "--size",
@@ -642,7 +642,7 @@ pub fn window_close(plugins: &[&Plugin], id: u32, package: &str, apk: &Path, bas
 #[must_use]
 pub fn close_prompt_text(id: &str, package: &str) -> String {
     format!(
-        "You closed the window of instance #{id} ({package}).\n\nShut it down, or keep it running headless, with no window?\n\nA headless instance goes on using memory and CPU until it is stopped: `close {id}` in omnidroid, or the stop_instance tool.\n\nNot to be asked again: `plugins disable close-prompt`."
+        "You closed the window of instance #{id} ({package}).\n\nShut it down, or keep it running headless, with no window?\n\nA headless instance goes on using memory and CPU until it is stopped: `close {id}` in omnidroid, or the stop_instance tool. `show {id}` brings its window back.\n\nNot to be asked again: `plugins disable close-prompt`."
     )
 }
 
@@ -982,7 +982,7 @@ mod tests {
     #[test]
     fn the_close_prompt_says_which_instance_and_how_to_stop_it() {
         let text = close_prompt_text("3", "com.roblox.client");
-        for said in ["#3", "com.roblox.client", "headless", "close 3", "stop_instance", "plugins disable close-prompt"] {
+        for said in ["#3", "com.roblox.client", "headless", "close 3", "show 3", "stop_instance", "plugins disable close-prompt"] {
             assert!(text.contains(said), "{said}: {text}");
         }
     }

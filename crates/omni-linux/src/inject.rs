@@ -255,6 +255,12 @@ pub fn pointer_icon_type(parcel: &[u8]) -> Option<i32> {
 }
 
 /// The injector: the mouse's state and the input service's handle, once there is one.
+/// A holder for [`Injector::with_icon`]: no icon heard yet.
+#[must_use]
+pub fn new_icon() -> Arc<AtomicI32> {
+    Arc::new(AtomicI32::new(POINTER_ICON_UNKNOWN))
+}
+
 pub struct Injector {
     broker: Arc<Broker>,
     inner: Mutex<Inner>,
@@ -280,7 +286,7 @@ impl Injector {
         Self {
             broker,
             inner: Mutex::new(Inner { mouse: Mouse::default(), handle: None, looked: None, confirmed: false, next_id: 0x0100_0000 }),
-            icon: Arc::new(AtomicI32::new(POINTER_ICON_UNKNOWN)),
+            icon: new_icon(),
             display: Arc::new(AtomicI32::new(0)),
         }
     }
@@ -291,6 +297,15 @@ impl Injector {
     #[must_use]
     pub fn with_display(mut self, display: Arc<AtomicI32>) -> Self {
         self.display = display;
+        self
+    }
+
+    /// The holder of the pointer icon heard ([`new_icon`]), kept beyond this injector: Android says
+    /// an icon only when it changes, so a window opened again on a display would otherwise not know
+    /// the app draws its own pointer until it next asks for another.
+    #[must_use]
+    pub fn with_icon(mut self, icon: Arc<AtomicI32>) -> Self {
+        self.icon = icon;
         self
     }
 

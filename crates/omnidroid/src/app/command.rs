@@ -23,6 +23,10 @@ pub enum Command {
     AutoRestartStatus,
     /// `warm`: boot one more device now.
     Warm,
+    /// `show <#id>...`: headless instances' windows again.
+    Show(Vec<u32>),
+    /// `show all`: every headless instance's.
+    ShowAll,
     /// `kill <D#>... | all`: stop devices.
     Kill(Vec<u32>),
     KillAll,
@@ -47,6 +51,7 @@ pub const HELP: &[&str] = &[
     "run <apk> [xN]       launch N instances of any APK (Tab completes the path)",
     "  ... --cookie <c> --place <id>   with a plugin's options (`plugins` lists them)",
     "close <#id>... | all close instances (or Delete on a selected one)",
+    "show <#id>... | all  bring back the window of instances running headless",
     "restart <#id>... | all  restart instances' apps on their windows (in 5 s; the card counts down)",
     "autorestart on|off [#id...]  restart an app when it crashes (no ids: the pool's setting, for instances without their own)",
     "warm                 boot one more Android now",
@@ -162,6 +167,11 @@ pub fn parse(line: &str) -> Result<Command, String> {
             [] => Err("close #id... or close all".into()),
             ids => instance_ids(ids).map(Command::Close),
         },
+        "show" => match words.as_slice() {
+            ["all"] => Ok(Command::ShowAll),
+            [] => Err("show #id... or show all".into()),
+            ids => instance_ids(ids).map(Command::Show),
+        },
         "restart" => match words.as_slice() {
             ["all"] => Ok(Command::RestartAll),
             [] => Err("restart #id... or restart all".into()),
@@ -271,6 +281,9 @@ mod tests {
     fn close_kill_and_the_rest() {
         assert_eq!(parse("close #2 3"), Ok(Command::Close(vec![2, 3])));
         assert_eq!(parse("close all"), Ok(Command::CloseAll));
+        assert_eq!(parse("show #2 3"), Ok(Command::Show(vec![2, 3])));
+        assert_eq!(parse("show all"), Ok(Command::ShowAll));
+        assert!(parse("show").is_err() && parse("show x").is_err());
         assert_eq!(parse("kill D1"), Ok(Command::Kill(vec![1])));
         assert_eq!(parse("kill all"), Ok(Command::KillAll));
         assert_eq!(parse("shell D2 pm list packages -3"), Ok(Command::Shell(2, "pm list packages -3".into())));
