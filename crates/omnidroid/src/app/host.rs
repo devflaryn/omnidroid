@@ -286,6 +286,25 @@ impl Host {
                     false
                 }
             }),
+            Ok(Command::Show(ids)) => ids.into_iter().fold(true, |ok, id| match pool.show_window(id) {
+                Ok(true) => ok,
+                Ok(false) => {
+                    pool.say(format!("#{id} has its window"));
+                    ok
+                }
+                Err(e) => {
+                    pool.say(e);
+                    false
+                }
+            }),
+            Ok(Command::ShowAll) => {
+                let (shown, errors) = pool.show_all_windows();
+                if shown.is_empty() && errors.is_empty() {
+                    pool.say("no instance runs headless");
+                }
+                errors.iter().for_each(|e| pool.say(e.clone()));
+                errors.is_empty()
+            }
             // An ended instance's window still showing its card closes too (`Pool::close`).
             Ok(Command::CloseAll) => {
                 let (_, instances) = pool.snapshot();

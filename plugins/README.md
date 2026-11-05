@@ -30,7 +30,8 @@ Windows: `%LOCALAPPDATA%\Omnidroid\plugins`; Linux: `$XDG_DATA_HOME/omnidroid/pl
 the person closes an instance's window, it asks whether to **shut the instance down** or **keep it
 running headless**, with no window (a `window-close` hook: it answers `close` or `headless`). A
 headless instance shows `headless` in the app's list and in `list_instances`, and goes on until
-`close <id>` or `stop_instance`. If the question cannot be shown, the instance shuts down.
+`close <id>` or `stop_instance`; `show <id>` or `show all` (the `show_instance` tool through MCP)
+bring its window back. If the question cannot be shown, the instance shuts down.
 
 Turn it off, and closing a window shuts the instance down without asking:
 

@@ -1628,6 +1628,54 @@ impl Pool {
         }
     }
 
+    /// **A headless instance's window again**, on the display it went on with. Whether a window was
+    /// opened: not for one that has its window. Closing the new one asks as closing any does.
+    ///
+    /// # Errors
+    /// No such instance, one that ended or is closing, one whose window's question is unanswered, or
+    /// the device's.
+    pub fn show_window(self: &Arc<Self>, id: InstanceId) -> Result<bool, String> {
+        let (dev, hwc) = {
+            let s = self.state.lock();
+            let i = s.instances.get(&id).ok_or_else(|| format!("no instance #{id}"))?;
+            if i.closed || matches!(i.state, InstanceState::Closing | InstanceState::Ended(_)) {
+                return Err(format!("#{id} ended: it has no window to show"));
+            }
+            if i.asking {
+                return Err(format!("#{id}: its window was just closed; answer the question about it first"));
+            }
+            if !i.headless {
+                return Ok(false);
+            }
+            let found = s.devices.get(&i.device).map(DeviceRec::device).zip(i.hwc);
+            found.ok_or_else(|| format!("#{id} has no display to show"))?
+        };
+        if !dev.alive() {
+            return Err(format!("#{id}: its Android is gone"));
+        }
+        device::open_window(&dev, hwc)?;
+        if let Some(i) = self.state.lock().instances.get_mut(&id) {
+            i.headless = false;
+        }
+        self.say(format!("#{id}: its window is back"));
+        Ok(true)
+    }
+
+    /// Every headless instance's window again ([`Pool::show_window`]): the ids shown, and what stopped
+    /// any that could not be.
+    pub fn show_all_windows(self: &Arc<Self>) -> (Vec<InstanceId>, Vec<String>) {
+        let ids: Vec<InstanceId> = self.state.lock().instances.iter().filter(|(_, i)| i.headless && i.hwc.is_some()).map(|(id, _)| *id).collect();
+        let (mut shown, mut errors) = (Vec::new(), Vec::new());
+        for id in ids {
+            match self.show_window(id) {
+                Ok(true) => shown.push(id),
+                Ok(false) => {}
+                Err(e) => errors.push(e),
+            }
+        }
+        (shown, errors)
+    }
+
     /// Close an instance: its app stopped, its window gone -- an ended one's too, while it shows
     /// its card (the screen's close, the MCP server's `stop_instance`: as the person closing the
     /// window). A restart counting down is called off; whatever its app does meanwhile (a crash as
@@ -2855,6 +2903,41 @@ mod tests {
         q.follow_windows();
         assert!(!q.state.lock().instances[&1].asking);
         assert_ne!(q.state.lock().instances[&1].state, InstanceState::Running, "closing");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `show` opens only a headless instance's window, and says why it cannot.
+    #[test]
+    fn show_is_for_a_headless_instance_that_runs() {
+        let dir = std::env::temp_dir().join(format!("omni-pool-show-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = pool(&dir, 1);
+        let apk = Arc::new(omni_warm::Apk { path: dir.join("a.apk"), sha256: "ff".into(), package: "com.a".into(), launcher: Some(".Main".into()), ..Default::default() });
+        let rec = |state, headless, asking| InstanceRec { user: Some(10), hwc: Some(2), display: Some(3), state, headless, asking, ..InstanceRec::new(1, Arc::clone(&apk), Extras::default()) };
+        {
+            let mut s = p.state.lock();
+            s.instances.insert(1, rec(InstanceState::Running, false, false));
+            s.instances.insert(2, rec(InstanceState::Ended("closed".into()), true, false));
+            s.instances.insert(3, rec(InstanceState::Closing, true, false));
+            s.instances.insert(4, rec(InstanceState::Running, false, true));
+            s.instances.insert(5, rec(InstanceState::Running, true, false));
+        }
+        assert_eq!(p.show_window(1), Ok(false), "it has its window");
+        assert!(p.show_window(2).unwrap_err().contains("ended"));
+        assert!(p.show_window(3).unwrap_err().contains("ended"));
+        assert!(p.show_window(4).unwrap_err().contains("question"));
+        assert!(p.show_window(99).unwrap_err().contains("no instance"));
+        // Its Android gone: said, and it stays as it was.
+        assert!(p.show_window(5).unwrap_err().contains("Android"));
+        assert!(p.state.lock().instances[&5].headless);
+        // `show all`: the running headless ones and only them; an ended one's has no display.
+        p.state.lock().instances.get_mut(&2).unwrap().hwc = None;
+        p.state.lock().instances.get_mut(&3).unwrap().hwc = None;
+        let (shown, errors) = p.show_all_windows();
+        assert!(shown.is_empty());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("#5"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
