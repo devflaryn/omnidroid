@@ -42,6 +42,7 @@ windows-sys = { workspace = true, features = [
     # algorithm handle this crate would have to open and hold; see src/process/windows.rs.
     "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     # `process::env_is_set_raw`: `GetEnvironmentVariableA`, which a global allocator can call where
     # `std::env` (which allocates) cannot be.

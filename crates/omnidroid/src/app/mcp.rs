@@ -115,11 +115,10 @@ impl LabChild {
 
     fn start() -> Result<Self, String> {
         let program = Self::program();
-        let mut child = Command::new(&program)
-            .arg("--lab")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+        let mut lab = Command::new(&program);
+        lab.arg("--lab").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        omni_platform::process::no_console_window(&mut lab);
+        let mut child = lab
             .spawn()
             .map_err(|e| format!("the lab's tools run in {} (`cargo build --release -p omni-mcp`): {e}", program.display()))?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else { return Err("omni-mcp --lab: no stdio".into()) };

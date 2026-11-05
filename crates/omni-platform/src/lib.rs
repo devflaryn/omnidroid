@@ -103,6 +103,7 @@
 pub mod audio;
 pub mod clipboard;
 pub mod clock;
+pub mod dialog;
 pub mod fault;
 pub mod fs;
 #[cfg(feature = "hypervisor")]

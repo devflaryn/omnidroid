@@ -24,6 +24,23 @@ Windows: `%LOCALAPPDATA%\Omnidroid\plugins`; Linux: `$XDG_DATA_HOME/omnidroid/pl
 `plugins/roblox` (a sign-in cookie, a place link, `login`, and the Roblox benchmark scripts in its
 `tools/`) is the worked example. `omnidroid plugins new <name>` makes a starting point.
 
+## Built in: close-prompt
+
+`plugins/close-prompt` comes with omnidroid, inside its program, and is on unless switched off. When
+the person closes an instance's window, it asks whether to **shut the instance down** or **keep it
+running headless**, with no window (a `window-close` hook: it answers `close` or `headless`). A
+headless instance shows `headless` in the app's list and in `list_instances`, and goes on until
+`close <id>` or `stop_instance`. If the question cannot be shown, the instance shuts down.
+
+Turn it off, and closing a window shuts the instance down without asking:
+
+```text
+omnidroid plugins disable close-prompt    # from a shell, or `plugins disable close-prompt` in the app
+omnidroid plugins enable close-prompt     # on again
+```
+
+Through MCP: the `plugins` tool, `{"name": "close-prompt", "enabled": false}`.
+
 ## What a session does beyond install-and-start
 
 `omnidroid aosp` installs any APK and starts its launcher Activity, nothing more. A plugin's

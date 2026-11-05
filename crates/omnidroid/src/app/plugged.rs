@@ -49,6 +49,19 @@ pub fn take_package(options: &mut Vec<String>) -> Result<Option<String>, String>
     Ok(Some(name))
 }
 
+/// What becomes of instance `id`, whose window the person closed: what the plugins that are on say
+/// (`close-prompt`, built in, asks the person), read anew each time so switching one takes effect at
+/// once. A broken plugin is no reason to lose the answer of another.
+///
+/// # Errors
+/// A hook's failure: said by the caller, and the instance closes -- nothing is left running unseen
+/// because a question could not be asked.
+pub fn window_close(id: u32, package: &str, apk: &Path) -> Result<omni_pool::WindowClosed, String> {
+    let registry = plugin::Registry::installed();
+    let plugins: Vec<&plugin::Plugin> = registry.entries.iter().filter(|e| e.enabled).filter_map(|e| e.plugin.as_ref().ok()).collect();
+    Ok(plugin::window_close(&plugins, id, package, apk, &crate::plugin_base())?.unwrap_or(omni_pool::WindowClosed::Close))
+}
+
 /// Launch `count` instances of `apk` (an APK or a bundle of APKs) with `options`: the launcher's
 /// `--package`, and the installed plugins' options ([`extras`]).
 ///
@@ -110,14 +123,10 @@ fn cookie_store(cookie: &Path) -> Result<TempFile, String> {
     let _ = std::fs::remove_file(&at);
     let store = TempFile::new(at);
     let python = if cfg!(windows) { "python" } else { "python3" };
-    let out = Command::new(python)
-        .arg(crate::repo_root().join("tools/plant_cookie.py"))
-        .arg("--new")
-        .arg(store.path())
-        .arg(cookie)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("the cookie store: {python}: {e}"))?;
+    let mut plant = Command::new(python);
+    plant.arg(crate::repo_root().join("tools/plant_cookie.py")).arg("--new").arg(store.path()).arg(cookie).stdin(Stdio::null());
+    omni_platform::process::no_console_window(&mut plant);
+    let out = plant.output().map_err(|e| format!("the cookie store: {python}: {e}"))?;
     if !out.status.success() {
         return Err(format!("the cookie store: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim()));
     }

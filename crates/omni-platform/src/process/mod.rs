@@ -113,6 +113,19 @@ pub fn hold_children() -> bool {
     backend::hold_children()
 }
 
+/// **`cmd`'s child opens no terminal window.** Windows gives a console program a console of its own
+/// when its parent has none to share, and that console is a window on the desktop: a process with
+/// no console (one started detached, or a GUI program's child) that starts one without this shows a
+/// terminal for it. With this it gets a console with no window, which what it starts then inherits.
+/// A process that has a console -- `omnidroid aosp` run from a terminal -- is left alone: its children
+/// share that terminal and their output goes there. Nothing elsewhere.
+pub fn no_console_window(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    backend::no_console_window(cmd);
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// End this process when the process that started it ends (Linux: `PR_SET_PDEATHSIG`). Nothing
 /// on Windows ([`hold_children`] covers it) or macOS (no such call). Whether it took.
 pub fn end_with_parent() -> bool {

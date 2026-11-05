@@ -1031,10 +1031,13 @@ impl WindowPresenter {
                     .subpass(0);
                 c.pipelines[kind] = device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None).map_err(|(_, r)| vkerr("vkCreateGraphicsPipelines")(r))?[0];
             }
-            // Nearest: at 1:1 each pixel its own source pixel, as the CPU composes.
+            // Linear: at 1:1 each pixel samples its own source pixel's centre, as the CPU composes;
+            // stretched (a window past the display's cap, the frames of a resize) it is smooth where
+            // nearest drew square blocks. Vulkan requires linear filtering of the colour formats a display's
+            // buffers use (RGBA8, BGRA8, RGB565, RGB10A2, RGBA16F).
             let sampler = vk::SamplerCreateInfo::default()
-                .mag_filter(vk::Filter::NEAREST)
-                .min_filter(vk::Filter::NEAREST)
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
                 .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
                 .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                 .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)

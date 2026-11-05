@@ -280,6 +280,7 @@ impl Server {
     #[allow(clippy::too_many_arguments)]
     fn launcher_rooted(&self, dir: &Path, apk: &Path, extra: &[String], link_id: Option<&str>, gpu: &str, size: Option<&str>, minutes: Option<u64>, root: &RootRequest) -> std::process::Command {
         let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
+        omni_platform::process::no_console_window(&mut cmd);
         cmd.arg("aosp").arg("--apk").arg(apk).arg("--gpu").arg(gpu).arg("--instance").arg(dir);
         // A plugin's options: the launcher refuses one no installed plugin adds, and says which of
         // the repository's plugins does.
@@ -379,6 +380,7 @@ impl Server {
             return Err(format!("another device runs on this host ({}); stop it first (stop_instance, or its data/local/tmp/stop)", other.display()));
         }
         let mut cmd = std::process::Command::new(&self.config.omnidroid_bin);
+        omni_platform::process::no_console_window(&mut cmd);
         cmd.arg("aosp").arg("--warm").arg("--instance").arg(dir).arg("--gpu").arg(&self.config.gpu).arg("--minutes").arg(self.config.warm_minutes.to_string());
         if let Some(sz) = &self.config.size {
             cmd.arg("--size").arg(sz);

@@ -113,6 +113,7 @@ pub fn boot(exe: &Path, dir: &Path, config: &Config) -> Result<Child, String> {
         cmd.env("OMNI_DEVICE_RAM_MB", config.device_ram_mb.to_string());
     }
     cmd.stdin(Stdio::null()).stdout(log).stderr(err);
+    omni_platform::process::no_console_window(&mut cmd);
     cmd.spawn().map_err(|e| format!("{}: {e}", exe.display()))
 }
 

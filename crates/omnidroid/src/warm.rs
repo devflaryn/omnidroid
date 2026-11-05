@@ -58,16 +58,10 @@ fn plant(package: &str, store: &str) -> String {
 /// started here, waited for with [`store_made`] (it runs while the APK installs).
 fn make_store(repo: &Path, at: &Path, cookie: &Path) -> Result<std::process::Child, String> {
     let python = if cfg!(windows) { "python" } else { "python3" };
-    Command::new(python)
-        .arg(repo.join("tools/plant_cookie.py"))
-        .arg("--new")
-        .arg(at)
-        .arg(cookie)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{python}: {e}"))
+    let mut make = Command::new(python);
+    make.arg(repo.join("tools/plant_cookie.py")).arg("--new").arg(at).arg(cookie).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    omni_platform::process::no_console_window(&mut make);
+    make.spawn().map_err(|e| format!("{python}: {e}"))
 }
 
 /// `make_store`'s end.
@@ -239,12 +233,10 @@ impl Drop for RemovedOnDrop {
 /// A helper that stops `package` on `dev` once this process is gone (`omnidroid warm-release`).
 fn release_when_gone(dev: &device::Device, package: &str) {
     let Ok(exe) = std::env::current_exe() else { return };
-    let _ = Command::new(exe)
-        .args(["warm-release", &std::process::id().to_string(), &dev.dir.display().to_string(), package])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let mut release = Command::new(exe);
+    release.args(["warm-release", &std::process::id().to_string(), &dev.dir.display().to_string(), package]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    omni_platform::process::no_console_window(&mut release);
+    let _ = release.spawn();
 }
 
 /// `omnidroid warm-release <pid> <device dir> <package>`: wait for `pid` to end, then stop

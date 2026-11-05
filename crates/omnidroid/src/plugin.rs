@@ -18,12 +18,19 @@
 //!   `env KEY=VALUE` (never printed), `unset KEY`, `data-dir <dir>` (`play`'s storage, unless
 //!   `--data-dir`), `say <text>`, `error <text>` (the session does not start); any other line is
 //!   shown as it is, and a hook that fails stops the session.
+//!   A `window-close` hook runs when the person closes an instance's window (`OMNI_INSTANCE_ID`,
+//!   `OMNI_APK_PACKAGE`, `OMNI_APK`) and answers `close` or `headless`, each on a line: the first
+//!   plugin to answer decides; with no answer the instance closes. The person may take their time.
 //! * **`commands`**: commands of its own (`omnidroid login`), run with the arguments after them.
+//!
+//! **Built in** ([`BUILTIN`]): plugins that come with the launcher, in its binary, on unless switched
+//! off (`plugins disable <name>`), with nothing to install -- their hooks run the launcher itself
+//! (`${OMNIDROID}`), so they need no compiler or interpreter on the person's computer.
 //!
 //! Every program a plugin runs gets `OMNI_PLUGIN_NAME`, `OMNI_PLUGIN_DIR`, `OMNI_REPO`,
 //! `OMNI_COMMAND` and `OMNI_APP_DATA_DIR`, and a session's hooks also `OMNI_FRESH` (`1`/`0`),
 //! `OMNI_GIVEN_DATA_DIR` (`--data-dir`), `OMNI_APK` and `OMNI_APK_PACKAGE`, and `session-end`'s
-//! `OMNI_EXIT_CODE`. `${PLUGIN_DIR}`, `${REPO}`, `${APP_DATA_DIR}` and `${CARGO}` in a program's
+//! `OMNI_EXIT_CODE`. `${PLUGIN_DIR}`, `${REPO}`, `${APP_DATA_DIR}`, `${CARGO}` and `${OMNIDROID}` in a program's
 //! arguments and in `env` values are replaced with theirs.
 
 use std::collections::BTreeMap;
@@ -43,7 +50,7 @@ pub const SESSION_COMMANDS: &[&str] = &["play", "aosp"];
 /// The launcher's own commands: a plugin's command cannot take one of these names -- the ones
 /// `main` answers before a plugin's command is looked for (`serve`, `host`, `app`, `restart`,
 /// `autorestart`) too, or a plugin's of that name was accepted and never ran.
-const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release", "serve", "host", "app", "restart", "autorestart"];
+const CORE_COMMANDS: &[&str] = &["play", "aosp", "which", "modules", "plugins", "help", "warm-release", "close-prompt", "serve", "host", "app", "restart", "autorestart"];
 /// The launcher's own options: a plugin's option cannot take one of these.
 const CORE_FLAGS: &[&str] = &[
     "--apk", "--minutes", "--fresh", "--phone", "--data-dir", "--headless", "--no-window", "--control", "--size",
@@ -51,7 +58,9 @@ const CORE_FLAGS: &[&str] = &[
     "--denylist", "--su", "--no-clipboard", "--help", "--link",
 ];
 /// The hook events.
-const EVENTS: &[&str] = &["session-start", "session-end"];
+const EVENTS: &[&str] = &["session-start", "session-end", "window-close"];
+/// The plugins that come with the launcher: their names and manifests.
+const BUILTIN: &[(&str, &str)] = &[("close-prompt", include_str!("../../../plugins/close-prompt/omnidroid-plugin.json"))];
 /// The installed plugins that are switched off, one name a line, in the plugin directory.
 const DISABLED: &str = "disabled.txt";
 /// An installed link: `<name>.link` in the plugin directory holds the plugin's own directory.
@@ -276,6 +285,7 @@ impl Plugin {
             .replace("${REPO}", &base.repo.display().to_string())
             .replace("${APP_DATA_DIR}", &base.app_data.as_ref().map(|d| d.display().to_string()).unwrap_or_default())
             .replace("${CARGO}", &std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()))
+            .replace("${OMNIDROID}", &std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_default())
     }
 
     /// The program `run` names, with what every plugin program is given.
@@ -292,6 +302,7 @@ impl Plugin {
             Some(dir) => program.env("OMNI_APP_DATA_DIR", dir),
             None => program.env_remove("OMNI_APP_DATA_DIR"),
         };
+        omni_platform::process::no_console_window(&mut program);
         program
     }
 }
@@ -308,6 +319,8 @@ pub struct Entry {
     pub name: String,
     pub dir: PathBuf,
     pub linked: bool,
+    /// It comes with the launcher ([`BUILTIN`]): nothing on the disk but whether it is switched off.
+    pub builtin: bool,
     pub enabled: bool,
     pub plugin: Result<Plugin, String>,
 }
@@ -358,15 +371,29 @@ impl Registry {
                         Err(format!("installed as `{name}`, but its manifest names `{}`", p.name))
                     }
                 });
-                entries.push(Entry { enabled: !disabled.contains(&name), name, dir: plugin_dir, linked, plugin });
+                entries.push(Entry { enabled: !disabled.contains(&name), name, dir: plugin_dir, linked, builtin: false, plugin });
             }
         }
         Registry { dir: dir.map(Path::to_path_buf), entries }
     }
 
+    /// This user's plugins: those installed in `dir`, and the [`BUILTIN`] ones (one installed under
+    /// a built-in's name replaces it).
+    pub fn with_builtin(dir: Option<&Path>) -> Self {
+        let mut registry = Self::discover(dir);
+        let disabled = dir.map(disabled_names).unwrap_or_default();
+        for (name, manifest) in BUILTIN {
+            if !registry.entries.iter().any(|e| e.name == *name) {
+                let plugin = Plugin::parse(manifest, Path::new(""));
+                registry.entries.push(Entry { name: (*name).to_string(), dir: PathBuf::new(), linked: false, builtin: true, enabled: !disabled.iter().any(|d| d == name), plugin });
+            }
+        }
+        registry
+    }
+
     /// This user's plugins.
     pub fn installed() -> Self {
-        Self::discover(user_dir().as_deref())
+        Self::with_builtin(user_dir().as_deref())
     }
 
     /// The plugins that are on, checked against each other: a broken one, or two that take the same
@@ -576,6 +603,49 @@ pub fn end(plugins: &[&Plugin], given: &[Given], info: &SessionInfo, base: &Base
     }
 }
 
+/// A `window-close` hook's answer in its output: its first `close` or `headless` line.
+fn close_answer(out: &str) -> Option<omni_pool::WindowClosed> {
+    out.lines().find_map(|line| match line.trim() {
+        "close" => Some(omni_pool::WindowClosed::Close),
+        "headless" => Some(omni_pool::WindowClosed::KeepHeadless),
+        _ => None,
+    })
+}
+
+/// What becomes of instance `id`, whose window the person closed: the first `window-close` hook's
+/// answer, in the order the plugins are installed. `Ok(None)`: none has one.
+///
+/// # Errors
+/// A hook that could not run or failed: what the instance does then is the caller's.
+pub fn window_close(plugins: &[&Plugin], id: u32, package: &str, apk: &Path, base: &Base) -> Result<Option<omni_pool::WindowClosed>, String> {
+    for plugin in plugins {
+        let Some(run) = plugin.hooks.get("window-close") else { continue };
+        let out = plugin
+            .program(run, "window-close", base)
+            .env("OMNI_INSTANCE_ID", id.to_string())
+            .env("OMNI_APK_PACKAGE", package)
+            .env("OMNI_APK", apk)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("plugin `{}`: could not run {}: {e}", plugin.name, plugin.expand(&run[0], base)))?;
+        if !out.status.success() {
+            return Err(format!("plugin `{}`: its window-close hook failed ({}): {}", plugin.name, out.status, String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        if let Some(answer) = close_answer(&String::from_utf8_lossy(&out.stdout)) {
+            return Ok(Some(answer));
+        }
+    }
+    Ok(None)
+}
+
+/// The built-in `close-prompt` plugin's question.
+#[must_use]
+pub fn close_prompt_text(id: &str, package: &str) -> String {
+    format!(
+        "You closed the window of instance #{id} ({package}).\n\nShut it down, or keep it running headless, with no window?\n\nA headless instance goes on using memory and CPU until it is stopped: `close {id}` in omnidroid, or the stop_instance tool.\n\nNot to be asked again: `plugins disable close-prompt`."
+    )
+}
+
 /// The plugin command named `name`, run with `args`; `None` when no plugin adds it.
 pub fn run_command(plugins: &[&Plugin], name: &str, args: &[String], base: &Base) -> Option<Result<i32, String>> {
     let (plugin, command) = plugins.iter().find_map(|p| p.commands.iter().find(|c| c.name == name).map(|c| (p, c)))?;
@@ -665,6 +735,9 @@ pub fn add(registry: &Registry, from: &Path, link: bool) -> Result<String, Strin
 /// `omnidroid plugins remove <name>`: a copy is deleted, a link forgotten (its directory stays).
 pub fn remove(registry: &Registry, name: &str) -> Result<String, String> {
     let entry = registry.entries.iter().find(|e| e.name == name).ok_or_else(|| format!("no plugin `{name}` is installed"))?;
+    if entry.builtin {
+        return Err(format!("`{name}` comes with omnidroid; switch it off instead: plugins disable {name}"));
+    }
     let dir = registry.dir.as_deref().ok_or("no plugin directory")?;
     if entry.linked {
         let file = dir.join(format!("{name}.{LINK}"));
@@ -687,6 +760,8 @@ pub fn set_enabled(registry: &Registry, name: &str, enabled: bool) -> Result<Str
         }
         disabled.push(name.to_string());
     }
+    // A built-in can be switched off before anything was installed.
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join(DISABLED);
     let text: String = disabled.iter().map(|n| format!("{n}\n")).collect();
     std::fs::write(&file, text).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -852,5 +927,63 @@ mod tests {
         assert!(Registry::discover(Some(&installed)).entries.is_empty());
         scaffold("mine", &root.join("mine")).expect("a new plugin loads");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `close-prompt` comes with the launcher: on with nothing installed, switched off and on like
+    /// any plugin, not removable, and replaced by one installed under its name.
+    #[test]
+    fn a_built_in_plugin_is_on_until_it_is_switched_off() {
+        let root = std::env::temp_dir().join(format!("omni-plugin-builtin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("not-made-yet");
+        let find = |r: &Registry| r.entries.iter().position(|e| e.name == "close-prompt").unwrap();
+        let registry = Registry::with_builtin(Some(&dir));
+        let entry = &registry.entries[find(&registry)];
+        assert!(entry.builtin && entry.enabled, "on, with nothing installed");
+        let plugin = entry.plugin.as_ref().expect("its manifest loads");
+        assert_eq!(plugin.hooks["window-close"], ["${OMNIDROID}", "close-prompt"]);
+        assert_eq!(registry.active().unwrap().len(), 1);
+        assert!(remove(&registry, "close-prompt").unwrap_err().contains("plugins disable"));
+        // Off, before the plugin directory exists; on again.
+        set_enabled(&registry, "close-prompt", false).unwrap();
+        let off = Registry::with_builtin(Some(&dir));
+        assert!(!off.entries[find(&off)].enabled);
+        assert!(off.active().unwrap().is_empty(), "no hook of it runs");
+        set_enabled(&off, "close-prompt", true).unwrap();
+        let on = Registry::with_builtin(Some(&dir));
+        assert!(on.entries[find(&on)].enabled);
+        // One installed under its name replaces it.
+        let own = dir.join("close-prompt");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(own.join(MANIFEST), r#"{"name": "close-prompt", "version": "9"}"#).unwrap();
+        let replaced = Registry::with_builtin(Some(&dir));
+        assert_eq!(replaced.entries.iter().filter(|e| e.name == "close-prompt").count(), 1);
+        assert!(!replaced.entries[find(&replaced)].builtin);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_window_close_hook_answers_close_or_headless() {
+        use omni_pool::WindowClosed::{Close, KeepHeadless};
+        assert_eq!(close_answer("close\n"), Some(Close));
+        assert_eq!(close_answer("thinking\n  headless \nclose\n"), Some(KeepHeadless), "its first answer");
+        assert_eq!(close_answer("something else\n"), None);
+        assert!(Plugin::parse(r#"{"name": "x", "hooks": {"window-close": ["p"]}}"#, Path::new("")).is_ok());
+        assert!(Plugin::parse(r#"{"name": "x", "hooks": {"window-closed": ["p"]}}"#, Path::new("")).is_err());
+        // No plugin with the hook: no answer. One with no answer: the next one's.
+        let base = Base { repo: PathBuf::new(), app_data: None };
+        let plain = Plugin::parse(r#"{"name": "plain"}"#, Path::new("")).unwrap();
+        assert_eq!(window_close(&[&plain], 1, "p", Path::new("a.apk"), &base), Ok(None));
+        // A hook that cannot run is an error, for the caller to close the instance on.
+        let gone = Plugin::parse(r#"{"name": "gone", "hooks": {"window-close": ["no-such-program-omni"]}}"#, Path::new("")).unwrap();
+        assert!(window_close(&[&gone], 1, "p", Path::new("a.apk"), &base).unwrap_err().contains("could not run"));
+    }
+
+    #[test]
+    fn the_close_prompt_says_which_instance_and_how_to_stop_it() {
+        let text = close_prompt_text("3", "com.roblox.client");
+        for said in ["#3", "com.roblox.client", "headless", "close 3", "stop_instance", "plugins disable close-prompt"] {
+            assert!(text.contains(said), "{said}: {text}");
+        }
     }
 }

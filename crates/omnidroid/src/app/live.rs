@@ -22,7 +22,8 @@ const TOOLS: &[ToolDef] = &[
     ("start_instance", "Launch any APK (a host path) as `count` instances (default 1). A bundle of APKs works too (`.apkm`, `.xapk`, `.apks`, a zip of APKs): its base APK and splits installed together, its OBB files placed; when it holds several packages, name one with `package` (an error lists them; `apk_info` shows them first). Answers their ids at once; each runs in a window of its own on a warm Android: the same APK file again shares an Android (one Android user per extra instance), another package goes into a warm Android beside the others, another build of a package running elsewhere gets an Android of its own. `wait_instance` waits until one runs. `auto_restart` sets each new instance's own auto restart (else the pool's setting holds: `auto_restart` tool).", &[("apk", "string", true, "host path of the APK or bundle"), ("package", "string", false, "which package of a bundle of several to launch"), ("count", "number", false, "how many instances (1-64, default 1)"), ("options", "string", false, "the installed plugins' options, as on omnidroid's command line: e.g. `--cookie <file or name login saved> --place <id>` (roblox plugin) signs each instance in as that account and joins the place"), ("auto_restart", "boolean", false, "restart each new instance's app when it crashes (its own setting)")]),
     ("wait_instance", "Wait until an instance runs (its app's Activity displayed) or ends, at most `timeout` seconds (default 300); one restarting is waited through until it runs again (or ends). Answers its state, auto_restart, restarts and, while restarting, restart_in (seconds); an ended or restarting one's `details` too (what its Android's log says happened, as the card its window shows), and once restarted, `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[("instance_id", "number", true, "the id start_instance gave"), ("timeout", "number", false, "seconds (default 300)")]),
     ("list_instances", "Every instance: id, package, its Android (device), user, display, state (waiting, installing, starting, running, restarting, closing, ended: why), auto_restart (its own setting, else the pool's), restarts (how many so far), restart_in (seconds, while restarting), screenshot path; an ended or restarting one's `details` too -- when its app crashed, was killed, or did not start, what its Android's log says happened (exception and frames, signal and library, ANR...), the card its window shows until it is closed or restarted -- and a restarted one's `last_end` (the same, of the end it was restarted after). An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) ends with its window closed and no card.", &[]),
-    ("stop_instance", "Close an instance: its app stopped, its window gone (no card, no auto restart). Its Android stays warm.", &[("instance_id", "number", true, "the instance")]),
+    ("stop_instance", "Close an instance: its app stopped, its window gone (no card, no auto restart). Its Android stays warm. Never asks, and also ends one running headless.", &[("instance_id", "number", true, "the instance")]),
+    ("plugins", "The plugins: name, version, description, enabled, built_in. With `name` and `enabled`, switch one on or off, at once: `close-prompt` (built in, on by default) asks the person, when they close an instance's window, whether to shut the instance down or keep it running headless (`headless` in list_instances); off, closing the window shuts it down.", &[("name", "string", false, "a plugin"), ("enabled", "boolean", false, "switch it on or off")]),
     ("restart_instance", "Restart an instance's app on its window: its app stopped (a running one) and started again after `delay` seconds (default 5) while its window's card counts down (\"Restarting in 5 seconds\", \"Click here to restart now\"); a crashed one's card shows the countdown under its crash log. Same instance id. wait_instance waits for it to run again. Answers its state.", &[("instance_id", "number", true, "the instance"), ("delay", "number", false, "seconds before its app starts again (default 5; 0 now)")]),
     ("auto_restart", "Restart an app automatically when it crashes or ends on its own (its card says \"Automatically restarting in 5 seconds\"): for one instance, or without instance_id for every instance without its own setting (saved). After 3 ends in a row within a minute of starting, it stops restarting it. An app closed on purpose (stop_instance, its window closed, force-stopped, quit by the person) is not restarted: its window closes. Answers the setting now.", &[("on", "boolean", true, "true: restart it when it crashes; false: leave it ended, its card shown"), ("instance_id", "number", false, "the instance (without: the pool's setting)")]),
     ("apk_info", "What an APK or a bundle of APKs (`.apkm`, `.xapk`, `.apks`, a zip of APKs) holds, read on the host without launching it: each package's name, versionCode, launcher Activity, the splits that would be installed with it (and those of other ABIs left out) and its OBB files. A bundle of several packages needs one named on start_instance (`package`).", &[("apk", "string", true, "host path of the APK or bundle")]),
@@ -142,12 +143,34 @@ fn instance_json(i: &InstanceInfo) -> Json {
             ("display", i.display.map_or(Json::Null, |d| Json::Num(f64::from(d)))),
             ("state", json::s(state_name(&i.state))),
             ("up_s", Json::Num(i.up_for.as_secs() as f64)),
+            ("headless", Json::Bool(i.headless)),
             ("screenshot", i.screenshot.as_ref().map_or(Json::Null, |p| json::s(p.display().to_string()))),
         ]
         .into_iter()
         .chain(restarts(i))
         .chain(details(i)),
     )
+}
+
+/// The `plugins` tool: `name` and `enabled` switch one, and either way it answers the list.
+fn plugins_tool(args: &Json) -> Result<Json, RpcError> {
+    let registry = crate::plugin::Registry::installed();
+    match (args.get("name").and_then(Json::as_str), args.get("enabled").and_then(Json::as_bool)) {
+        (None, None) => {}
+        (Some(name), Some(on)) => {
+            if !registry.entries.iter().any(|e| e.name == name) {
+                return Err(RpcError::params(format!("no plugin `{name}`")));
+            }
+            crate::plugin::set_enabled(&registry, name, on).map_err(RpcError::params)?;
+        }
+        _ => return Err(RpcError::params("`name` and `enabled` go together")),
+    }
+    let registry = crate::plugin::Registry::installed();
+    let list = registry.entries.iter().map(|e| {
+        let (version, description) = e.plugin.as_ref().map_or_else(|error| (String::new(), format!("BROKEN: {error}")), |p| (p.version.clone(), p.description.clone()));
+        json::obj([("name", json::s(e.name.clone())), ("version", json::s(version)), ("description", json::s(description)), ("enabled", Json::Bool(e.enabled)), ("built_in", Json::Bool(e.builtin))])
+    });
+    Ok(json::obj([("plugins", Json::Array(list.collect()))]))
 }
 
 /// A PNG's width and height (its IHDR).
@@ -341,6 +364,7 @@ impl PoolLive {
                 std::thread::spawn(move || pool.kill(id));
                 Ok(json::obj([("device", Json::Num(f64::from(id))), ("stopping", Json::Bool(true))]))
             }
+            "plugins" => plugins_tool(args),
             "settings" => {
                 if let (Some(key), Some(value)) = (args.get("key").and_then(Json::as_str), args.get("value").and_then(Json::as_str)) {
                     if key.starts_with("mcp_") {
@@ -403,6 +427,7 @@ mod tests {
         let prop = |t: &Json, p: &str| t.get("inputSchema").and_then(|s| s.get("properties")).and_then(|s| s.get(p)).and_then(|p| p.get("type")).and_then(Json::as_str).map(str::to_string);
         assert_eq!(prop(&tool("restart_instance"), "delay").as_deref(), Some("number"));
         assert_eq!(prop(&tool("auto_restart"), "on").as_deref(), Some("boolean"));
+        assert_eq!(prop(&tool("plugins"), "enabled").as_deref(), Some("boolean"));
         assert_eq!(prop(&tool("start_instance"), "auto_restart").as_deref(), Some("boolean"));
         let on = live.call("auto_restart", &json::obj([("on", Json::Bool(true))])).expect("a tool").expect("the pool's setting");
         assert_eq!(on.get("auto_restart").and_then(Json::as_bool), Some(true));
@@ -431,6 +456,7 @@ mod tests {
             auto_restart: true,
             restarts,
             restart_in: None,
+            headless: false,
         };
         let key = |i: &InstanceInfo| details(i).map(|(k, _)| k);
         assert_eq!(key(&info(InstanceState::Ended("closed".into()), &[], 0)), Some("details"), "an ended one's, always");
