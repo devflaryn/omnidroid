@@ -292,6 +292,7 @@ impl Plugin {
             Some(dir) => program.env("OMNI_APP_DATA_DIR", dir),
             None => program.env_remove("OMNI_APP_DATA_DIR"),
         };
+        omni_platform::process::no_console_window(&mut program);
         program
     }
 }

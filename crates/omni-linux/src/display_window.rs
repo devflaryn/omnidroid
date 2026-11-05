@@ -27,13 +27,12 @@
 //! time the two sizes differ.
 //!
 //! **Up to a size, past which the display is scaled down** ([`display_for_window`]): a window
-//! larger than [`DISPLAY_MAX_PIXELS`] (1600x900's area; `OMNI_DISPLAY_MAX=WxH` sets another,
+//! larger than [`DISPLAY_MAX_PIXELS`] (3840x2160's area; `OMNI_DISPLAY_MAX=WxH` sets another,
 //! `OMNI_DISPLAY_MAX=0` none) gets a display of its shape and that many pixels, stretched to it.
-//! A fullscreen window on a Retina screen is 2940x1646 physical pixels, 5.25x 1280x720's -- and
-//! every one of them was drawn by the app, read back, composed and copied to the window each
-//! frame, while what the screen shows of them is its size in points (1470x823). Capped, the app
-//! draws ~3x fewer pixels at fullscreen (run 2026-10-07: 23.6 fps at 2940x1646 against 28.7 at
-//! 1280x720 in the same session); a window within the cap is still its display, pixel for pixel.
+//! Below it every window pixel is one the app drew. The cap was 1600x900's until 2026-11-05, for
+//! frames (run 2026-10-07: 23.6 fps at 2940x1646 against 28.7 at 1280x720 in the same session) --
+//! but that left a fullscreen window on a 2560x1440 screen showing 1640x876 stretched, visibly
+//! soft, and people asked for the picture. `OMNI_DISPLAY_MAX=1600x900` takes those frames back.
 //!
 //! **A size must hold for [`SETTLE`] before the display follows it.** A border drag is hundreds
 //! of sizes, and each display change is a reconnect in SurfaceFlinger and a configuration change
@@ -114,8 +113,8 @@ use crate::window_input::{Input, Out, TITLE_FREE};
 
 /// How long a window size must hold before the display is resized to it.
 pub const SETTLE: Duration = Duration::from_millis(300);
-/// The most pixels a display is given ([`display_for_window`]): 1600x900's.
-pub const DISPLAY_MAX_PIXELS: u64 = 1600 * 900;
+/// The most pixels a display is given ([`display_for_window`]): 3840x2160's.
+pub const DISPLAY_MAX_PIXELS: u64 = 3840 * 2160;
 
 /// The cap on the display's pixels: `OMNI_DISPLAY_MAX=WxH` (its area), `0` for none, else
 /// [`DISPLAY_MAX_PIXELS`].
@@ -317,14 +316,6 @@ fn perform(outs: Vec<Out>, window: &mut Window, input: &mut Input, devices: &Dev
             }
             Out::Title(title) => {
                 let _ = window.set_title(title);
-            }
-            Out::Warp(x, y) => {
-                let _ = window.warp_pointer(x, y);
-            }
-            Out::Center => {
-                if let Ok((w, h)) = window.client_size() {
-                    let _ = window.warp_pointer(i32::try_from(w / 2).unwrap_or(0), i32::try_from(h / 2).unwrap_or(0));
-                }
             }
         }
     }
@@ -897,11 +888,12 @@ mod tests {
     #[test]
     fn a_large_window_gets_a_display_of_its_shape_scaled_down() {
         assert_eq!(display_for_window(1280, 720, DISPLAY_MAX_PIXELS), (1280, 720), "within the cap: the window's own");
-        assert_eq!(display_for_window(1600, 900, DISPLAY_MAX_PIXELS), (1600, 900));
-        let (w, h) = display_for_window(2940, 1646, DISPLAY_MAX_PIXELS);
+        assert_eq!(display_for_window(2560, 1369, DISPLAY_MAX_PIXELS), (2560, 1369), "a maximised 1440p window: every pixel its own");
+        assert_eq!(display_for_window(3840, 2160, DISPLAY_MAX_PIXELS), (3840, 2160), "a fullscreen 4K window too");
+        let (w, h) = display_for_window(5120, 2880, DISPLAY_MAX_PIXELS);
         assert!(u64::from(w) * u64::from(h) <= DISPLAY_MAX_PIXELS && w % 2 == 0 && h % 2 == 0, "{w}x{h}");
-        assert!((f64::from(w) / f64::from(h) - 2940.0 / 1646.0).abs() < 0.01, "the window's shape: {w}x{h}");
-        assert_eq!(display_for_window(2940, 1646, u64::MAX), (2940, 1646), "no cap");
+        assert!((f64::from(w) / f64::from(h) - 5120.0 / 2880.0).abs() < 0.01, "the window's shape: {w}x{h}");
+        assert_eq!(display_for_window(5120, 2880, u64::MAX), (5120, 2880), "no cap");
     }
 
     #[test]

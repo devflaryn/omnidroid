@@ -47,6 +47,17 @@ pub(super) fn hold_children() -> bool {
     set != 0 && unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) } != 0
 }
 
+/// `CREATE_NO_WINDOW`, when this process has no console for the child to share.
+pub(super) fn no_console_window(cmd: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // SAFETY: no arguments. Zero is the documented answer of a process with no console; a console
+    // without a window (`CREATE_NO_WINDOW`) still answers its code page.
+    if unsafe { windows_sys::Win32::System::Console::GetConsoleCP() } == 0 {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 /// Nothing: the job object of the process that started this one ends it ([`hold_children`]).
 pub(super) fn end_with_parent() -> bool {
     false

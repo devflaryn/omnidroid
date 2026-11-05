@@ -110,14 +110,10 @@ fn cookie_store(cookie: &Path) -> Result<TempFile, String> {
     let _ = std::fs::remove_file(&at);
     let store = TempFile::new(at);
     let python = if cfg!(windows) { "python" } else { "python3" };
-    let out = Command::new(python)
-        .arg(crate::repo_root().join("tools/plant_cookie.py"))
-        .arg("--new")
-        .arg(store.path())
-        .arg(cookie)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("the cookie store: {python}: {e}"))?;
+    let mut plant = Command::new(python);
+    plant.arg(crate::repo_root().join("tools/plant_cookie.py")).arg("--new").arg(store.path()).arg(cookie).stdin(Stdio::null());
+    omni_platform::process::no_console_window(&mut plant);
+    let out = plant.output().map_err(|e| format!("the cookie store: {python}: {e}"))?;
     if !out.status.success() {
         return Err(format!("the cookie store: {}{}", String::from_utf8_lossy(&out.stdout).trim(), String::from_utf8_lossy(&out.stderr).trim()));
     }

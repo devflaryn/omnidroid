@@ -144,7 +144,10 @@ pub fn one_shot(line: &str) -> ExitCode {
 }
 
 /// A host outlives the window that started it: a process group (Unix) or console (Windows) of its
-/// own, so the terminal's Ctrl+C and hang-up are not its.
+/// own, so the terminal's Ctrl+C and hang-up are not its. **On Windows that console has no window,
+/// and it is not `DETACHED_PROCESS`**: a detached host has no console at all, so Windows gave every
+/// console program it started a new one, on the desktop -- a terminal for each Android it warmed and
+/// for each helper an instance's start ran. Everything under this host inherits the windowless one.
 fn detach(cmd: &mut std::process::Command) {
     #[cfg(unix)]
     {
@@ -154,8 +157,8 @@ fn detach(cmd: &mut std::process::Command) {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS
-        cmd.creation_flags(0x0000_0200 | 0x0000_0008);
+        // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
+        cmd.creation_flags(0x0000_0200 | 0x0800_0000);
     }
 }
 
