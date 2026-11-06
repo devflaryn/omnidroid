@@ -6,7 +6,7 @@ Executor desktop app ships this folder and runs `omnidroid serve --port <p>` fro
     python3 tools/make_bundle.py --out <dir> [--zip] [--sysroot <dir>] [-j <n>]
 
     <out>/omnidroid(.exe)                the launcher, its pool and MCP server
-    <out>/omni-linux-run(.exe)           the device runner
+    <out>/window/Omnidroid(.exe)         the device runner: the name the menu bar, Dock and Task Manager show
     <out>/omni-r-app(.exe)               the `r_app` gate, prebuilt: what boots a device
     <out>/omni-plant-cookie(.exe)        tools/plant_cookie.py, ported (crates/omni-cookie)
     <out>/omni-mcp(.exe)                 the MCP stdio bridge and the lab's tools
@@ -33,6 +33,8 @@ SYSROOT = os.path.join("sysroot", "aosp-35")
 # Chromium under Python, which an install does not have.
 PLUGINS = {"roblox": {"drop_commands": {"login"}}}
 # (package, binary) built into the bundle under the binary's own name.
+# Where the device runner goes: its file name is what people see it called (crates/omni-linux/src/install.rs).
+RUNNER = "window/Omnidroid"
 BINARIES = [("omnidroid", "omnidroid"), ("omni-linux", "omni-linux-run"), ("omni-mcp", "omni-mcp"), ("omni-cookie", "omni-plant-cookie")]
 
 
@@ -237,8 +239,10 @@ def main():
     for name, path in built.items():
         if name.startswith("plugin:"):
             continue
-        shutil.copy2(path, os.path.join(out, name + EXE))
-        say(f"{name + EXE} <- {path}")
+        placed = RUNNER + EXE if name == "omni-linux-run" else name + EXE
+        os.makedirs(os.path.dirname(os.path.join(out, placed)), exist_ok=True)
+        shutil.copy2(path, os.path.join(out, placed))
+        say(f"{placed} <- {path}")
     for name in PLUGINS:
         src = os.path.join(REPO, "plugins", name)
         dst = os.path.join(out, "plugins", name)

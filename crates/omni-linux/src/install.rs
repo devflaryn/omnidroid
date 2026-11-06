@@ -5,7 +5,9 @@
 //!
 //! ```text
 //! <home>/omnidroid(.exe)            the launcher and its pool
-//! <home>/omni-linux-run(.exe)       the device runner (`--sysroot ... --instance ...`)
+//! <home>/window/Omnidroid(.exe)    the device runner (`--sysroot ... --instance ...`): named so
+//!                                   because the menu bar, the Dock and Task Manager show its file
+//!                                   name; a folder of its own, as macOS's disks ignore case
 //! <home>/omni-r-app(.exe)           the prebuilt `r_app` gate: what boots a device
 //! <home>/omni-plant-cookie(.exe)    `tools/plant_cookie.py`, ported (crate `omni-cookie`)
 //! <home>/sysroot/aosp-35/...        the pinned sysroot (`vfs::SYSROOT_MANIFEST_SHA256`)
@@ -34,6 +36,9 @@ pub const SYSROOT: &str = "sysroot/aosp-35";
 
 /// The prebuilt `r_app` gate in an install: the program `omnidroid aosp` runs to boot a device.
 pub const R_APP: &str = "omni-r-app";
+
+/// The device runner in an install: `omni-linux-run`, under the name people see it by.
+pub const RUNNER: &str = "window/Omnidroid";
 
 /// The ported cookie planter, beside the launcher in an install (`crates/omni-cookie`).
 pub const PLANT_COOKIE: &str = "omni-plant-cookie";

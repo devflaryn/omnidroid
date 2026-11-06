@@ -485,7 +485,7 @@ fn r_app_command() -> Command {
         run.env("OMNI_SYSROOT", home.join(omni_linux::install::SYSROOT));
     }
     if std::env::var_os("OMNI_LINUX_RUN").is_none() {
-        run.env("OMNI_LINUX_RUN", exe("omni-linux-run"));
+        run.env("OMNI_LINUX_RUN", exe(omni_linux::install::RUNNER));
     }
     run
 }
