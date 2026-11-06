@@ -28,7 +28,7 @@ use objc2_app_kit::{
     NSWindowOcclusionState, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSAttributedStringKey, NSDate, NSDefaultRunLoopMode,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSData, NSDate, NSDefaultRunLoopMode,
     NSNotification, NSObjectProtocol, NSPoint, NSRange, NSRect, NSSize, NSString, NSNotFound,
 };
 use objc2_quartz_core::{CAAutoresizingMask, CALayer, CAMetalLayer, CATransaction};
@@ -58,6 +58,13 @@ pub(crate) fn start_application(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     app.finishLaunching();
+    // A bare executable has no bundle for the Dock to read an icon from, so it would show the
+    // generic program icon. A PNG this file holds always decodes; `None` would only leave that.
+    let icon = NSData::with_bytes(include_bytes!("../../../icon/omnidroid-mac.png"));
+    if let Some(icon) = NSImage::initWithData(NSImage::alloc(), &icon) {
+        // SAFETY: on the main thread (`mtm`), with an image that lives across the call.
+        unsafe { app.setApplicationIconImage(Some(&icon)) };
+    }
     STARTED.store(true, Ordering::Release);
     main_thread::stop_run_loop();
 }

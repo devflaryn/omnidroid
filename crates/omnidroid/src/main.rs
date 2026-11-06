@@ -381,6 +381,8 @@ fn plugins_lines(args: &[String]) -> Result<Vec<String>, String> {
                 let state = if entry.enabled { "on" } else { "off" };
                 let from = if entry.builtin {
                     "comes with omnidroid".to_string()
+                } else if entry.bundled {
+                    format!("comes with this install ({})", entry.dir.display())
                 } else if entry.linked {
                     format!("linked to {}", entry.dir.display())
                 } else {
@@ -472,13 +474,43 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
     Ok(options)
 }
 
-/// The repository this launcher was built from: the gate it runs is that checkout's.
+/// The repository this launcher was built from: the gate it runs is that checkout's. Run from an
+/// install (`omni_linux::install`: a folder of prebuilt programs and the sysroot, no checkout), the
+/// install -- its plugins, its root modules, its tools.
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/omnidroid has two ancestors")
-        .to_path_buf()
+    omni_linux::install::repo_root()
+}
+
+/// The libtest filter of the one `r_app` gate a device session is (`--ignored`: it is ignored by
+/// default, being minutes long).
+const R_APP_TEST: &str = "the_apk_is_installed_started_and_draws";
+
+/// The program that boots a device and runs its session (`omnidroid aosp`): the `r_app` gate.
+///
+/// From a checkout it is cargo's -- `cargo test --release -p omni-linux --test r_app` in the
+/// repository, built there first if the checkout changed. From an install there is no cargo, and
+/// the gate is the prebuilt `omni-r-app` beside this launcher (the test binary that same command
+/// builds, copied by `tools/make_bundle.py`), run with the libtest arguments cargo would have
+/// passed it, the install's sysroot (`OMNI_SYSROOT`) and the runner it spawns (`OMNI_LINUX_RUN`,
+/// which `common::boot` reads before the path cargo compiled in -- a path on the machine the bundle
+/// was built on). A caller's own `OMNI_SYSROOT` or `OMNI_LINUX_RUN` is kept.
+fn r_app_command() -> Command {
+    let Some(home) = omni_linux::install::home() else {
+        let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        run.current_dir(repo_root())
+            .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_app", "--", "--ignored", "--nocapture"]);
+        return run;
+    };
+    let exe = |name: &str| home.join(omni_linux::install::exe_name(name));
+    let mut run = Command::new(exe(omni_linux::install::R_APP));
+    run.current_dir(&home).args(["--ignored", "--nocapture", "--exact", R_APP_TEST]).env(omni_linux::install::HOME_ENV, &home);
+    if std::env::var_os("OMNI_SYSROOT").is_none() {
+        run.env("OMNI_SYSROOT", home.join(omni_linux::install::SYSROOT));
+    }
+    if std::env::var_os("OMNI_LINUX_RUN").is_none() {
+        run.env("OMNI_LINUX_RUN", exe(omni_linux::install::RUNNER));
+    }
+    run
 }
 
 fn chosen(options: &Options) -> Result<omni_apk::ChosenApk, ExitCode> {
@@ -953,17 +985,16 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
             if options.size.is_some() || options.gpu.is_some() || options.with_systemui || options.no_clipboard {
                 println!("Omnidroid: --size, --gpu, --with-systemui and --no-clipboard are the warm device's own (set when it booted); not applied");
             }
-            let code = warm::session(&dev, &repo_root(), &apk_path, cookie.as_deref(), &app_session, options.minutes);
+            let code = warm::session(&dev, &apk_path, cookie.as_deref(), &app_session, options.minutes);
             plugin::end(plugged.plugins, &plugged.given, &info, &base, i32::from(code != ExitCode::SUCCESS));
             return code;
         }
     }
-    // The session (cargo, the test, the device's host processes) ends with this process, however it
-    // ends: a caller that kills the launcher (the MCP server) leaves nothing running.
+    // The session (cargo or the install's prebuilt gate, the test, the device's host processes)
+    // ends with this process, however it ends: a caller that kills the launcher (the MCP server)
+    // leaves nothing running.
     omni_platform::process::hold_children();
-    let mut run = Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-    run.current_dir(repo_root())
-        .args(["test", "--release", "-q", "-p", "omni-linux", "--test", "r_app", "--", "--ignored", "--nocapture"]);
+    let mut run = r_app_command();
     for (k, v) in aosp_env(options, &apk_path, package.as_deref()) {
         run.env(k, v);
     }
@@ -998,7 +1029,7 @@ fn aosp(options: &AospOptions, plugged: &Plugged) -> ExitCode {
     let code = match run.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(error) => {
-            eprintln!("omnidroid: could not start cargo: {error}");
+            eprintln!("omnidroid: could not start {}: {error}", run.get_program().to_string_lossy());
             1
         }
     };

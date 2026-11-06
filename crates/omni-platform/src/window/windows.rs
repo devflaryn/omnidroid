@@ -97,7 +97,7 @@ use windows_sys::Win32::UI::Input::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, ClipCursor, CreateWindowExW, DefWindowProcW, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, LoadCursorW, MSG, MWMO_INPUTAVAILABLE,
+    GetWindowLongPtrW, GetWindowRect, HTCLIENT, IDC_ARROW, LoadCursorW, LoadIconW, MSG, MWMO_INPUTAVAILABLE,
     MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW, PostMessageW, QS_ALLINPUT,
     RegisterClassW, SM_CXSCREEN, SM_CXVIRTUALSCREEN, SM_CYSCREEN, SM_CYVIRTUALSCREEN, SM_SWAPBUTTON, SW_MINIMIZE,
     SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetCursor, SetCursorPos,
@@ -533,7 +533,10 @@ fn window_class() -> Result<(u16, HINSTANCE), u32> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance,
-            hIcon: core::ptr::null_mut(),
+            // SAFETY: `hinstance` is this executable, and an integer resource id is what
+            // `MAKEINTRESOURCE` makes. Icon group 1 is the one the programs' `build.rs` link in; an
+            // executable without it (a test) gets null, the system's default icon.
+            hIcon: unsafe { LoadIconW(hinstance, 1 as *const u16) },
             // SAFETY: a null instance with a `IDC_*` integer resource asks for a system cursor,
             // which is a shared resource that is never unloaded. Without this the cursor keeps
             // whatever shape it had when it entered the client area — commonly the resize arrows

@@ -42,6 +42,7 @@ pub mod hal;
 pub mod hostnet;
 pub mod init;
 pub mod inject;
+pub mod install;
 pub mod keymap;
 pub mod input_channel;
 pub mod locks;

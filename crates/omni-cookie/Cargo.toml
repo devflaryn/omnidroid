@@ -1,0 +1,23 @@
+[package]
+name = "omni-cookie"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "`omni-plant-cookie`: an account's .ROBLOSECURITY cookie put into an Android app's WebView cookie store -- tools/plant_cookie.py, with no Python."
+
+# A top-level tool crate: the program an install runs where a checkout ran `tools/plant_cookie.py`
+# (`omni_linux::install::plant_cookie` picks it). Nothing depends on it; it is a separate program, not
+# a library the launcher links, so the launcher stays free of SQLite.
+[dependencies]
+# The store is Chromium's SQLite database, changed in place. `bundled`: SQLite compiled in, so an
+# install needs no SQLite of the host's (Windows has none on PATH). Its C compiler is the one
+# dynarmic-sys already needs.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[[bin]]
+name = "omni-plant-cookie"
+path = "src/main.rs"

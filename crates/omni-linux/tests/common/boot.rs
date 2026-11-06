@@ -65,6 +65,13 @@ fn milestones() -> Vec<String> {
     MILESTONES.iter().map(|m| (*m).to_string()).chain([s.signed_in, s.link_taken, s.loaded, s.disconnected].into_iter().flatten()).collect()
 }
 
+/// The runner a boot spawns: `OMNI_LINUX_RUN` when set -- an install's (`omni_linux::install`),
+/// where this gate is a prebuilt program run by `omnidroid aosp` with no cargo to have built one
+/// beside it -- else the `omni-linux-run` cargo built for this test.
+fn runner() -> PathBuf {
+    std::env::var_os("OMNI_LINUX_RUN").filter(|r| !r.is_empty()).map_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_omni-linux-run")), PathBuf::from)
+}
+
 impl Boot {
     /// Boot `instance` (made fresh) with system_server, `extra` runner arguments and the `then`
     /// shell command run beside it as the shell user.
@@ -73,7 +80,7 @@ impl Boot {
         let exports = derive_classpath(sysroot, &instance);
         eprintln!("[boot] derive_classpath: {} ms", derive.elapsed().as_millis());
         let ss_classpath = exports.iter().find(|(k, _)| k == "SYSTEMSERVERCLASSPATH").map(|(_, v)| v.clone()).expect("SYSTEMSERVERCLASSPATH");
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_omni-linux-run"));
+        let mut cmd = Command::new(runner());
         cmd.args(["--sysroot", &sysroot.to_string_lossy(), "--instance", &instance.to_string_lossy(), "--uid", "1000"]);
         for (k, v) in &exports {
             cmd.arg("--env").arg(format!("{k}={v}"));
